@@ -13,3 +13,4 @@ Cargo.lock
 *.model
 *.gguf
 proptest-regressions
+__pycache__

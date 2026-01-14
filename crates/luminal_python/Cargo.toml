@@ -1,0 +1,15 @@
+[package]
+name = "luminal_python"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "luminal_native"
+crate-type = ["cdylib"]  # Creates shared library for Python to import
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+luminal = { path = "../.." }
+
+[build-dependencies]
+pyo3-build-config = "0.23"
