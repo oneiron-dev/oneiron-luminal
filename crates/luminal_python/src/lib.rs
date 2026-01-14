@@ -86,8 +86,35 @@ fn compile(
                 // Map aten operations to HLIR
                 match node.target.as_str() {
                     "aten.add.Tensor" | "aten.add" => {
-                        if verbose && node.args.len() >= 2 {
-                            eprintln!("add.Tensor!");
+                        if node.args.len() >= 2 {
+                            let left_hand_name = &node.args[0];
+                            let right_hand_name = &node.args[1];
+
+                            if let (Some(left_hand), Some(right_hand)) = (
+                                tensor_map.get(left_hand_name),
+                                tensor_map.get(right_hand_name),
+                            ) {
+                                if verbose {
+                                    eprintln!(
+                                        "    -> Computing: {} + {}",
+                                        left_hand_name, right_hand_name
+                                    );
+                                }
+
+                                // Add two tensors (dereference since get() returns &GraphTensor)
+                                let output = *left_hand + *right_hand;
+
+                                if verbose {
+                                    eprintln!("    ✓ Created tensor addition (HLIR: Add)");
+                                    eprintln!("    Output shape: {:?}", output.shape);
+                                }
+                                tensor_map.insert(node.name.clone(), output);
+                            } else if verbose {
+                                eprintln!(
+                                    "    ERROR: Could not find tensors {} or {}",
+                                    left_hand_name, right_hand_name
+                                );
+                            }
                         }
                     }
 
