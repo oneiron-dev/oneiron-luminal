@@ -22,11 +22,17 @@ def extract_graph_and_inputs(model, x):
         args = []
         for arg in node.args:
             if hasattr(arg, "name"):
+                # It's a node reference
                 args.append(arg.name)
+            elif isinstance(arg, (int, float, bool, str)):
+                # It's a scalar constant - convert to string
+                args.append(str(arg))
             elif isinstance(arg, (list, tuple)):
                 for sub_arg in arg:
                     if hasattr(sub_arg, "name"):
                         args.append(sub_arg.name)
+                    elif isinstance(sub_arg, (int, float, bool, str)):
+                        args.append(str(sub_arg))
 
         # Extract kwargs - convert values to strings for Rust HashMap<String, String>
         kwargs = {}
@@ -79,6 +85,7 @@ def run_luminal_and_compare(model, x, atol, verbose=False):
     outputs = luminal_native.compile(nodes, inputs, verbose=verbose)
 
     output_key = next(iter(outputs.keys()))
+    print(f"keys: {output_key}")
     luminal_output = torch.tensor(outputs[output_key]).reshape(pytorch_output.shape)
 
     torch.testing.assert_close(luminal_output, pytorch_output, atol=atol, rtol=0.0)

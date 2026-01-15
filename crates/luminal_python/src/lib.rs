@@ -1,6 +1,9 @@
 use luminal::prelude::*;
+use luminal::visualization::ToDot;
 use pyo3::prelude::*;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 
 /// Represents a node in the exported PyTorch graph
 #[derive(Debug, Clone)]
@@ -61,13 +64,13 @@ fn compile(
             "placeholder" => {
                 if verbose {
                     eprintln!(
-                        "  Creating input: {} with shape {:?}",
-                        node.name, node.shape
+                        "  Creating input: {} with shape {:?} dtype={}",
+                        node.name, node.shape, node.dtype
                     );
                 }
 
                 // Create tensor with actual shape from PyTorch
-                let tensor = match node.shape.len() {
+                let mut tensor = match node.shape.len() {
                     0 => cx.tensor((1,)),
                     1 => cx.tensor((node.shape[0],)),
                     2 => cx.tensor((node.shape[0], node.shape[1])),
@@ -81,6 +84,15 @@ fn compile(
                         cx.tensor((1,))
                     }
                 };
+
+                // Check if this is an integer tensor (for embedding indices, etc.)
+                // PyTorch dtypes: torch.int64, torch.int32, torch.long, etc.
+                if node.dtype.contains("int") || node.dtype.contains("long") {
+                    if verbose {
+                        eprintln!("    -> Marking tensor as Int dtype");
+                    }
+                    tensor = tensor.as_dtype(DType::Int);
+                }
 
                 if verbose {
                     eprintln!("    ✓ Created input tensor (shape: {:?})", tensor.shape);
@@ -96,122 +108,168 @@ fn compile(
                 // Map aten operations to HLIR
                 match node.target.as_str() {
                     "aten.add.Tensor" | "aten.add" => {
-                        if node.args.len() >= 2 {
-                            let left_hand_name = &node.args[0];
-                            let right_hand_name = &node.args[1];
-
-                            if let (Some(left_hand), Some(right_hand)) = (
-                                tensor_map.get(left_hand_name),
-                                tensor_map.get(right_hand_name),
-                            ) {
-                                if verbose {
-                                    eprintln!(
-                                        "    -> Computing: {} + {}",
-                                        left_hand_name, right_hand_name
-                                    );
-                                }
-
-                                // Add two tensors (dereference since get() returns &GraphTensor)
-                                let output = *left_hand + *right_hand;
-
-                                if verbose {
-                                    eprintln!("    ✓ Created tensor addition (HLIR: Add)");
-                                    eprintln!("    Output shape: {:?}", output.shape);
-                                }
-                                tensor_map.insert(node.name.clone(), output);
-                            } else if verbose {
-                                eprintln!(
-                                    "    ERROR: Could not find tensors {} or {}",
-                                    left_hand_name, right_hand_name
-                                );
-                            }
+                        if node.args.len() < 2 {
+                            panic!("aten.add requires at least 2 arguments, got {}", node.args.len());
                         }
+
+                        let left_hand_name = &node.args[0];
+                        let right_hand_name = &node.args[1];
+
+                        if verbose {
+                            eprintln!(
+                                "    -> Computing: {} + {}",
+                                left_hand_name, right_hand_name
+                            );
+                        }
+
+                        // Check if operands are tensors or scalars
+                        let left_hand = tensor_map.get(left_hand_name);
+                        let right_hand = tensor_map.get(right_hand_name);
+
+                        let output = match (left_hand, right_hand) {
+                            (Some(left), Some(right)) => {
+                                // Tensor + Tensor
+                                if verbose {
+                                    eprintln!("    -> tensor + tensor");
+                                }
+                                *left + *right
+                            }
+                            (Some(tensor), None) => {
+                                // Tensor + Scalar
+                                let scalar: f32 = right_hand_name.parse()
+                                    .unwrap_or_else(|_| panic!("Could not parse '{}' as scalar for add operation", right_hand_name));
+                                if verbose {
+                                    eprintln!("    -> tensor + scalar ({})", scalar);
+                                }
+                                *tensor + scalar
+                            }
+                            (None, Some(tensor)) => {
+                                // Scalar + Tensor
+                                let scalar: f32 = left_hand_name.parse()
+                                    .unwrap_or_else(|_| panic!("Could not parse '{}' as scalar for add operation", left_hand_name));
+                                if verbose {
+                                    eprintln!("    -> scalar ({}) + tensor", scalar);
+                                }
+                                scalar + *tensor
+                            }
+                            (None, None) => {
+                                panic!("Both operands of add are missing from tensor_map: {} and {}", left_hand_name, right_hand_name);
+                            }
+                        };
+
+                        if verbose {
+                            eprintln!("    ✓ Created addition");
+                            eprintln!("    Output shape: {:?}", output.shape);
+                        }
+                        tensor_map.insert(node.name.clone(), output);
                     }
 
                     "aten.mul.Tensor" | "aten.mul" => {
-                        if node.args.len() >= 2 {
-                            let left_hand_name = &node.args[0];
-                            let right_hand_name = &node.args[1];
-
-                            if let (Some(left_hand), Some(right_hand)) = (
-                                tensor_map.get(left_hand_name),
-                                tensor_map.get(right_hand_name),
-                            ) {
-                                if verbose {
-                                    eprintln!(
-                                        "    -> Computing: {} * {}",
-                                        left_hand_name, right_hand_name
-                                    );
-                                }
-
-                                // Multiply two tensors (dereference since get() returns &GraphTensor)
-                                let output = *left_hand * *right_hand;
-
-                                if verbose {
-                                    eprintln!("    ✓ Created tensor multiplication (HLIR: Mul)");
-                                    eprintln!("    Output shape: {:?}", output.shape);
-                                }
-                                tensor_map.insert(node.name.clone(), output);
-                            } else if verbose {
-                                eprintln!(
-                                    "    ERROR: Could not find tensors {} or {}",
-                                    left_hand_name, right_hand_name
-                                );
-                            }
+                        if node.args.len() < 2 {
+                            panic!("aten.mul requires at least 2 arguments, got {}", node.args.len());
                         }
+
+                        let left_hand_name = &node.args[0];
+                        let right_hand_name = &node.args[1];
+
+                        if verbose {
+                            eprintln!(
+                                "    -> Computing: {} * {}",
+                                left_hand_name, right_hand_name
+                            );
+                        }
+
+                        // Check if left is a tensor
+                        let left_hand = tensor_map.get(left_hand_name);
+                        let right_hand = tensor_map.get(right_hand_name);
+
+                        let output = match (left_hand, right_hand) {
+                            (Some(left), Some(right)) => {
+                                // Tensor * Tensor
+                                if verbose {
+                                    eprintln!("    -> tensor * tensor");
+                                }
+                                *left * *right
+                            }
+                            (Some(tensor), None) => {
+                                // Tensor * Scalar
+                                let scalar: f32 = right_hand_name.parse()
+                                    .unwrap_or_else(|_| panic!("Could not parse '{}' as scalar for mul operation", right_hand_name));
+                                if verbose {
+                                    eprintln!("    -> tensor * scalar ({})", scalar);
+                                }
+                                *tensor * scalar
+                            }
+                            (None, Some(tensor)) => {
+                                // Scalar * Tensor
+                                let scalar: f32 = left_hand_name.parse()
+                                    .unwrap_or_else(|_| panic!("Could not parse '{}' as scalar for mul operation", left_hand_name));
+                                if verbose {
+                                    eprintln!("    -> scalar ({}) * tensor", scalar);
+                                }
+                                scalar * *tensor
+                            }
+                            (None, None) => {
+                                panic!("Both operands of mul are missing from tensor_map: {} and {}", left_hand_name, right_hand_name);
+                            }
+                        };
+
+                        if verbose {
+                            eprintln!("    ✓ Created multiplication");
+                            eprintln!("    Output shape: {:?}", output.shape);
+                        }
+                        tensor_map.insert(node.name.clone(), output);
                     }
 
                     "aten.linear.default" => {
                         // linear(input, weight, bias=None)
                         // output = input @ weight.T + bias
-                        if node.args.len() >= 2 {
-                            let input_name = &node.args[0];
-                            let weight_name = &node.args[1];
+                        if node.args.len() < 2 {
+                            panic!("aten.linear requires at least 2 arguments, got {}", node.args.len());
+                        }
 
-                            if let (Some(input), Some(weight)) =
-                                (tensor_map.get(input_name), tensor_map.get(weight_name))
-                            {
+                        let input_name = &node.args[0];
+                        let weight_name = &node.args[1];
+
+                        if verbose {
+                            eprintln!(
+                                "    -> Computing: {} @ {}.T",
+                                input_name, weight_name
+                            );
+                        }
+
+                        let input = tensor_map.get(input_name)
+                            .unwrap_or_else(|| panic!("Could not find input '{}' in tensor_map for linear operation", input_name));
+                        let weight = tensor_map.get(weight_name)
+                            .unwrap_or_else(|| panic!("Could not find weight '{}' in tensor_map for linear operation", weight_name));
+
+                        // Perform matmul with transposed weight: input @ weight.T
+                        // PyTorch linear: weight is (out_features, in_features), needs transpose
+                        let weight_t = weight.permute((1, 0));
+                        let mut output = input.matmul(weight_t);
+
+                        // Add bias if present (args[2])
+                        if node.args.len() >= 3 {
+                            let bias_name = &node.args[2];
+                            if let Some(bias) = tensor_map.get(bias_name) {
                                 if verbose {
-                                    eprintln!(
-                                        "    -> Computing: {} @ {}.T",
-                                        input_name, weight_name
-                                    );
+                                    eprintln!("    -> Adding bias: {}", bias_name);
                                 }
-
-                                // Perform matmul with transposed weight: input @ weight.T
-                                // PyTorch linear: weight is (out_features, in_features), needs transpose
-                                let weight_t = weight.permute((1, 0));
-                                let mut output = input.matmul(weight_t);
-
-                                // Add bias if present (args[2])
-                                if node.args.len() >= 3 {
-                                    let bias_name = &node.args[2];
-                                    if let Some(bias) = tensor_map.get(bias_name) {
-                                        if verbose {
-                                            eprintln!("    -> Adding bias: {}", bias_name);
-                                        }
-                                        // Bias has shape (out_features,), need to expand to (batch, out_features)
-                                        // Get batch size from output (first dimension)
-                                        let batch_size = output.dims()[0];
-                                        let expanded_bias = bias.expand_lhs([batch_size]);
-                                        output = output + expanded_bias;
-                                    }
-                                }
-
-                                if verbose {
-                                    eprintln!(
-                                        "    ✓ Created linear layer (HLIR: Mul + SumReduce + Add)"
-                                    );
-                                    eprintln!("    Output shape: {:?}", output.shape);
-                                }
-                                tensor_map.insert(node.name.clone(), output);
-                            } else if verbose {
-                                eprintln!(
-                                    "    ERROR: Could not find tensors {} or {}",
-                                    input_name, weight_name
-                                );
+                                // Bias has shape (out_features,), need to expand to (batch, out_features)
+                                // Get batch size from output (first dimension)
+                                let batch_size = output.dims()[0];
+                                let expanded_bias = bias.expand_lhs([batch_size]);
+                                output = output + expanded_bias;
                             }
                         }
+
+                        if verbose {
+                            eprintln!(
+                                "    ✓ Created linear layer (HLIR: Mul + SumReduce + Add)"
+                            );
+                            eprintln!("    Output shape: {:?}", output.shape);
+                        }
+                        tensor_map.insert(node.name.clone(), output);
                     }
 
                     // TODO: Implement view/reshape operations
@@ -373,17 +431,71 @@ fn compile(
                         }
                     }
 
-                    // TODO: Implement embedding lookup
                     "aten.embedding.default" => {
-                        if verbose {
-                            eprintln!("    TODO: embedding operation not yet implemented");
+                        // Embedding lookup: embedding(weight, indices)
+                        // weight: (num_embeddings, embedding_dim) - the embedding table
+                        // indices: (batch, seq_len) - token IDs to look up
+                        // output: (batch, seq_len, embedding_dim) - gathered embeddings
+                        if node.args.len() < 2 {
+                            panic!("aten.embedding requires at least 2 arguments, got {}", node.args.len());
                         }
+
+                        let weight_name = &node.args[0];
+                        let indices_name = &node.args[1];
+
+                        if verbose {
+                            eprintln!(
+                                "    -> Computing: embedding({}, {})",
+                                weight_name, indices_name
+                            );
+                        }
+
+                        let weight = tensor_map.get(weight_name)
+                            .unwrap_or_else(|| panic!("Could not find weight '{}' in tensor_map for embedding operation", weight_name));
+                        let indices = tensor_map.get(indices_name)
+                            .unwrap_or_else(|| panic!("Could not find indices '{}' in tensor_map for embedding operation", indices_name));
+
+                        if verbose {
+                            eprintln!("    Weight shape: {:?}", weight.shape);
+                            eprintln!("    Indices shape: {:?}", indices.shape);
+                            eprintln!("    Indices dtype: {:?}", indices.dtype);
+                        }
+
+                        // Get dimensions
+                        let weight_dims = weight.dims();
+                        let embedding_dim = weight_dims[1]; // num_embeddings x embedding_dim
+                        let indices_dims = indices.dims();
+
+                        // Compute flat indices for gather operation
+                        // For each token_id, we need indices: token_id * embedding_dim + [0, 1, 2, ..., embedding_dim-1]
+                        //
+                        // Step 1: token_ids * embedding_dim
+                        let scaled_indices = *indices * embedding_dim;
+
+                        // Step 2: Expand to (batch, seq_len, embedding_dim)
+                        let expanded_scaled = scaled_indices.expand_dim(indices_dims.len(), embedding_dim);
+
+                        // Step 3: Create arange(embedding_dim) and expand to (batch, seq_len, embedding_dim)
+                        let mut offset = cx.arange(embedding_dim);
+                        for (i, &dim) in indices_dims.iter().enumerate() {
+                            offset = offset.expand_dim(i, dim);
+                        }
+
+                        // Step 4: Add them together to get final indices
+                        let gather_indices = expanded_scaled + offset;
+
+                        // Step 5: Gather from the flattened weight tensor
+                        let output = weight.gather(gather_indices);
+
+                        if verbose {
+                            eprintln!("    ✓ Created embedding lookup (HLIR: Gather)");
+                            eprintln!("    Output shape: {:?}", output.shape);
+                        }
+                        tensor_map.insert(node.name.clone(), output);
                     }
 
                     _ => {
-                        if verbose {
-                            eprintln!("    WARNING: Unsupported operation: {}", node.target);
-                        }
+                        panic!("Unsupported operation: {} (node: {}). This operation needs to be implemented.", node.target, node.name);
                     }
                 }
             }
@@ -391,6 +503,8 @@ fn compile(
             "output" => {
                 if verbose {
                     eprintln!("  Marking outputs");
+                    eprintln!("    Output args requested: {:?}", node.args);
+                    eprintln!("    Available tensors: {:?}", tensor_map.keys().collect::<Vec<_>>());
                 }
                 // Mark all output tensors
                 for arg in &node.args {
@@ -401,6 +515,8 @@ fn compile(
                         if verbose {
                             eprintln!("    ✓ Marked {} as output", arg);
                         }
+                    } else if verbose {
+                        eprintln!("    ⚠ WARNING: Output tensor {} not found in tensor_map", arg);
                     }
                 }
             }
@@ -452,6 +568,30 @@ fn compile(
         eprintln!("  HLIR nodes: {}", cx.graph.node_count());
         eprintln!("  HLIR edges: {}", cx.graph.edge_count());
 
+        // Output HLIR graph to dot file
+        eprintln!("\nExporting HLIR graph to dot file...");
+        match cx.graph.to_dot() {
+            Ok(dot_string) => {
+                let filename = "hlir_graph.dot";
+                match File::create(filename) {
+                    Ok(mut file) => {
+                        if let Err(e) = file.write_all(dot_string.as_bytes()) {
+                            eprintln!("  ⚠ Failed to write to {}: {}", filename, e);
+                        } else {
+                            eprintln!("  ✓ HLIR graph exported to {}", filename);
+                            eprintln!("    View it at: https://dreampuf.github.io/GraphvizOnline/");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  ⚠ Failed to create {}: {}", filename, e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("  ⚠ Failed to generate dot representation: {}", e);
+            }
+        }
+
         // Build search space to populate operation metadata
         eprintln!("\nBuilding search space (populates op metadata)...");
     }
@@ -466,15 +606,52 @@ fn compile(
     if verbose {
         eprintln!("  ✓ Compilation complete!");
 
+        // Output optimized LLIR graph to dot file
+        eprintln!("\nExporting optimized LLIR graph to dot file...");
+        match runtime.graph.to_dot() {
+            Ok(dot_string) => {
+                let filename = "llir_graph_optimized.dot";
+                match File::create(filename) {
+                    Ok(mut file) => {
+                        if let Err(e) = file.write_all(dot_string.as_bytes()) {
+                            eprintln!("  ⚠ Failed to write to {}: {}", filename, e);
+                        } else {
+                            eprintln!("  ✓ Optimized LLIR graph exported to {}", filename);
+                            eprintln!("    LLIR nodes: {}", runtime.graph.node_count());
+                            eprintln!("    LLIR edges: {}", runtime.graph.edge_count());
+                            eprintln!("    View it at: https://dreampuf.github.io/GraphvizOnline/");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  ⚠ Failed to create {}: {}", filename, e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("  ⚠ Failed to generate dot representation: {}", e);
+            }
+        }
+
         // Set input data
         eprintln!("\nSetting input data...");
     }
     for (name, data) in &inputs {
         if let Some(tensor) = tensor_map.get(name) {
             if verbose {
-                eprintln!("  Setting data for input: {}", name);
+                eprintln!("  Setting data for input: {} (dtype: {:?})", name, tensor.dtype);
             }
-            runtime.set_data(tensor.id, data.clone());
+            // Convert data based on tensor dtype
+            match tensor.dtype {
+                DType::Int => {
+                    // Convert f32 to i32 for integer tensors
+                    let int_data: Vec<i32> = data.iter().map(|&f| f as i32).collect();
+                    runtime.set_data(tensor.id, int_data);
+                }
+                _ => {
+                    // Keep as f32 for float tensors
+                    runtime.set_data(tensor.id, data.clone());
+                }
+            }
         } else if verbose {
             eprintln!("  WARNING: Input {} not found in tensor_map", name);
         }
