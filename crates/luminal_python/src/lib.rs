@@ -109,17 +109,17 @@ fn compile(
                 match node.target.as_str() {
                     "aten.add.Tensor" | "aten.add" => {
                         if node.args.len() < 2 {
-                            panic!("aten.add requires at least 2 arguments, got {}", node.args.len());
+                            panic!(
+                                "aten.add requires at least 2 arguments, got {}",
+                                node.args.len()
+                            );
                         }
 
                         let left_hand_name = &node.args[0];
                         let right_hand_name = &node.args[1];
 
                         if verbose {
-                            eprintln!(
-                                "    -> Computing: {} + {}",
-                                left_hand_name, right_hand_name
-                            );
+                            eprintln!("    -> Computing: {} + {}", left_hand_name, right_hand_name);
                         }
 
                         // Check if operands are tensors or scalars
@@ -136,8 +136,12 @@ fn compile(
                             }
                             (Some(tensor), None) => {
                                 // Tensor + Scalar
-                                let scalar: f32 = right_hand_name.parse()
-                                    .unwrap_or_else(|_| panic!("Could not parse '{}' as scalar for add operation", right_hand_name));
+                                let scalar: f32 = right_hand_name.parse().unwrap_or_else(|_| {
+                                    panic!(
+                                        "Could not parse '{}' as scalar for add operation",
+                                        right_hand_name
+                                    )
+                                });
                                 if verbose {
                                     eprintln!("    -> tensor + scalar ({})", scalar);
                                 }
@@ -145,15 +149,22 @@ fn compile(
                             }
                             (None, Some(tensor)) => {
                                 // Scalar + Tensor
-                                let scalar: f32 = left_hand_name.parse()
-                                    .unwrap_or_else(|_| panic!("Could not parse '{}' as scalar for add operation", left_hand_name));
+                                let scalar: f32 = left_hand_name.parse().unwrap_or_else(|_| {
+                                    panic!(
+                                        "Could not parse '{}' as scalar for add operation",
+                                        left_hand_name
+                                    )
+                                });
                                 if verbose {
                                     eprintln!("    -> scalar ({}) + tensor", scalar);
                                 }
                                 scalar + *tensor
                             }
                             (None, None) => {
-                                panic!("Both operands of add are missing from tensor_map: {} and {}", left_hand_name, right_hand_name);
+                                panic!(
+                                    "Both operands of add are missing from tensor_map: {} and {}",
+                                    left_hand_name, right_hand_name
+                                );
                             }
                         };
 
@@ -166,17 +177,17 @@ fn compile(
 
                     "aten.mul.Tensor" | "aten.mul" => {
                         if node.args.len() < 2 {
-                            panic!("aten.mul requires at least 2 arguments, got {}", node.args.len());
+                            panic!(
+                                "aten.mul requires at least 2 arguments, got {}",
+                                node.args.len()
+                            );
                         }
 
                         let left_hand_name = &node.args[0];
                         let right_hand_name = &node.args[1];
 
                         if verbose {
-                            eprintln!(
-                                "    -> Computing: {} * {}",
-                                left_hand_name, right_hand_name
-                            );
+                            eprintln!("    -> Computing: {} * {}", left_hand_name, right_hand_name);
                         }
 
                         // Check if left is a tensor
@@ -193,8 +204,12 @@ fn compile(
                             }
                             (Some(tensor), None) => {
                                 // Tensor * Scalar
-                                let scalar: f32 = right_hand_name.parse()
-                                    .unwrap_or_else(|_| panic!("Could not parse '{}' as scalar for mul operation", right_hand_name));
+                                let scalar: f32 = right_hand_name.parse().unwrap_or_else(|_| {
+                                    panic!(
+                                        "Could not parse '{}' as scalar for mul operation",
+                                        right_hand_name
+                                    )
+                                });
                                 if verbose {
                                     eprintln!("    -> tensor * scalar ({})", scalar);
                                 }
@@ -202,15 +217,22 @@ fn compile(
                             }
                             (None, Some(tensor)) => {
                                 // Scalar * Tensor
-                                let scalar: f32 = left_hand_name.parse()
-                                    .unwrap_or_else(|_| panic!("Could not parse '{}' as scalar for mul operation", left_hand_name));
+                                let scalar: f32 = left_hand_name.parse().unwrap_or_else(|_| {
+                                    panic!(
+                                        "Could not parse '{}' as scalar for mul operation",
+                                        left_hand_name
+                                    )
+                                });
                                 if verbose {
                                     eprintln!("    -> scalar ({}) * tensor", scalar);
                                 }
                                 scalar * *tensor
                             }
                             (None, None) => {
-                                panic!("Both operands of mul are missing from tensor_map: {} and {}", left_hand_name, right_hand_name);
+                                panic!(
+                                    "Both operands of mul are missing from tensor_map: {} and {}",
+                                    left_hand_name, right_hand_name
+                                );
                             }
                         };
 
@@ -225,23 +247,31 @@ fn compile(
                         // linear(input, weight, bias=None)
                         // output = input @ weight.T + bias
                         if node.args.len() < 2 {
-                            panic!("aten.linear requires at least 2 arguments, got {}", node.args.len());
+                            panic!(
+                                "aten.linear requires at least 2 arguments, got {}",
+                                node.args.len()
+                            );
                         }
 
                         let input_name = &node.args[0];
                         let weight_name = &node.args[1];
 
                         if verbose {
-                            eprintln!(
-                                "    -> Computing: {} @ {}.T",
-                                input_name, weight_name
-                            );
+                            eprintln!("    -> Computing: {} @ {}.T", input_name, weight_name);
                         }
 
-                        let input = tensor_map.get(input_name)
-                            .unwrap_or_else(|| panic!("Could not find input '{}' in tensor_map for linear operation", input_name));
-                        let weight = tensor_map.get(weight_name)
-                            .unwrap_or_else(|| panic!("Could not find weight '{}' in tensor_map for linear operation", weight_name));
+                        let input = tensor_map.get(input_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find input '{}' in tensor_map for linear operation",
+                                input_name
+                            )
+                        });
+                        let weight = tensor_map.get(weight_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find weight '{}' in tensor_map for linear operation",
+                                weight_name
+                            )
+                        });
 
                         // Perform matmul with transposed weight: input @ weight.T
                         // PyTorch linear: weight is (out_features, in_features), needs transpose
@@ -264,9 +294,7 @@ fn compile(
                         }
 
                         if verbose {
-                            eprintln!(
-                                "    ✓ Created linear layer (HLIR: Mul + SumReduce + Add)"
-                            );
+                            eprintln!("    ✓ Created linear layer (HLIR: Mul + SumReduce + Add)");
                             eprintln!("    Output shape: {:?}", output.shape);
                         }
                         tensor_map.insert(node.name.clone(), output);
@@ -329,8 +357,8 @@ fn compile(
                                 let mut output = input.layer_norm(norm_axis, eps);
 
                                 // Apply weight (gamma) if present (args[2])
-                                if node.args.len() >= 2 && node.args[1] != "None" {
-                                    let weight_name = &node.args[1];
+                                if node.args.len() >= 3 && node.args[2] != "None" {
+                                    let weight_name = &node.args[2];
                                     if let Some(weight) = tensor_map.get(weight_name) {
                                         if verbose {
                                             eprintln!(
@@ -346,8 +374,8 @@ fn compile(
                                 }
 
                                 // Apply bias (beta) if present (args[3])
-                                if node.args.len() >= 3 && node.args[2] != "None" {
-                                    let bias_name = &node.args[2];
+                                if node.args.len() >= 4 && node.args[3] != "None" {
+                                    let bias_name = &node.args[3];
                                     if let Some(bias) = tensor_map.get(bias_name) {
                                         if verbose {
                                             eprintln!("    -> Applying bias (beta): {}", bias_name);
@@ -437,7 +465,10 @@ fn compile(
                         // indices: (batch, seq_len) - token IDs to look up
                         // output: (batch, seq_len, embedding_dim) - gathered embeddings
                         if node.args.len() < 2 {
-                            panic!("aten.embedding requires at least 2 arguments, got {}", node.args.len());
+                            panic!(
+                                "aten.embedding requires at least 2 arguments, got {}",
+                                node.args.len()
+                            );
                         }
 
                         let weight_name = &node.args[0];
@@ -450,10 +481,18 @@ fn compile(
                             );
                         }
 
-                        let weight = tensor_map.get(weight_name)
-                            .unwrap_or_else(|| panic!("Could not find weight '{}' in tensor_map for embedding operation", weight_name));
-                        let indices = tensor_map.get(indices_name)
-                            .unwrap_or_else(|| panic!("Could not find indices '{}' in tensor_map for embedding operation", indices_name));
+                        let weight = tensor_map.get(weight_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find weight '{}' in tensor_map for embedding operation",
+                                weight_name
+                            )
+                        });
+                        let indices = tensor_map.get(indices_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find indices '{}' in tensor_map for embedding operation",
+                                indices_name
+                            )
+                        });
 
                         if verbose {
                             eprintln!("    Weight shape: {:?}", weight.shape);
@@ -473,7 +512,8 @@ fn compile(
                         let scaled_indices = *indices * embedding_dim;
 
                         // Step 2: Expand to (batch, seq_len, embedding_dim)
-                        let expanded_scaled = scaled_indices.expand_dim(indices_dims.len(), embedding_dim);
+                        let expanded_scaled =
+                            scaled_indices.expand_dim(indices_dims.len(), embedding_dim);
 
                         // Step 3: Create arange(embedding_dim) and expand to (batch, seq_len, embedding_dim)
                         let mut offset = cx.arange(embedding_dim);
@@ -495,7 +535,10 @@ fn compile(
                     }
 
                     _ => {
-                        panic!("Unsupported operation: {} (node: {}). This operation needs to be implemented.", node.target, node.name);
+                        panic!(
+                            "Unsupported operation: {} (node: {}). This operation needs to be implemented.",
+                            node.target, node.name
+                        );
                     }
                 }
             }
@@ -504,7 +547,10 @@ fn compile(
                 if verbose {
                     eprintln!("  Marking outputs");
                     eprintln!("    Output args requested: {:?}", node.args);
-                    eprintln!("    Available tensors: {:?}", tensor_map.keys().collect::<Vec<_>>());
+                    eprintln!(
+                        "    Available tensors: {:?}",
+                        tensor_map.keys().collect::<Vec<_>>()
+                    );
                 }
                 // Mark all output tensors
                 for arg in &node.args {
@@ -516,7 +562,10 @@ fn compile(
                             eprintln!("    ✓ Marked {} as output", arg);
                         }
                     } else if verbose {
-                        eprintln!("    ⚠ WARNING: Output tensor {} not found in tensor_map", arg);
+                        eprintln!(
+                            "    ⚠ WARNING: Output tensor {} not found in tensor_map",
+                            arg
+                        );
                     }
                 }
             }
@@ -638,7 +687,10 @@ fn compile(
     for (name, data) in &inputs {
         if let Some(tensor) = tensor_map.get(name) {
             if verbose {
-                eprintln!("  Setting data for input: {} (dtype: {:?})", name, tensor.dtype);
+                eprintln!(
+                    "  Setting data for input: {} (dtype: {:?})",
+                    name, tensor.dtype
+                );
             }
             // Convert data based on tensor dtype
             match tensor.dtype {
