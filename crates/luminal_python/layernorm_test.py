@@ -38,7 +38,7 @@ def test_layernorm_with_affine():
 
     model = Model()
     x = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
-    run_luminal_and_compare(model, x, atol=1e-5)
+    run_luminal_and_compare(model, x, atol=1e-5, verbose=True)
 
 
 def test_layernorm_no_affine():
@@ -88,12 +88,13 @@ def test_layernorm_in_mlp():
             self.layernorm = nn.LayerNorm(8)
             self.linear2 = nn.Linear(8, 4, bias=True)
             with torch.no_grad():
-                self.linear1.weight.fill_(0.5)
-                self.linear1.bias.fill_(0.1)
+                # Use non-uniform weights to avoid zero-variance edge case
+                self.linear1.weight.copy_(torch.linspace(0.3, 0.7, 24).reshape(8, 3))
+                self.linear1.bias.copy_(torch.linspace(0.0, 0.7, 8))
                 self.layernorm.weight.fill_(1.0)
                 self.layernorm.bias.fill_(0.0)
-                self.linear2.weight.fill_(0.5)
-                self.linear2.bias.fill_(0.1)
+                self.linear2.weight.copy_(torch.linspace(0.3, 0.7, 32).reshape(4, 8))
+                self.linear2.bias.copy_(torch.linspace(0.0, 0.3, 4))
 
         def forward(self, x):
             x = self.linear1(x)
@@ -114,8 +115,9 @@ def test_layernorm_with_gelu():
             self.linear = nn.Linear(3, 8, bias=True)
             self.layernorm = nn.LayerNorm(8)
             with torch.no_grad():
-                self.linear.weight.fill_(0.5)
-                self.linear.bias.fill_(0.1)
+                # Use non-uniform weights to avoid zero-variance edge case
+                self.linear.weight.copy_(torch.linspace(0.3, 0.7, 24).reshape(8, 3))
+                self.linear.bias.copy_(torch.linspace(0.0, 0.7, 8))
                 self.layernorm.weight.fill_(1.0)
                 self.layernorm.bias.fill_(0.0)
 

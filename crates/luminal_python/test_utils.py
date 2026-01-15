@@ -62,7 +62,7 @@ def extract_graph_and_inputs(model, x):
     return nodes, inputs
 
 
-def run_luminal_and_compare(model, x, atol):
+def run_luminal_and_compare(model, x, atol, verbose=False):
     """Run model through both PyTorch and Luminal and compare results
 
     Args:
@@ -76,7 +76,7 @@ def run_luminal_and_compare(model, x, atol):
     nodes, inputs = extract_graph_and_inputs(model, x)
 
     luminal_native = pytest.importorskip("luminal_native")
-    outputs = luminal_native.compile(nodes, inputs, verbose=False)
+    outputs = luminal_native.compile(nodes, inputs, verbose=verbose)
 
     output_key = next(iter(outputs.keys()))
     luminal_output = torch.tensor(outputs[output_key]).reshape(pytorch_output.shape)

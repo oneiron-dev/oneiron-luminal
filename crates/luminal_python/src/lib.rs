@@ -244,10 +244,71 @@ fn compile(
                         }
                     }
 
-                    // TODO: Implement layer normalization
                     "aten.layer_norm.default" => {
-                        if verbose {
-                            eprintln!("    TODO: layer_norm operation not yet implemented");
+                        // Layer normalization: normalize over the last N dimensions
+                        // layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5)
+                        if node.args.len() >= 1 {
+                            let input_name = &node.args[0];
+
+                            if let Some(input) = tensor_map.get(input_name) {
+                                if verbose {
+                                    eprintln!("    -> Computing: layer_norm({})", input_name);
+                                    eprintln!("    Args ({:?})", node.args);
+                                }
+
+                                // Get epsilon from kwargs, default to 1e-5
+                                let eps: f32 = node
+                                    .kwargs
+                                    .get("eps")
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(1e-5);
+
+                                // Apply layer normalization
+                                // For 2D tensors [batch, features], normalize over the last dimension (axis 1)
+                                // PyTorch LayerNorm normalizes over the last N dimensions
+                                let dims = input.dims();
+                                let norm_axis = dims.len() - 1; // Normalize over last dimension
+                                let mut output = input.layer_norm(norm_axis, eps);
+
+                                // Apply weight (gamma) if present (args[2])
+                                if node.args.len() >= 2 && node.args[1] != "None" {
+                                    let weight_name = &node.args[1];
+                                    if let Some(weight) = tensor_map.get(weight_name) {
+                                        if verbose {
+                                            eprintln!(
+                                                "    -> Applying weight (gamma): {}",
+                                                weight_name
+                                            );
+                                        }
+                                        // Weight has shape (normalized_shape,), need to expand to match input
+                                        let batch_size = output.dims()[0];
+                                        let expanded_weight = weight.expand_lhs([batch_size]);
+                                        output = output * expanded_weight;
+                                    }
+                                }
+
+                                // Apply bias (beta) if present (args[3])
+                                if node.args.len() >= 3 && node.args[2] != "None" {
+                                    let bias_name = &node.args[2];
+                                    if let Some(bias) = tensor_map.get(bias_name) {
+                                        if verbose {
+                                            eprintln!("    -> Applying bias (beta): {}", bias_name);
+                                        }
+                                        // Bias has shape (normalized_shape,), need to expand to match input
+                                        let batch_size = output.dims()[0];
+                                        let expanded_bias = bias.expand_lhs([batch_size]);
+                                        output = output + expanded_bias;
+                                    }
+                                }
+
+                                if verbose {
+                                    eprintln!("    ✓ Created layer normalization");
+                                    eprintln!("    Output shape: {:?}", output.shape);
+                                }
+                                tensor_map.insert(node.name.clone(), output);
+                            } else if verbose {
+                                eprintln!("    ERROR: Could not find tensor {}", input_name);
+                            }
                         }
                     }
 
