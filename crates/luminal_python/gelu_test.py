@@ -4,7 +4,6 @@ import torch.nn as nn
 
 from test_utils import extract_graph_and_inputs, run_luminal_and_compare
 
-
 def test_gelu_simple():
     """Test GELU activation after linear layer"""
     class Model(nn.Module):

@@ -18,7 +18,15 @@ struct PyTorchGraphNode {
 #[pyfunction]
 #[pyo3(signature = (nodes, inputs, verbose=false))]
 fn compile(
-    nodes: Vec<(String, String, String, Vec<String>, HashMap<String, String>, Vec<usize>, String)>,
+    nodes: Vec<(
+        String,
+        String,
+        String,
+        Vec<String>,
+        HashMap<String, String>,
+        Vec<usize>,
+        String,
+    )>,
     inputs: HashMap<String, Vec<f32>>,
     verbose: bool,
 ) -> PyResult<HashMap<String, Vec<f32>>> {
@@ -220,10 +228,19 @@ fn compile(
                         }
                     }
 
-                    // TODO: Implement dropout (might be no-op in inference)
                     "aten.dropout.default" => {
-                        if verbose {
-                            eprintln!("    TODO: dropout operation not yet implemented");
+                        if node.args.len() >= 1 {
+                            let input_name = &node.args[0];
+
+                            if let Some(input) = tensor_map.get(input_name) {
+                                if verbose {
+                                    eprintln!("    -> Dropout (no-op)");
+                                }
+                                let output = *input;
+                                tensor_map.insert(node.name.clone(), output);
+                            } else if verbose {
+                                eprintln!("    ERROR: Could not find tensor {}", input_name);
+                            }
                         }
                     }
 
@@ -254,7 +271,8 @@ fn compile(
                         // GELU activation - TANH APPROXIMATION ONLY
                         //
                         // Check kwargs to ensure tanh approximation was requested
-                        let is_tanh_approx = node.kwargs
+                        let is_tanh_approx = node
+                            .kwargs
                             .get("approximate")
                             .map(|s| s == "tanh")
                             .unwrap_or(false);
@@ -266,7 +284,7 @@ fn compile(
                                  Please use: torch.nn.functional.gelu(x, approximate='tanh')\n\
                                  \n\
                                  Note: The tanh approximation differs from exact GELU by ~0.0004 max error.\n\
-                                 Formula: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))"
+                                 Formula: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))",
                             ));
                         }
 
@@ -275,7 +293,10 @@ fn compile(
 
                             if let Some(input) = tensor_map.get(input_name) {
                                 if verbose {
-                                    eprintln!("    -> Computing: gelu({}) [tanh approximation]", input_name);
+                                    eprintln!(
+                                        "    -> Computing: gelu({}) [tanh approximation]",
+                                        input_name
+                                    );
                                 }
 
                                 let output = input.gelu();
