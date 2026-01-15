@@ -9,6 +9,7 @@ struct PyTorchGraphNode {
     op: String, // "placeholder", "call_function", "output", "get_attr"
     target: String,
     args: Vec<String>,
+    kwargs: HashMap<String, String>,
     shape: Vec<usize>,
     dtype: String,
 }
@@ -17,7 +18,7 @@ struct PyTorchGraphNode {
 #[pyfunction]
 #[pyo3(signature = (nodes, inputs, verbose=false))]
 fn compile(
-    nodes: Vec<(String, String, String, Vec<String>, Vec<usize>, String)>,
+    nodes: Vec<(String, String, String, Vec<String>, HashMap<String, String>, Vec<usize>, String)>,
     inputs: HashMap<String, Vec<f32>>,
     verbose: bool,
 ) -> PyResult<HashMap<String, Vec<f32>>> {
@@ -27,7 +28,7 @@ fn compile(
 
     let mut graph_nodes: Vec<PyTorchGraphNode> = Vec::new();
 
-    for (name, op, target, args, shape, dtype) in nodes {
+    for (name, op, target, args, kwargs, shape, dtype) in nodes {
         if verbose {
             eprintln!("  Node: {} | op={} | target={}", name, op, target);
         }
@@ -36,6 +37,7 @@ fn compile(
             op,
             target,
             args,
+            kwargs,
             shape,
             dtype,
         });
@@ -201,6 +203,98 @@ fn compile(
                                     input_name, weight_name
                                 );
                             }
+                        }
+                    }
+
+                    // TODO: Implement view/reshape operations
+                    "aten.view.default" => {
+                        if verbose {
+                            eprintln!("    TODO: view operation not yet implemented");
+                        }
+                    }
+
+                    // TODO: Implement transpose
+                    "aten.transpose.int" => {
+                        if verbose {
+                            eprintln!("    TODO: transpose operation not yet implemented");
+                        }
+                    }
+
+                    // TODO: Implement dropout (might be no-op in inference)
+                    "aten.dropout.default" => {
+                        if verbose {
+                            eprintln!("    TODO: dropout operation not yet implemented");
+                        }
+                    }
+
+                    // TODO: Implement layer normalization
+                    "aten.layer_norm.default" => {
+                        if verbose {
+                            eprintln!("    TODO: layer_norm operation not yet implemented");
+                        }
+                    }
+
+                    // TODO: Implement tensor split
+                    "aten.split.Tensor" => {
+                        if verbose {
+                            eprintln!("    TODO: split operation not yet implemented");
+                        }
+                    }
+
+                    // TODO: Implement scaled dot product attention
+                    "aten.scaled_dot_product_attention.default" => {
+                        if verbose {
+                            eprintln!(
+                                "    TODO: scaled_dot_product_attention operation not yet implemented"
+                            );
+                        }
+                    }
+
+                    "aten.gelu.default" => {
+                        // GELU activation - TANH APPROXIMATION ONLY
+                        //
+                        // Check kwargs to ensure tanh approximation was requested
+                        let is_tanh_approx = node.kwargs
+                            .get("approximate")
+                            .map(|s| s == "tanh")
+                            .unwrap_or(false);
+
+                        if !is_tanh_approx {
+                            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                                "Exact GELU (erf-based) is not supported.\n\
+                                 Luminal only supports the tanh approximation of GELU.\n\
+                                 Please use: torch.nn.functional.gelu(x, approximate='tanh')\n\
+                                 \n\
+                                 Note: The tanh approximation differs from exact GELU by ~0.0004 max error.\n\
+                                 Formula: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))"
+                            ));
+                        }
+
+                        if node.args.len() >= 1 {
+                            let input_name = &node.args[0];
+
+                            if let Some(input) = tensor_map.get(input_name) {
+                                if verbose {
+                                    eprintln!("    -> Computing: gelu({}) [tanh approximation]", input_name);
+                                }
+
+                                let output = input.gelu();
+
+                                if verbose {
+                                    eprintln!("    ✓ Created GELU activation (tanh approximation)");
+                                    eprintln!("    Output shape: {:?}", output.shape);
+                                }
+                                tensor_map.insert(node.name.clone(), output);
+                            } else if verbose {
+                                eprintln!("    ERROR: Could not find tensor {}", input_name);
+                            }
+                        }
+                    }
+
+                    // TODO: Implement embedding lookup
+                    "aten.embedding.default" => {
+                        if verbose {
+                            eprintln!("    TODO: embedding operation not yet implemented");
                         }
                     }
 

@@ -3,47 +3,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-
-def extract_graph_and_inputs(model, x):
-    exported = torch.export.export(model, (x,))
-
-    nodes = []
-    for node in exported.graph.nodes:
-        args = []
-        for arg in node.args:
-            if hasattr(arg, "name"):
-                args.append(arg.name)
-            elif isinstance(arg, (list, tuple)):
-                for sub_arg in arg:
-                    if hasattr(sub_arg, "name"):
-                        args.append(sub_arg.name)
-
-        shape = []
-        dtype = "f32"
-        if hasattr(node, "meta") and "val" in node.meta:
-            val = node.meta["val"]
-            if hasattr(val, "shape"):
-                shape = [int(dim) for dim in val.shape]
-            if hasattr(val, "dtype"):
-                dtype = str(val.dtype)
-
-        nodes.append((node.name, node.op, str(node.target), args, shape, dtype))
-
-    inputs = {"x": x.flatten().tolist()}
-
-    placeholder_nodes = [
-        n for n in exported.graph.nodes if n.op == "placeholder" and n.name != "x"
-    ]
-    params_dict = dict(model.named_parameters())
-
-    for node in placeholder_nodes:
-        for param_name, param in params_dict.items():
-            normalized_name = param_name.replace(".", "_")
-            if normalized_name in node.name:
-                inputs[node.name] = param.detach().flatten().tolist()
-                break
-
-    return nodes, inputs
+from test_utils import extract_graph_and_inputs, run_luminal_and_compare
 
 
 def test_compile_verbose_produces_more_output(capfd):
