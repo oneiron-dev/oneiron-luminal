@@ -369,11 +369,88 @@ fn compile(
                         tensor_map.insert(node.name.clone(), output);
                     }
 
-                    // TODO: Implement transpose
                     "aten.transpose.int" => {
-                        if verbose {
-                            eprintln!("    TODO: transpose operation not yet implemented");
+                        if node.args.len() < 3 {
+                            panic!(
+                                "aten.transpose requires 3 arguments (tensor, dim0, dim1), got {}",
+                                node.args.len()
+                            );
                         }
+
+                        let input_name = &node.args[0];
+                        let dim0_str = &node.args[1];
+                        let dim1_str = &node.args[2];
+
+                        if verbose {
+                            eprintln!(
+                                "    -> Computing: {}.transpose({}, {})",
+                                input_name, dim0_str, dim1_str
+                            );
+                        }
+
+                        let input = tensor_map.get(input_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find input '{}' in tensor_map for transpose operation",
+                                input_name
+                            )
+                        });
+
+                        // Parse dimension indices
+                        let mut dim0: i32 = dim0_str.parse().unwrap_or_else(|_| {
+                            panic!(
+                                "Could not parse dim0 '{}' as integer for transpose operation",
+                                dim0_str
+                            )
+                        });
+                        let mut dim1: i32 = dim1_str.parse().unwrap_or_else(|_| {
+                            panic!(
+                                "Could not parse dim1 '{}' as integer for transpose operation",
+                                dim1_str
+                            )
+                        });
+
+                        // Get number of dimensions
+                        let num_dims = input.dims().len() as i32;
+
+                        // Handle negative indices (Python-style indexing)
+                        if dim0 < 0 {
+                            dim0 += num_dims;
+                        }
+                        if dim1 < 0 {
+                            dim1 += num_dims;
+                        }
+
+                        // Validate dimensions
+                        if dim0 < 0 || dim0 >= num_dims {
+                            panic!(
+                                "dim0 {} is out of bounds for tensor with {} dimensions",
+                                dim0, num_dims
+                            );
+                        }
+                        if dim1 < 0 || dim1 >= num_dims {
+                            panic!(
+                                "dim1 {} is out of bounds for tensor with {} dimensions",
+                                dim1, num_dims
+                            );
+                        }
+
+                        if verbose {
+                            eprintln!("    -> Input shape: {:?}", input.dims());
+                            eprintln!(
+                                "    -> Transposing dimensions {} and {}",
+                                dim0, dim1
+                            );
+                        }
+
+                        // Apply transpose using luminal's transpose method
+                        // Multiply by 1.0 to materialize the transposed layout into contiguous memory
+                        let output = input.transpose(dim0 as usize, dim1 as usize) * 1.0;
+
+                        if verbose {
+                            eprintln!("    ✓ Created transpose operation");
+                            eprintln!("    Output shape: {:?}", output.shape);
+                        }
+                        tensor_map.insert(node.name.clone(), output);
                     }
 
                     "aten.dropout.default" => {
