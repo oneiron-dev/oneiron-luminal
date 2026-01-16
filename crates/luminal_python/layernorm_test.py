@@ -38,7 +38,7 @@ def test_layernorm_with_affine():
 
     model = Model()
     x = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
-    run_luminal_and_compare(model, x, atol=1e-5, verbose=True)
+    run_luminal_and_compare(model, x, atol=1e-5, verbose=False)
 
 
 def test_layernorm_no_affine():

@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 
-/// Represents a node in the exported PyTorch graph
 #[derive(Debug, Clone)]
 struct PyTorchGraphNode {
     name: String,
@@ -17,7 +16,6 @@ struct PyTorchGraphNode {
     dtype: String,
 }
 
-/// Main function: Load a PyTorch exported graph, build HLIR, and execute
 #[pyfunction]
 #[pyo3(signature = (nodes, inputs, verbose=false))]
 fn compile(
@@ -54,7 +52,6 @@ fn compile(
         });
     }
 
-    // Build HLIR graph
     let mut cx = Graph::new();
     let mut tensor_map: HashMap<String, GraphTensor> = HashMap::new();
     let mut output_names: Vec<String> = Vec::new();
@@ -69,7 +66,6 @@ fn compile(
                     );
                 }
 
-                // Create tensor with actual shape from PyTorch
                 let mut tensor = match node.shape.len() {
                     0 => cx.tensor((1,)),
                     1 => cx.tensor((node.shape[0],)),
@@ -85,8 +81,6 @@ fn compile(
                     }
                 };
 
-                // Check if this is an integer tensor (for embedding indices, etc.)
-                // PyTorch dtypes: torch.int64, torch.int32, torch.long, etc.
                 if node.dtype.contains("int") || node.dtype.contains("long") {
                     if verbose {
                         eprintln!("    -> Marking tensor as Int dtype");
@@ -105,7 +99,6 @@ fn compile(
                     eprintln!("  Creating operation: {} ({})", node.name, node.target);
                 }
 
-                // Map aten operations to HLIR
                 match node.target.as_str() {
                     "aten.add.Tensor" | "aten.add" => {
                         if node.args.len() < 2 {
@@ -122,20 +115,17 @@ fn compile(
                             eprintln!("    -> Computing: {} + {}", left_hand_name, right_hand_name);
                         }
 
-                        // Check if operands are tensors or scalars
                         let left_hand = tensor_map.get(left_hand_name);
                         let right_hand = tensor_map.get(right_hand_name);
 
                         let output = match (left_hand, right_hand) {
                             (Some(left), Some(right)) => {
-                                // Tensor + Tensor
                                 if verbose {
                                     eprintln!("    -> tensor + tensor");
                                 }
                                 *left + *right
                             }
                             (Some(tensor), None) => {
-                                // Tensor + Scalar
                                 let scalar: f32 = right_hand_name.parse().unwrap_or_else(|_| {
                                     panic!(
                                         "Could not parse '{}' as scalar for add operation",
@@ -148,7 +138,6 @@ fn compile(
                                 *tensor + scalar
                             }
                             (None, Some(tensor)) => {
-                                // Scalar + Tensor
                                 let scalar: f32 = left_hand_name.parse().unwrap_or_else(|_| {
                                     panic!(
                                         "Could not parse '{}' as scalar for add operation",
@@ -190,20 +179,17 @@ fn compile(
                             eprintln!("    -> Computing: {} * {}", left_hand_name, right_hand_name);
                         }
 
-                        // Check if left is a tensor
                         let left_hand = tensor_map.get(left_hand_name);
                         let right_hand = tensor_map.get(right_hand_name);
 
                         let output = match (left_hand, right_hand) {
                             (Some(left), Some(right)) => {
-                                // Tensor * Tensor
                                 if verbose {
                                     eprintln!("    -> tensor * tensor");
                                 }
                                 *left * *right
                             }
                             (Some(tensor), None) => {
-                                // Tensor * Scalar
                                 let scalar: f32 = right_hand_name.parse().unwrap_or_else(|_| {
                                     panic!(
                                         "Could not parse '{}' as scalar for mul operation",
@@ -216,7 +202,6 @@ fn compile(
                                 *tensor * scalar
                             }
                             (None, Some(tensor)) => {
-                                // Scalar * Tensor
                                 let scalar: f32 = left_hand_name.parse().unwrap_or_else(|_| {
                                     panic!(
                                         "Could not parse '{}' as scalar for mul operation",
@@ -244,8 +229,6 @@ fn compile(
                     }
 
                     "aten.linear.default" => {
-                        // linear(input, weight, bias=None)
-                        // output = input @ weight.T + bias
                         if node.args.len() < 2 {
                             panic!(
                                 "aten.linear requires at least 2 arguments, got {}",
@@ -273,20 +256,15 @@ fn compile(
                             )
                         });
 
-                        // Perform matmul with transposed weight: input @ weight.T
-                        // PyTorch linear: weight is (out_features, in_features), needs transpose
                         let weight_t = weight.permute((1, 0));
                         let mut output = input.matmul(weight_t);
 
-                        // Add bias if present (args[2])
                         if node.args.len() >= 3 {
                             let bias_name = &node.args[2];
                             if let Some(bias) = tensor_map.get(bias_name) {
                                 if verbose {
                                     eprintln!("    -> Adding bias: {}", bias_name);
                                 }
-                                // Bias has shape (out_features,), need to expand to (batch, out_features)
-                                // Get batch size from output (first dimension)
                                 let batch_size = output.dims()[0];
                                 let expanded_bias = bias.expand_lhs([batch_size]);
                                 output = output + expanded_bias;
@@ -300,11 +278,95 @@ fn compile(
                         tensor_map.insert(node.name.clone(), output);
                     }
 
-                    // TODO: Implement view/reshape operations
                     "aten.view.default" => {
-                        if verbose {
-                            eprintln!("    TODO: view operation not yet implemented");
+                        if node.args.len() < 2 {
+                            panic!(
+                                "aten.view requires at least 2 arguments (tensor, *shape), got {}",
+                                node.args.len()
+                            );
                         }
+
+                        let input_name = &node.args[0];
+
+                        if verbose {
+                            eprintln!(
+                                "    -> Computing: {}.view({:?})",
+                                input_name,
+                                &node.args[1..]
+                            );
+                        }
+
+                        let input = tensor_map.get(input_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find input '{}' in tensor_map for view operation",
+                                input_name
+                            )
+                        });
+
+                        let mut target_shape: Vec<i32> = Vec::new();
+                        for arg in &node.args[1..] {
+                            let dim: i32 = arg.parse().unwrap_or_else(|_| {
+                                panic!(
+                                    "Could not parse dimension '{}' as integer for view operation",
+                                    arg
+                                )
+                            });
+                            target_shape.push(dim);
+                        }
+
+                        if verbose {
+                            eprintln!("    -> Target shape: {:?}", target_shape);
+                            eprintln!("    -> Input shape: {:?}", input.dims());
+                        }
+
+                        let input_dims = input.dims();
+                        let mut total_elements = Expression::from(1);
+                        for dim in &input_dims {
+                            total_elements *= dim;
+                        }
+
+                        let mut inferred_idx: Option<usize> = None;
+                        let mut known_product = Expression::from(1);
+                        for (i, &dim) in target_shape.iter().enumerate() {
+                            if dim == -1 {
+                                if inferred_idx.is_some() {
+                                    panic!(
+                                        "Only one dimension can be inferred (set to -1) in view operation"
+                                    );
+                                }
+                                inferred_idx = Some(i);
+                            } else if dim > 0 {
+                                known_product *= dim as usize;
+                            } else {
+                                panic!(
+                                    "Invalid dimension {} in view operation (must be positive or -1)",
+                                    dim
+                                );
+                            }
+                        }
+
+                        let mut final_shape: Vec<Expression> = Vec::new();
+                        for (i, &dim) in target_shape.iter().enumerate() {
+                            if Some(i) == inferred_idx {
+                                let inferred_dim = total_elements / known_product;
+                                final_shape.push(inferred_dim);
+                            } else {
+                                final_shape.push(Expression::from(dim as usize));
+                            }
+                        }
+
+                        if verbose {
+                            eprintln!("    -> Final shape: {:?}", final_shape);
+                        }
+
+                        let mut output = *input;
+                        output.shape = ShapeTracker::new(final_shape);
+
+                        if verbose {
+                            eprintln!("    ✓ Created view operation");
+                            eprintln!("    Output shape: {:?}", output.shape);
+                        }
+                        tensor_map.insert(node.name.clone(), output);
                     }
 
                     // TODO: Implement transpose
@@ -331,8 +393,6 @@ fn compile(
                     }
 
                     "aten.layer_norm.default" => {
-                        // Layer normalization: normalize over the last N dimensions
-                        // layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5)
                         if node.args.len() >= 1 {
                             let input_name = &node.args[0];
 
@@ -349,14 +409,10 @@ fn compile(
                                     .and_then(|s| s.parse().ok())
                                     .unwrap_or(1e-5);
 
-                                // Apply layer normalization
-                                // For 2D tensors [batch, features], normalize over the last dimension (axis 1)
-                                // PyTorch LayerNorm normalizes over the last N dimensions
                                 let dims = input.dims();
-                                let norm_axis = dims.len() - 1; // Normalize over last dimension
+                                let norm_axis = dims.len() - 1;
                                 let mut output = input.layer_norm(norm_axis, eps);
 
-                                // Apply weight (gamma) if present (args[2])
                                 if node.args.len() >= 3 && node.args[2] != "None" {
                                     let weight_name = &node.args[2];
                                     if let Some(weight) = tensor_map.get(weight_name) {
@@ -366,21 +422,18 @@ fn compile(
                                                 weight_name
                                             );
                                         }
-                                        // Weight has shape (normalized_shape,), need to expand to match input
                                         let batch_size = output.dims()[0];
                                         let expanded_weight = weight.expand_lhs([batch_size]);
                                         output = output * expanded_weight;
                                     }
                                 }
 
-                                // Apply bias (beta) if present (args[3])
                                 if node.args.len() >= 4 && node.args[3] != "None" {
                                     let bias_name = &node.args[3];
                                     if let Some(bias) = tensor_map.get(bias_name) {
                                         if verbose {
                                             eprintln!("    -> Applying bias (beta): {}", bias_name);
                                         }
-                                        // Bias has shape (normalized_shape,), need to expand to match input
                                         let batch_size = output.dims()[0];
                                         let expanded_bias = bias.expand_lhs([batch_size]);
                                         output = output + expanded_bias;
@@ -416,8 +469,6 @@ fn compile(
 
                     "aten.gelu.default" => {
                         // GELU activation - TANH APPROXIMATION ONLY
-                        //
-                        // Check kwargs to ensure tanh approximation was requested
                         let is_tanh_approx = node
                             .kwargs
                             .get("approximate")
@@ -460,10 +511,6 @@ fn compile(
                     }
 
                     "aten.embedding.default" => {
-                        // Embedding lookup: embedding(weight, indices)
-                        // weight: (num_embeddings, embedding_dim) - the embedding table
-                        // indices: (batch, seq_len) - token IDs to look up
-                        // output: (batch, seq_len, embedding_dim) - gathered embeddings
                         if node.args.len() < 2 {
                             panic!(
                                 "aten.embedding requires at least 2 arguments, got {}",
@@ -500,31 +547,22 @@ fn compile(
                             eprintln!("    Indices dtype: {:?}", indices.dtype);
                         }
 
-                        // Get dimensions
                         let weight_dims = weight.dims();
                         let embedding_dim = weight_dims[1]; // num_embeddings x embedding_dim
                         let indices_dims = indices.dims();
 
-                        // Compute flat indices for gather operation
-                        // For each token_id, we need indices: token_id * embedding_dim + [0, 1, 2, ..., embedding_dim-1]
-                        //
-                        // Step 1: token_ids * embedding_dim
                         let scaled_indices = *indices * embedding_dim;
 
-                        // Step 2: Expand to (batch, seq_len, embedding_dim)
                         let expanded_scaled =
                             scaled_indices.expand_dim(indices_dims.len(), embedding_dim);
 
-                        // Step 3: Create arange(embedding_dim) and expand to (batch, seq_len, embedding_dim)
                         let mut offset = cx.arange(embedding_dim);
                         for (i, &dim) in indices_dims.iter().enumerate() {
                             offset = offset.expand_dim(i, dim);
                         }
 
-                        // Step 4: Add them together to get final indices
                         let gather_indices = expanded_scaled + offset;
 
-                        // Step 5: Gather from the flattened weight tensor
                         let output = weight.gather(gather_indices);
 
                         if verbose {
@@ -552,7 +590,6 @@ fn compile(
                         tensor_map.keys().collect::<Vec<_>>()
                     );
                 }
-                // Mark all output tensors
                 for arg in &node.args {
                     if let Some(tensor) = tensor_map.get(arg).copied() {
                         let output_tensor = tensor.output();
@@ -578,7 +615,6 @@ fn compile(
                     );
                 }
 
-                // Create tensor for parameters (weights, biases)
                 let tensor = match node.shape.len() {
                     0 => cx.tensor((1,)),
                     1 => cx.tensor((node.shape[0],)),
@@ -610,14 +646,12 @@ fn compile(
         }
     }
 
-    // Display graph summary
     if verbose {
         eprintln!("\n✓ Successfully built HLIR graph!");
         eprintln!("  Tensors: {}", tensor_map.len());
         eprintln!("  HLIR nodes: {}", cx.graph.node_count());
         eprintln!("  HLIR edges: {}", cx.graph.edge_count());
 
-        // Output HLIR graph to dot file
         eprintln!("\nExporting HLIR graph to dot file...");
         match cx.graph.to_dot() {
             Ok(dot_string) => {
@@ -641,21 +675,18 @@ fn compile(
             }
         }
 
-        // Build search space to populate operation metadata
         eprintln!("\nBuilding search space (populates op metadata)...");
     }
     cx.build_search_space::<NativeRuntime>();
     if verbose {
         eprintln!("  ✓ Search space built");
 
-        // Compile and get runtime
         eprintln!("\nCompiling graph...");
     }
     let mut runtime = cx.search(NativeRuntime::default(), 1);
     if verbose {
         eprintln!("  ✓ Compilation complete!");
 
-        // Output optimized LLIR graph to dot file
         eprintln!("\nExporting optimized LLIR graph to dot file...");
         match runtime.graph.to_dot() {
             Ok(dot_string) => {
@@ -681,7 +712,6 @@ fn compile(
             }
         }
 
-        // Set input data
         eprintln!("\nSetting input data...");
     }
     for (name, data) in &inputs {
@@ -692,15 +722,12 @@ fn compile(
                     name, tensor.dtype
                 );
             }
-            // Convert data based on tensor dtype
             match tensor.dtype {
                 DType::Int => {
-                    // Convert f32 to i32 for integer tensors
                     let int_data: Vec<i32> = data.iter().map(|&f| f as i32).collect();
                     runtime.set_data(tensor.id, int_data);
                 }
                 _ => {
-                    // Keep as f32 for float tensors
                     runtime.set_data(tensor.id, data.clone());
                 }
             }
@@ -709,7 +736,6 @@ fn compile(
         }
     }
 
-    // Execute
     if verbose {
         eprintln!("\nExecuting graph...");
     }
@@ -717,7 +743,6 @@ fn compile(
     if verbose {
         eprintln!("  ✓ Execution complete!");
 
-        // Get outputs
         eprintln!("\nCollecting outputs...");
     }
     let mut outputs = HashMap::new();
@@ -746,7 +771,6 @@ fn compile(
     Ok(outputs)
 }
 
-/// The Python module
 #[pymodule]
 fn luminal_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compile, m)?)?;
