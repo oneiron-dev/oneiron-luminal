@@ -436,14 +436,9 @@ fn compile(
 
                         if verbose {
                             eprintln!("    -> Input shape: {:?}", input.dims());
-                            eprintln!(
-                                "    -> Transposing dimensions {} and {}",
-                                dim0, dim1
-                            );
+                            eprintln!("    -> Transposing dimensions {} and {}", dim0, dim1);
                         }
 
-                        // Apply transpose using luminal's transpose method
-                        // Multiply by 1.0 to materialize the transposed layout into contiguous memory
                         let output = input.transpose(dim0 as usize, dim1 as usize) * 1.0;
 
                         if verbose {
@@ -528,10 +523,125 @@ fn compile(
                         }
                     }
 
-                    // TODO: Implement tensor split
                     "aten.split.Tensor" => {
+                        // Split doesn't actually transform the data - it just conceptually divides it
+                        // The actual slicing happens in getitem
+                        if node.args.len() < 2 {
+                            panic!(
+                                "aten.split requires at least 2 arguments (tensor, split_size), got {}",
+                                node.args.len()
+                            );
+                        }
+
+                        let input_name = &node.args[0];
+                        let split_size_str = &node.args[1];
+                        let dim_str = if node.args.len() >= 3 {
+                            &node.args[2]
+                        } else {
+                            "0"
+                        };
+
                         if verbose {
-                            eprintln!("    TODO: split operation not yet implemented");
+                            eprintln!(
+                                "    -> Split operation: {}.split({}, dim={})",
+                                input_name, split_size_str, dim_str
+                            );
+                        }
+
+                        let input = *tensor_map.get(input_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find input '{}' in tensor_map for split operation",
+                                input_name
+                            )
+                        });
+
+                        tensor_map.insert(node.name.clone(), input);
+
+                        if verbose {
+                            eprintln!("    ✓ Split metadata recorded");
+                        }
+                    }
+
+                    "<built-in function getitem>" | "operator.getitem" | "getitem" => {
+                        if node.args.len() < 2 {
+                            panic!(
+                                "getitem requires 2 arguments (container, index), got {}",
+                                node.args.len()
+                            );
+                        }
+
+                        let container_name = &node.args[0];
+                        let index_str = &node.args[1];
+
+                        if verbose {
+                            eprintln!("    -> Computing: {}[{}]", container_name, index_str);
+                        }
+
+                        let index: usize = index_str.parse().unwrap_or_else(|_| {
+                            panic!(
+                                "Could not parse index '{}' as integer for getitem operation",
+                                index_str
+                            )
+                        });
+
+                        let container = *tensor_map.get(container_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find container '{}' in tensor_map for getitem operation",
+                                container_name
+                            )
+                        });
+
+                        let split_node = graph_nodes.iter().find(|n| n.name == *container_name);
+
+                        if let Some(split_node) = split_node {
+                            if split_node.target == "aten.split.Tensor"
+                                && split_node.args.len() >= 2
+                            {
+                                let split_size: usize = split_node.args[1].parse().unwrap();
+                                let dim_str = if split_node.args.len() >= 3 {
+                                    &split_node.args[2]
+                                } else {
+                                    "0"
+                                };
+                                let mut dim: i32 = dim_str.parse().unwrap();
+
+                                let num_dims = container.dims().len() as i32;
+                                if dim < 0 {
+                                    dim += num_dims;
+                                }
+                                let dim_usize = dim as usize;
+
+                                let start = index * split_size;
+                                let dim_size = container.dims()[dim_usize].to_usize().unwrap();
+                                let end = std::cmp::min(start + split_size, dim_size);
+
+                                if verbose {
+                                    eprintln!("    -> Extracting chunk {} from split", index);
+                                    eprintln!(
+                                        "    -> Slicing dimension {} from {} to {}",
+                                        dim, start, end
+                                    );
+                                }
+
+                                let chunk = container.slice_along(start..end, dim_usize) * 1.0;
+
+                                if verbose {
+                                    eprintln!("    ✓ Retrieved chunk");
+                                    eprintln!("    Chunk shape: {:?}", chunk.shape);
+                                }
+
+                                tensor_map.insert(node.name.clone(), chunk);
+                            } else {
+                                panic!(
+                                    "getitem container '{}' is not a split operation",
+                                    container_name
+                                );
+                            }
+                        } else {
+                            panic!(
+                                "Could not find split node '{}' for getitem operation",
+                                container_name
+                            );
                         }
                     }
 
