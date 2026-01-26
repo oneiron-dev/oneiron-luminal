@@ -464,6 +464,38 @@ fn compile(
                         }
                     }
 
+                    "aten.lift_fresh_copy.default" => {
+                        // This operation creates a fresh copy of a tensor
+                        // Used by PyTorch export to track constants/parameters
+                        if node.args.is_empty() {
+                            panic!(
+                                "aten.lift_fresh_copy requires at least 1 argument (tensor), got 0"
+                            );
+                        }
+
+                        let input_name = &node.args[0];
+
+                        if verbose {
+                            eprintln!("    -> Creating fresh copy of: {}", input_name);
+                        }
+
+                        let input = *tensor_map.get(input_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find input '{}' in tensor_map for lift_fresh_copy operation",
+                                input_name
+                            )
+                        });
+
+                        // Just pass through - luminal handles the graph structure
+                        let output = input;
+
+                        if verbose {
+                            eprintln!("    ✓ Created fresh copy (pass-through)");
+                            eprintln!("    Output shape: {:?}", output.shape);
+                        }
+                        tensor_map.insert(node.name.clone(), output);
+                    }
+
                     "aten.layer_norm.default" => {
                         if node.args.len() >= 1 {
                             let input_name = &node.args[0];
@@ -645,13 +677,386 @@ fn compile(
                         }
                     }
 
-                    // TODO: Implement scaled dot product attention
-                    "aten.scaled_dot_product_attention.default" => {
-                        if verbose {
-                            eprintln!(
-                                "    TODO: scaled_dot_product_attention operation not yet implemented"
+                    "aten.unsqueeze.default" => {
+                        if node.args.len() < 2 {
+                            panic!(
+                                "aten.unsqueeze requires 2 arguments (tensor, dim), got {}",
+                                node.args.len()
                             );
                         }
+
+                        let input_name = &node.args[0];
+                        let dim_str = &node.args[1];
+
+                        if verbose {
+                            eprintln!("    -> Computing: {}.unsqueeze({})", input_name, dim_str);
+                        }
+
+                        let input = *tensor_map.get(input_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find input '{}' in tensor_map for unsqueeze operation",
+                                input_name
+                            )
+                        });
+
+                        // Parse dimension
+                        let mut dim: i32 = dim_str.parse().unwrap_or_else(|_| {
+                            panic!(
+                                "Could not parse dim '{}' as integer for unsqueeze operation",
+                                dim_str
+                            )
+                        });
+
+                        // Get number of dimensions (after unsqueeze will be +1)
+                        let num_dims = input.dims().len() as i32;
+                        let new_num_dims = num_dims + 1;
+
+                        // Handle negative indices
+                        if dim < 0 {
+                            dim += new_num_dims;
+                        }
+
+                        // Validate dimension
+                        if dim < 0 || dim >= new_num_dims {
+                            panic!(
+                                "dim {} is out of bounds for unsqueeze operation (valid range: 0 to {})",
+                                dim,
+                                new_num_dims - 1
+                            );
+                        }
+
+                        if verbose {
+                            eprintln!("    -> Input shape: {:?}", input.dims());
+                            eprintln!("    -> Adding dimension of size 1 at position {}", dim);
+                        }
+
+                        // Apply unsqueeze
+                        let output = input.unsqueeze(dim as usize);
+
+                        if verbose {
+                            eprintln!("    ✓ Created unsqueeze operation");
+                            eprintln!("    Output shape: {:?}", output.shape);
+                        }
+                        tensor_map.insert(node.name.clone(), output);
+                    }
+
+                    "aten.squeeze.dim" => {
+                        if node.args.len() < 2 {
+                            panic!(
+                                "aten.squeeze requires 2 arguments (tensor, dim), got {}",
+                                node.args.len()
+                            );
+                        }
+
+                        let input_name = &node.args[0];
+                        let dim_str = &node.args[1];
+
+                        if verbose {
+                            eprintln!("    -> Computing: {}.squeeze({})", input_name, dim_str);
+                        }
+
+                        let input = *tensor_map.get(input_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find input '{}' in tensor_map for squeeze operation",
+                                input_name
+                            )
+                        });
+
+                        // Parse dimension
+                        let mut dim: i32 = dim_str.parse().unwrap_or_else(|_| {
+                            panic!(
+                                "Could not parse dim '{}' as integer for squeeze operation",
+                                dim_str
+                            )
+                        });
+
+                        // Get number of dimensions
+                        let num_dims = input.dims().len() as i32;
+
+                        // Handle negative indices (relative to current shape)
+                        if dim < 0 {
+                            dim += num_dims;
+                        }
+
+                        // Validate dimension
+                        if dim < 0 || dim >= num_dims {
+                            panic!(
+                                "dim {} is out of bounds for squeeze operation (valid range: 0 to {})",
+                                dim,
+                                num_dims - 1
+                            );
+                        }
+
+                        // Validate that the dimension has size 1
+                        let dim_size = input.dims()[dim as usize].to_usize().unwrap();
+                        if dim_size != 1 {
+                            panic!(
+                                "Cannot squeeze dimension {} with size {} (only dimensions of size 1 can be squeezed)",
+                                dim, dim_size
+                            );
+                        }
+
+                        if verbose {
+                            eprintln!("    -> Input shape: {:?}", input.dims());
+                            eprintln!("    -> Removing dimension {} (size 1)", dim);
+                        }
+
+                        // Apply squeeze
+                        let output = input.squeeze(dim as usize);
+
+                        if verbose {
+                            eprintln!("    ✓ Created squeeze operation");
+                            eprintln!("    Output shape: {:?}", output.shape);
+                        }
+                        tensor_map.insert(node.name.clone(), output);
+                    }
+
+                    "aten.arange.default" => {
+                        // torch.arange(end) - creates [0, 1, 2, ..., end-1]
+                        if node.args.is_empty() {
+                            panic!("aten.arange.default requires at least 1 argument (end), got 0");
+                        }
+
+                        let end_str = &node.args[0];
+
+                        if verbose {
+                            eprintln!("    -> Computing: arange({})", end_str);
+                            eprintln!("    DEBUG: arange node name: {}", node.name);
+                            eprintln!("    DEBUG: arange args: {:?}", node.args);
+                            eprintln!("    DEBUG: arange shape: {:?}", node.shape);
+                        }
+
+                        // Parse end value
+                        let end: usize = end_str.parse().unwrap_or_else(|_| {
+                            panic!(
+                                "Could not parse end '{}' as integer for arange operation",
+                                end_str
+                            )
+                        });
+
+                        if verbose {
+                            eprintln!("    -> Creating range [0, 1, ..., {}]", end - 1);
+                            eprintln!("    DEBUG: Parsed end value: {}", end);
+                        }
+
+                        // Create arange [0, 1, ..., end-1]
+                        let output = cx.arange(end);
+
+                        if verbose {
+                            eprintln!("    ✓ Created arange operation");
+                            eprintln!("    Output shape: {:?}", output.shape);
+                            eprintln!("    DEBUG: arange tensor ID: {:?}", output.id);
+                            eprintln!("    DEBUG: arange dtype: {:?}", output.dtype);
+                        }
+                        tensor_map.insert(node.name.clone(), output);
+                    }
+
+                    "aten.arange.start" => {
+                        // torch.arange(start, end) - creates [start, start+1, ..., end-1]
+                        if node.args.len() < 2 {
+                            panic!(
+                                "aten.arange.start requires 2 arguments (start, end), got {}",
+                                node.args.len()
+                            );
+                        }
+
+                        let start_str = &node.args[0];
+                        let end_str = &node.args[1];
+
+                        if verbose {
+                            eprintln!("    -> Computing: arange({}, {})", start_str, end_str);
+                        }
+
+                        // Parse start and end values
+                        let start: f32 = start_str.parse().unwrap_or_else(|_| {
+                            panic!(
+                                "Could not parse start '{}' as number for arange operation",
+                                start_str
+                            )
+                        });
+                        let end: f32 = end_str.parse().unwrap_or_else(|_| {
+                            panic!(
+                                "Could not parse end '{}' as number for arange operation",
+                                end_str
+                            )
+                        });
+
+                        // Calculate length
+                        let length = (end - start).ceil() as usize;
+
+                        if verbose {
+                            eprintln!(
+                                "    -> Creating range [{}, {}, ..., {}]",
+                                start,
+                                start + 1.0,
+                                end - 1.0
+                            );
+                            eprintln!("    -> Length: {}", length);
+                        }
+
+                        // Create base arange [0, 1, ..., length-1] and shift by start
+                        let output = cx.arange(length) + start;
+
+                        if verbose {
+                            eprintln!("    ✓ Created arange operation");
+                            eprintln!("    Output shape: {:?}", output.shape);
+                        }
+                        tensor_map.insert(node.name.clone(), output);
+                    }
+
+                    "aten.arange.start_step" => {
+                        // torch.arange(start, end, step) - creates [start, start+step, start+2*step, ...]
+                        if node.args.len() < 3 {
+                            panic!(
+                                "aten.arange.start_step requires 3 arguments (start, end, step), got {}",
+                                node.args.len()
+                            );
+                        }
+
+                        let start_str = &node.args[0];
+                        let end_str = &node.args[1];
+                        let step_str = &node.args[2];
+
+                        if verbose {
+                            eprintln!(
+                                "    -> Computing: arange({}, {}, {})",
+                                start_str, end_str, step_str
+                            );
+                        }
+
+                        // Parse start, end, and step values
+                        let start: f32 = start_str.parse().unwrap_or_else(|_| {
+                            panic!(
+                                "Could not parse start '{}' as number for arange operation",
+                                start_str
+                            )
+                        });
+                        let end: f32 = end_str.parse().unwrap_or_else(|_| {
+                            panic!(
+                                "Could not parse end '{}' as number for arange operation",
+                                end_str
+                            )
+                        });
+                        let step: f32 = step_str.parse().unwrap_or_else(|_| {
+                            panic!(
+                                "Could not parse step '{}' as number for arange operation",
+                                step_str
+                            )
+                        });
+
+                        // Calculate length: ceil((end - start) / step)
+                        let length = ((end - start) / step).ceil() as usize;
+
+                        if verbose {
+                            eprintln!(
+                                "    -> Creating range [{}, {}, ..., <{}]",
+                                start,
+                                start + step,
+                                end
+                            );
+                            eprintln!("    -> Length: {}, Step: {}", length, step);
+                        }
+
+                        // Create base arange [0, 1, ..., length-1], scale by step, and shift by start
+                        let output = cx.arange(length) * step + start;
+
+                        if verbose {
+                            eprintln!("    ✓ Created arange operation");
+                            eprintln!("    Output shape: {:?}", output.shape);
+                        }
+                        tensor_map.insert(node.name.clone(), output);
+                    }
+
+                    "aten.scaled_dot_product_attention.default" => {
+                        if node.args.len() < 3 {
+                            panic!(
+                                "aten.scaled_dot_product_attention requires at least 3 arguments (query, key, value), got {}",
+                                node.args.len()
+                            );
+                        }
+
+                        let query_name = &node.args[0];
+                        let key_name = &node.args[1];
+                        let value_name = &node.args[2];
+
+                        if verbose {
+                            eprintln!(
+                                "    -> Computing: scaled_dot_product_attention({}, {}, {})",
+                                query_name, key_name, value_name
+                            );
+                        }
+
+                        let query = *tensor_map.get(query_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find query '{}' in tensor_map for SDPA operation",
+                                query_name
+                            )
+                        });
+                        let key = *tensor_map.get(key_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find key '{}' in tensor_map for SDPA operation",
+                                key_name
+                            )
+                        });
+                        let value = *tensor_map.get(value_name).unwrap_or_else(|| {
+                            panic!(
+                                "Could not find value '{}' in tensor_map for SDPA operation",
+                                value_name
+                            )
+                        });
+
+                        if verbose {
+                            eprintln!("    -> Query shape: {:?}", query.dims());
+                            eprintln!("    -> Key shape: {:?}", key.dims());
+                            eprintln!("    -> Value shape: {:?}", value.dims());
+                        }
+
+                        // Get head dimension (last dimension)
+                        let query_dims = query.dims();
+                        let head_dim = query_dims[query_dims.len() - 1].to_usize().unwrap();
+                        let scale = 1.0 / (head_dim as f32).sqrt();
+
+                        if verbose {
+                            eprintln!("    -> Head dimension: {}", head_dim);
+                            eprintln!("    -> Scale factor: {}", scale);
+                        }
+
+                        // Transpose key on last two dimensions
+                        let num_dims = key.dims().len();
+                        let key_t = key.transpose(num_dims - 2, num_dims - 1);
+
+                        if verbose {
+                            eprintln!("    -> Key transposed shape: {:?}", key_t.dims());
+                        }
+
+                        // Compute Q @ K^T
+                        let scores = query.matmul(key_t);
+
+                        if verbose {
+                            eprintln!("    -> Scores shape (Q @ K^T): {:?}", scores.dims());
+                        }
+
+                        // Scale by 1/sqrt(d_k)
+                        let scaled_scores = scores * scale;
+
+                        // Apply softmax on last dimension
+                        let attention_weights = scaled_scores.softmax(num_dims - 1);
+
+                        if verbose {
+                            eprintln!(
+                                "    -> Attention weights shape: {:?}",
+                                attention_weights.dims()
+                            );
+                        }
+
+                        // Compute attention @ V
+                        let output = attention_weights.matmul(value);
+
+                        if verbose {
+                            eprintln!("    ✓ Created scaled dot product attention");
+                            eprintln!("    Output shape: {:?}", output.shape);
+                        }
+                        tensor_map.insert(node.name.clone(), output);
                     }
 
                     "aten.gelu.default" => {
@@ -759,6 +1164,173 @@ fn compile(
                         tensor_map.insert(node.name.clone(), output);
                     }
 
+                    "aten.index.Tensor" => {
+                        // Expect: args[0] = input tensor name
+                        let input_name = node.args.get(0).unwrap().clone();
+                        let input = *tensor_map.get(&input_name).unwrap_or_else(|| {
+                            panic!("aten.index.Tensor: missing input tensor '{}'", input_name)
+                        });
+
+                        // Metadata injected from Python
+                        let index_dim: usize = node.kwargs.get("index_dim")
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "aten.index.Tensor: missing/invalid kwargs['index_dim'] (spec={:?})",
+                                    node.kwargs.get("index_spec")
+                                )
+                            });
+
+                        let index_tensor_name =
+                            node.kwargs.get("index_tensor").cloned().unwrap_or_else(|| {
+                                panic!(
+                                    "aten.index.Tensor: missing kwargs['index_tensor'] (spec={:?})",
+                                    node.kwargs.get("index_spec")
+                                )
+                            });
+
+                        let indices = *tensor_map.get(&index_tensor_name).unwrap_or_else(|| {
+                            panic!(
+                                "aten.index.Tensor: missing index tensor '{}'",
+                                index_tensor_name
+                            )
+                        });
+
+                        let in_dims = input.dims();
+                        let rank = in_dims.len();
+                        if index_dim >= rank {
+                            panic!(
+                                "aten.index.Tensor: index_dim={} out of range for rank={}",
+                                index_dim, rank
+                            );
+                        }
+
+                        if verbose {
+                            eprintln!(
+                                "  -> aten.index.Tensor input={} shape={:?} index_dim={} index_tensor={} idx_shape={:?} idx_dtype={:?} spec={}",
+                                input_name,
+                                in_dims,
+                                index_dim,
+                                index_tensor_name,
+                                indices.dims(),
+                                indices.dtype, // if you store dtype
+                                node.kwargs.get("index_spec").cloned().unwrap_or_default()
+                            );
+                        }
+
+                        // --- Simple supported subset ---
+                        // We implement: out = input with exactly ONE dimension 'index_dim' gathered by an int tensor.
+                        // All other dimensions behave like ':' (full slice).
+                        //
+                        // Strategy:
+                        // 1) Flatten input to 2D: (prefix, indexed_dim, suffix_flat)
+                        //    -> reshape to (prefix*indexed_dim, suffix_flat) or (prefix, indexed_dim*suffix_flat)
+                        //    Choose a layout that lets us gather rows with one index per prefix entry.
+                        // 2) Convert indices into "row indices" into the flattened matrix
+                        // 3) Use gather to fetch full suffix_flat block
+                        // 4) Reshape back to the correct output shape, preserving indexed dim size from indices
+
+                        // Compute sizes (require static dims for now)
+                        let mut prefix = 1usize;
+                        for d in 0..index_dim {
+                            prefix *= in_dims[d]
+                                .to_usize()
+                                .expect("aten.index.Tensor: dynamic prefix dim not supported yet");
+                        }
+                        let indexed = in_dims[index_dim]
+                            .to_usize()
+                            .expect("aten.index.Tensor: dynamic indexed dim not supported yet");
+
+                        let mut suffix = 1usize;
+                        for d in (index_dim + 1)..rank {
+                            suffix *= in_dims[d]
+                                .to_usize()
+                                .expect("aten.index.Tensor: dynamic suffix dim not supported yet");
+                        }
+
+                        // Reshape input to (prefix, indexed, suffix)
+                        // then flatten to (prefix*indexed, suffix) so we can gather "rows" (a whole suffix block)
+                        let mut x3 = input;
+                        x3.shape = ShapeTracker::new(vec![
+                            Expression::from(prefix),
+                            Expression::from(indexed),
+                            Expression::from(suffix),
+                        ]);
+
+                        let mut x2 = x3;
+                        x2.shape = ShapeTracker::new(vec![
+                            Expression::from(prefix * indexed),
+                            Expression::from(suffix),
+                        ]);
+
+                        // Normalize indices shape:
+                        // We support either:
+                        //  - scalar/len1 -> broadcast to (prefix,)
+                        //  - (prefix,)   -> use directly
+                        //
+                        // (This is still generic: prefix is derived from shape, not GPT-specific.)
+                        let mut idx = indices;
+                        let idx_dims = idx.dims();
+                        if idx_dims.len() == 0 {
+                            // scalar -> treat as (1,) then broadcast
+                            idx = idx.unsqueeze(0);
+                        }
+                        let idx_len = idx
+                            .dims()
+                            .iter()
+                            .fold(1usize, |acc, e| acc * e.to_usize().unwrap());
+                        if idx_len == 1 && prefix != 1 {
+                            idx = idx.expand_lhs([Expression::from(prefix)]);
+                        } else if idx_len != prefix {
+                            panic!(
+                                "aten.index.Tensor: unsupported indices size. expected 1 or prefix={}, got {} (idx_shape={:?})",
+                                prefix,
+                                idx_len,
+                                idx.dims()
+                            );
+                        }
+
+                        // Now idx is effectively (prefix,)
+                        // Compute flat row indices: row = arange(prefix) * indexed + idx
+                        // NOTE: this assumes idx contains integer values in [0, indexed) or negative indexing already normalized upstream.
+                        // If you need negative handling, do it either in Python (preferred) or add a normalize op later.
+                        let base = cx.arange(prefix) * (indexed as f32); // ideally int arange; use your existing for now
+                        let row = base + idx; // (prefix,)
+
+                        // Gather full suffix blocks from x2 (shape (prefix*indexed, suffix))
+                        let suffix_expr = Expression::from(suffix);
+                        let row_dims = row.dims(); // should be (prefix,)
+
+                        let scaled = row * suffix_expr;
+                        let expanded_scaled = scaled.expand_dim(row_dims.len(), suffix_expr);
+
+                        let mut offset = cx.arange(suffix);
+                        for (i, &d) in row_dims.iter().enumerate() {
+                            offset = offset.expand_dim(i, d);
+                        }
+                        let gather_idx = expanded_scaled + offset;
+                        let gathered = x2.gather(gather_idx); // (prefix, suffix)
+
+                        // Reshape back to original rank with indexed dim replaced by 1 (since we're selecting one index per prefix entry)
+                        // Output shape becomes: original dims, but indexed dim becomes 1, and suffix dims restored.
+                        //
+                        // We currently produce (prefix, suffix) and reshape to:
+                        //   dims[0:index_dim] + [1] + dims[index_dim+1:]
+                        let mut out_dims: Vec<Expression> = Vec::new();
+                        for d in 0..index_dim {
+                            out_dims.push(in_dims[d]);
+                        }
+                        out_dims.push(Expression::from(1));
+                        for d in (index_dim + 1)..rank {
+                            out_dims.push(in_dims[d]);
+                        }
+
+                        let mut out = gathered;
+                        out.shape = ShapeTracker::new(out_dims);
+
+                        tensor_map.insert(node.name.clone(), out);
+                    }
+
                     _ => {
                         panic!(
                             "Unsupported operation: {} (node: {}). This operation needs to be implemented.",
@@ -777,7 +1349,16 @@ fn compile(
                         tensor_map.keys().collect::<Vec<_>>()
                     );
                 }
+
                 for arg in &node.args {
+                    // ✅ Skip torch.export tuple entries like (logits, None)
+                    if arg == "None" {
+                        if verbose {
+                            eprintln!("    -> Skipping None output");
+                        }
+                        continue;
+                    }
+
                     if let Some(tensor) = tensor_map.get(arg).copied() {
                         let output_tensor = tensor.output();
                         tensor_map.insert(arg.clone(), output_tensor);
@@ -863,13 +1444,55 @@ fn compile(
         }
 
         eprintln!("\nBuilding search space (populates op metadata)...");
+
+        // Add detailed node information before building search space
+        eprintln!("\n==== PRE-SEARCH SPACE DEBUG ====");
+        eprintln!("  Total HLIR nodes: {}", cx.graph.node_count());
+        eprintln!("  Total HLIR edges: {}", cx.graph.edge_count());
+
+        // Log all tensors in the map with their properties
+        eprintln!("\n  Tensor map contents:");
+        for (name, tensor) in tensor_map.iter() {
+            eprintln!(
+                "    - {}: shape={:?}, ID={:?}",
+                name, tensor.shape, tensor.id
+            );
+        }
+
+        eprintln!("\n  Output tensors to retrieve:");
+        for output_name in &output_names {
+            if let Some(tensor) = tensor_map.get(output_name) {
+                eprintln!(
+                    "    - {}: shape={:?}, ID={:?}",
+                    output_name, tensor.shape, tensor.id
+                );
+            } else {
+                eprintln!("    - {} (NOT FOUND IN TENSOR MAP!)", output_name);
+            }
+        }
+        eprintln!("================================");
     }
+
     cx.build_search_space::<NativeRuntime>();
+
+    if verbose {
+        eprintln!("Egglog running...");
+    }
+
     if verbose {
         eprintln!("  ✓ Search space built");
 
         eprintln!("\nCompiling graph...");
+        eprintln!("\n==== PRE-COMPILE DEBUG ====");
+        eprintln!("  About to call cx.search() with NativeRuntime");
+        eprintln!(
+            "  Graph state: {} nodes, {} edges",
+            cx.graph.node_count(),
+            cx.graph.edge_count()
+        );
+        eprintln!("============================");
     }
+
     let mut runtime = cx.search(NativeRuntime::default(), 1);
     if verbose {
         eprintln!("  ✓ Compilation complete!");
@@ -933,8 +1556,21 @@ fn compile(
         eprintln!("\nCollecting outputs...");
     }
     let mut outputs = HashMap::new();
+    if verbose {
+        eprintln!("  Number of output names: {}", output_names.len());
+        if !output_names.is_empty() {
+            eprintln!("  Output names: {:?}", output_names);
+            eprintln!(
+                "  First few tensor map keys: {:?}",
+                tensor_map.keys().take(10).collect::<Vec<_>>()
+            );
+        }
+    }
     for name in &output_names {
         if let Some(tensor) = tensor_map.get(name) {
+            if verbose {
+                eprintln!("  Found tensor {} with id: {:?}", name, tensor.id);
+            }
             let output_data = runtime.get_f32(tensor.id).to_vec();
             if verbose {
                 eprintln!("  Output {} has {} elements", name, output_data.len());
@@ -942,6 +1578,14 @@ fn compile(
             outputs.insert(name.clone(), output_data);
         } else if verbose {
             eprintln!("  WARNING: Output {} not found in tensor_map", name);
+            eprintln!(
+                "    Available keys containing '{}': {:?}",
+                name,
+                tensor_map
+                    .keys()
+                    .filter(|k| k.contains(name))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 

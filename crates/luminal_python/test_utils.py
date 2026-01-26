@@ -3,43 +3,79 @@
 import pytest
 import torch
 
-
 def extract_graph_and_inputs(model, x):
-    """Extract graph nodes and inputs from a PyTorch model
-
-    Args:
-        model: PyTorch model to export
-        x: Input tensor for the model
-
-    Returns:
-        tuple: (nodes, inputs) where nodes is a list of graph node tuples
-               and inputs is a dict of input tensors
-    """
-    exported = torch.export.export(model, (x,))
+    # Handle both single tensor and tuple of tensors
+    if isinstance(x, tuple):
+        input_tensors = x
+        exported = torch.export.export(model, input_tensors)
+    else:
+        input_tensors = (x,)
+        exported = torch.export.export(model, (x,))
 
     nodes = []
+
+    def _flatten_arg(arg, out):
+        """Append arg(s) to out as strings, matching existing Rust expectations."""
+        if hasattr(arg, "name"):
+            out.append(arg.name)
+        elif arg is None:
+            out.append("None")
+        elif isinstance(arg, (int, float, bool, str)):
+            out.append(str(arg))
+        elif isinstance(arg, (list, tuple)):
+            for sub in arg:
+                _flatten_arg(sub, out)
+        else:
+            # fallback: keep string form
+            out.append(str(arg))
+
     for node in exported.graph.nodes:
+        # ---- args: keep current flattened positional behavior ----
         args = []
         for arg in node.args:
-            if hasattr(arg, "name"):
-                # It's a node reference
-                args.append(arg.name)
-            elif isinstance(arg, (int, float, bool, str)):
-                # It's a scalar constant - convert to string
-                args.append(str(arg))
-            elif isinstance(arg, (list, tuple)):
-                for sub_arg in arg:
-                    if hasattr(sub_arg, "name"):
-                        args.append(sub_arg.name)
-                    elif isinstance(sub_arg, (int, float, bool, str)):
-                        args.append(str(sub_arg))
+            _flatten_arg(arg, args)
 
-        # Extract kwargs - convert values to strings for Rust HashMap<String, String>
+        # ---- kwargs: keep existing behavior, but allow adding extra metadata ----
         kwargs = {}
         if hasattr(node, "kwargs") and node.kwargs:
             for key, value in node.kwargs.items():
                 kwargs[str(key)] = str(value)
 
+        # ---- NEW: extra metadata for aten.index.Tensor (without changing args) ----
+        if str(node.target) == "aten.index.Tensor":
+            # Export usually has (input, indices) where indices is a tuple/list like (None, idx_node, None)
+            # BUT since args are flattened we can’t recover dim position from args alone.
+            # So inspect the structured node.args directly here and stash the results in kwargs.
+            if len(node.args) >= 2:
+                indices_obj = node.args[1]
+
+                index_dim = None
+                index_tensor = None
+                spec_parts = []
+
+                if isinstance(indices_obj, (list, tuple)):
+                    for i, item in enumerate(indices_obj):
+                        if item is None:
+                            spec_parts.append("None")
+                            continue
+                        if hasattr(item, "name"):
+                            spec_parts.append(item.name)
+                            # pick the first non-None tensor index
+                            if index_dim is None:
+                                index_dim = i
+                                index_tensor = item.name
+                        else:
+                            spec_parts.append(str(item))
+                else:
+                    # Sometimes it’s not a tuple/list; just record it for debug
+                    spec_parts.append(str(indices_obj))
+
+                if index_dim is not None and index_tensor is not None:
+                    kwargs["index_dim"] = str(index_dim)
+                    kwargs["index_tensor"] = str(index_tensor)
+                kwargs["index_spec"] = ",".join(spec_parts)
+
+        # ---- meta: shape + dtype ----
         shape = []
         dtype = "f32"
         if hasattr(node, "meta") and "val" in node.meta:
@@ -51,21 +87,28 @@ def extract_graph_and_inputs(model, x):
 
         nodes.append((node.name, node.op, str(node.target), args, kwargs, shape, dtype))
 
-    inputs = {"x": x.flatten().tolist()}
+    # ---- Collect input placeholders from the graph (unchanged) ----
+    inputs = {}
+    placeholder_nodes = [n for n in exported.graph.nodes if n.op == "placeholder"]
 
-    placeholder_nodes = [
-        n for n in exported.graph.nodes if n.op == "placeholder" and n.name != "x"
-    ]
-    params_dict = dict(model.named_parameters())
-
+    input_placeholder_count = 0
     for node in placeholder_nodes:
+        is_parameter = False
+        params_dict = dict(model.named_parameters())
         for param_name, param in params_dict.items():
             normalized_name = param_name.replace(".", "_")
             if normalized_name in node.name:
                 inputs[node.name] = param.detach().flatten().tolist()
+                is_parameter = True
                 break
 
+        if not is_parameter:
+            if input_placeholder_count < len(input_tensors):
+                inputs[node.name] = input_tensors[input_placeholder_count].flatten().tolist()
+                input_placeholder_count += 1
+
     return nodes, inputs
+
 
 
 def run_luminal_and_compare(model, x, atol, verbose=False):
