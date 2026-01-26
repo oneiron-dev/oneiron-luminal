@@ -56,7 +56,39 @@ fn compile(
     let mut tensor_map: HashMap<String, GraphTensor> = HashMap::new();
     let mut output_names: Vec<String> = Vec::new();
 
+    // Collect all unique operation types for debugging
+    if verbose {
+        let mut op_types = std::collections::HashSet::new();
+        let mut target_types = std::collections::HashSet::new();
+
+        for node in &graph_nodes {
+            op_types.insert(node.op.clone());
+            if node.op == "call_function" {
+                target_types.insert(node.target.clone());
+            }
+        }
+
+        eprintln!("\n=== Graph Analysis ===");
+        eprintln!("Total nodes: {}", graph_nodes.len());
+        eprintln!("Unique op types: {:?}", op_types);
+        eprintln!("\nUnique call_function targets ({} total):", target_types.len());
+        let mut sorted_targets: Vec<_> = target_types.into_iter().collect();
+        sorted_targets.sort();
+        for target in sorted_targets {
+            eprintln!("  - {}", target);
+        }
+        eprintln!("======================\n");
+    }
+
+    let total_nodes = graph_nodes.len();
+    let mut processed_nodes = 0;
+
     for node in &graph_nodes {
+        processed_nodes += 1;
+        if verbose && (processed_nodes % 10 == 0 || processed_nodes == total_nodes) {
+            eprintln!("  Processing node {}/{}: {} ({})", processed_nodes, total_nodes, node.name, node.op);
+        }
+
         match node.op.as_str() {
             "placeholder" => {
                 if verbose {
@@ -477,6 +509,40 @@ fn compile(
 
                         if verbose {
                             eprintln!("    -> Creating fresh copy of: {}", input_name);
+                            eprintln!("    DEBUG: Looking for {} in tensor_map", input_name);
+                            eprintln!("    DEBUG: Current tensor_map keys: {:?}", tensor_map.keys().collect::<Vec<_>>());
+                        }
+
+                        // Check if this is a constant tensor that needs to be created as input
+                        if !tensor_map.contains_key(input_name) && input_name.starts_with("c_lifted_tensor") {
+                            if verbose {
+                                eprintln!("    ⚠ WARNING: lift_fresh_copy references {} which doesn't exist yet", input_name);
+                                eprintln!("    Creating as a new input tensor (likely a constant)");
+                            }
+                            // Create a new input tensor for this constant
+                            // Use the shape from the node metadata
+                            let tensor = match node.shape.len() {
+                                0 => cx.tensor((1,)),
+                                1 => cx.tensor((node.shape[0],)),
+                                2 => cx.tensor((node.shape[0], node.shape[1])),
+                                3 => cx.tensor((node.shape[0], node.shape[1], node.shape[2])),
+                                4 => cx.tensor((node.shape[0], node.shape[1], node.shape[2], node.shape[3])),
+                                _ => {
+                                    eprintln!("    WARNING: Unsupported shape length: {}", node.shape.len());
+                                    cx.tensor((1,))
+                                }
+                            };
+
+                            let tensor = if node.dtype.contains("int") || node.dtype.contains("long") {
+                                tensor.as_dtype(DType::Int)
+                            } else {
+                                tensor
+                            };
+
+                            tensor_map.insert(input_name.clone(), tensor);
+                            if verbose {
+                                eprintln!("    Created input tensor for constant: {} (shape: {:?})", input_name, tensor.shape);
+                            }
                         }
 
                         let input = *tensor_map.get(input_name).unwrap_or_else(|| {
@@ -1524,12 +1590,28 @@ fn compile(
 
         eprintln!("\nSetting input data...");
     }
+    // First, let's identify all tensors that are placeholders (should be Input nodes)
+    if verbose {
+        eprintln!("\n  DEBUG: Checking all placeholders in tensor_map:");
+        for node in &graph_nodes {
+            if node.op == "placeholder" {
+                if let Some(tensor) = tensor_map.get(&node.name) {
+                    eprintln!("    - {} (id: {:?})", node.name, tensor.id);
+                    if !inputs.contains_key(&node.name) {
+                        eprintln!("      ⚠ WARNING: No input data provided for this placeholder!");
+                    }
+                }
+            }
+        }
+        eprintln!("\n  DEBUG: Input data keys provided: {:?}", inputs.keys().collect::<Vec<_>>());
+    }
+
     for (name, data) in &inputs {
         if let Some(tensor) = tensor_map.get(name) {
             if verbose {
                 eprintln!(
-                    "  Setting data for input: {} (dtype: {:?})",
-                    name, tensor.dtype
+                    "  Setting data for input: {} (dtype: {:?}, id: {:?})",
+                    name, tensor.dtype, tensor.id
                 );
             }
             match tensor.dtype {
@@ -1548,6 +1630,10 @@ fn compile(
 
     if verbose {
         eprintln!("\nExecuting graph...");
+        eprintln!("  Graph has {} nodes to execute", runtime.graph.node_count());
+        eprintln!("  Graph has {} edges", runtime.graph.edge_count());
+        eprintln!("  About to call runtime.execute()...");
+        eprintln!("  [This is where it might hang - if you see this but not the next message, the issue is in execute()]");
     }
     runtime.execute(&cx.dyn_map);
     if verbose {

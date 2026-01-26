@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-def extract_graph_and_inputs(model, x):
+def extract_graph_and_inputs(model, x, verbose=False):
     # Handle both single tensor and tuple of tensors
     if isinstance(x, tuple):
         input_tensors = x
@@ -91,21 +91,92 @@ def extract_graph_and_inputs(model, x):
     inputs = {}
     placeholder_nodes = [n for n in exported.graph.nodes if n.op == "placeholder"]
 
+    if verbose:
+        print(f"DEBUG: Processing {len(placeholder_nodes)} placeholder nodes")
+        print(f"DEBUG: Available input tensors: {len(input_tensors)}")
+        print(f"DEBUG: Placeholder node names in order:")
+        for i, node in enumerate(placeholder_nodes):
+            print(f"  {i}: {node.name}")
+
     input_placeholder_count = 0
+    params_dict = dict(model.named_parameters())
+
     for node in placeholder_nodes:
         is_parameter = False
-        params_dict = dict(model.named_parameters())
-        for param_name, param in params_dict.items():
-            normalized_name = param_name.replace(".", "_")
-            if normalized_name in node.name:
-                inputs[node.name] = param.detach().flatten().tolist()
-                is_parameter = True
-                break
+
+        # First check if it's a parameter placeholder (starts with 'p_')
+        if node.name.startswith('p_'):
+            # Try to find matching parameter
+            for param_name, param in params_dict.items():
+                normalized_name = 'p_' + param_name.replace(".", "_")
+                if node.name == normalized_name:
+                    inputs[node.name] = param.detach().flatten().tolist()
+                    is_parameter = True
+                    if verbose:
+                        print(f"  {node.name}: Parameter (shape={list(param.shape)})")
+                    break
+
+            # If not found in named_parameters but starts with 'p_', it might be weight-tied
+            # Use the embedding weight for lm_head (weight tying in GPT)
+            if not is_parameter:
+                if 'lm_head' in node.name and 'transformer.wte.weight' in params_dict:
+                    # Use transformer.wte.weight for lm_head due to weight tying
+                    param = params_dict['transformer.wte.weight']
+                    inputs[node.name] = param.detach().flatten().tolist()
+                    is_parameter = True
+                    if verbose:
+                        print(f"  {node.name}: Weight-tied parameter (shape={list(param.shape)})")
+                elif hasattr(node, 'meta') and 'val' in node.meta:
+                    # If we have metadata, use it
+                    val = node.meta['val']
+                    if hasattr(val, 'detach'):
+                        inputs[node.name] = val.detach().flatten().tolist()
+                        is_parameter = True
+                        if verbose:
+                            print(f"  {node.name}: Parameter from metadata")
+                else:
+                    # This shouldn't happen but let's handle it gracefully
+                    print(f"WARNING: Parameter placeholder '{node.name}' not found in model")
+                    is_parameter = True  # Mark as parameter to avoid consuming input tensor
 
         if not is_parameter:
-            if input_placeholder_count < len(input_tensors):
+            # Handle lifted constant tensors (e.g., c_lifted_tensor_0)
+            if node.name.startswith("c_lifted_tensor"):
+                # These are constants that PyTorch lifted to placeholders
+                # For arange operations, this is typically 0
+                if hasattr(node, "meta") and "val" in node.meta:
+                    val = node.meta["val"]
+                    if hasattr(val, "item"):
+                        # Single value tensor
+                        inputs[node.name] = [float(val.item())]
+                        if verbose:
+                            print(f"  {node.name}: Lifted constant = {val.item()}")
+                    elif hasattr(val, "numpy"):
+                        # Convert to list
+                        inputs[node.name] = val.detach().numpy().flatten().tolist()
+                        if verbose:
+                            print(f"  {node.name}: Lifted constant array")
+                    else:
+                        # Default to 0 for arange start value
+                        inputs[node.name] = [0.0]
+                        if verbose:
+                            print(f"  {node.name}: Lifted constant (default=0)")
+                else:
+                    # Default to 0 for constants without metadata
+                    inputs[node.name] = [0.0]
+                    if verbose:
+                        print(f"  {node.name}: Lifted constant (no metadata, default=0)")
+            elif input_placeholder_count < len(input_tensors):
+                # This should handle regular input tensors like 'idx'
                 inputs[node.name] = input_tensors[input_placeholder_count].flatten().tolist()
+                if verbose:
+                    print(f"  {node.name}: Input tensor {input_placeholder_count} (shape={list(input_tensors[input_placeholder_count].shape)})")
                 input_placeholder_count += 1
+            else:
+                # If we've run out of input tensors but still have placeholders, print a warning
+                print(f"WARNING: Placeholder '{node.name}' has no corresponding input tensor")
+                print(f"  Available input tensors: {len(input_tensors)}")
+                print(f"  Current placeholder count: {input_placeholder_count}")
 
     return nodes, inputs
 
@@ -122,7 +193,7 @@ def run_luminal_and_compare(model, x, atol, verbose=False):
     with torch.no_grad():
         pytorch_output = model(x)
 
-    nodes, inputs = extract_graph_and_inputs(model, x)
+    nodes, inputs = extract_graph_and_inputs(model, x, verbose=verbose)
 
     luminal_native = pytest.importorskip("luminal_native")
     outputs = luminal_native.compile(nodes, inputs, verbose=verbose)
