@@ -1,4 +1,4 @@
-use crate::model::{TalkerConfig, TalkerModel, VOCAB_SIZE};
+use crate::model::{TalkerConfig, TalkerModel, TextProjection, VOCAB_SIZE};
 use candle_core::{Device, Result as CandleResult, Tensor};
 use candle_nn::ops::softmax;
 use luminal::prelude::*;
@@ -207,7 +207,7 @@ fn test_talker_graph_builds() {
     let mut cx = Graph::new();
     let model = TalkerModel::new(&mut cx, TalkerConfig::default());
     let token_ids = cx.tensor((1, 's')).as_dtype(DType::Int);
-    let _embedded = model.embed_tokens(token_ids).output();
+    let _embedded = model.embed_codec(token_ids).output();
     cx.set_dim('s', 8);
 
     cx.build_search_space::<NativeRuntime>();
@@ -276,7 +276,7 @@ fn test_single_layer_vs_candle() -> CandleResult<()> {
     let mut rt = cx.search(NativeRuntime::default(), 1);
 
     rt.set_data(token_ids.id, token_ids_data.clone());
-    rt.set_data(model.embedding.id, weights.embed.clone());
+    rt.set_data(model.codec_embedding.id, weights.embed.clone());
 
     let layer = &model.layers[0];
     rt.set_data(layer.q_proj.id, weights.q_proj.clone());
@@ -303,6 +303,50 @@ fn test_single_layer_vs_candle() -> CandleResult<()> {
     let luminal_out = rt.get_f32(hidden.id).clone();
 
     let candle_out = candle_single_layer_hidden(&token_ids_data, batch, seq, &config, &weights)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+
+    assert_close(&luminal_out, &candle_out, TEST_EPS);
+    Ok(())
+}
+
+#[test]
+fn test_text_projection_vs_candle() -> CandleResult<()> {
+    let hidden = 32;
+    let batch = 1;
+    let seq = 4;
+    let mut rng = StdRng::seed_from_u64(42);
+
+    let fc1_w = random_vec(&mut rng, hidden * hidden);
+    let fc1_b = random_vec(&mut rng, hidden);
+    let fc2_w = random_vec(&mut rng, hidden * hidden);
+    let fc2_b = random_vec(&mut rng, hidden);
+    let input_data = random_vec(&mut rng, batch * seq * hidden);
+
+    let mut cx = Graph::new();
+    let tp = TextProjection::new(hidden, &mut cx);
+    let input = cx.tensor((batch, seq, hidden));
+    let output = tp.forward(input).output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+    rt.set_data(input.id, input_data.clone());
+    rt.set_data(tp.fc1_weight.id, fc1_w.clone());
+    rt.set_data(tp.fc1_bias.id, fc1_b.clone());
+    rt.set_data(tp.fc2_weight.id, fc2_w.clone());
+    rt.set_data(tp.fc2_bias.id, fc2_b.clone());
+    rt.execute(&cx.dyn_map);
+    let luminal_out = rt.get_f32(output.id).clone();
+
+    let device = Device::Cpu;
+    let x = Tensor::from_vec(input_data, (batch, seq, hidden), &device)?;
+    let w1 = Tensor::from_vec(fc1_w, (hidden, hidden), &device)?;
+    let b1 = Tensor::from_vec(fc1_b, hidden, &device)?.reshape((1, 1, hidden))?;
+    let w2 = Tensor::from_vec(fc2_w, (hidden, hidden), &device)?;
+    let b2 = Tensor::from_vec(fc2_b, hidden, &device)?.reshape((1, 1, hidden))?;
+    let h = linear_3d(&x, &w1)?.broadcast_add(&b1)?.silu()?;
+    let candle_out = linear_3d(&h, &w2)?
+        .broadcast_add(&b2)?
         .flatten_all()?
         .to_vec1::<f32>()?;
 
