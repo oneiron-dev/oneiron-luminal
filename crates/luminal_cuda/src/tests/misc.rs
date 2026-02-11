@@ -1,13 +1,73 @@
 use cudarc::driver::CudaContext;
+use half::f16;
 use luminal::egglog_utils::{
     egglog_to_llir, extract_generation, hash_choice_set, random_initial_choice, validate_choice_set,
 };
 use luminal::prelude::*;
+use safetensors::{Dtype, tensor::TensorView};
+use std::{collections::HashMap, fs, path::PathBuf, time::SystemTime};
 use tracing::{Level, enabled};
 
 use super::{assert_close, get_cuda_stream, random_vec};
 use crate::cuda_bandwidth_gbps;
 use crate::runtime::CudaRuntime;
+
+#[test]
+pub fn load_safetensors_f16_tensor_test() {
+    let Some(stream) = get_cuda_stream() else {
+        println!("CUDA not available, skipping test");
+        return;
+    };
+
+    let expected = vec![0.0_f32, 1.5, -2.25, 10.0];
+    let f16_bytes: Vec<u8> = expected
+        .iter()
+        .flat_map(|&value| f16::from_f32(value).to_bits().to_le_bytes())
+        .collect();
+
+    let mut tensors: HashMap<String, TensorView<'_>> = HashMap::new();
+    tensors.insert(
+        "f16_input".to_string(),
+        TensorView::new(Dtype::F16, vec![4], &f16_bytes).unwrap(),
+    );
+    let serialized = safetensors::serialize(&tensors, None).unwrap();
+
+    let temp_path = std::env::temp_dir().join(format!(
+        "luminal_cuda_f16_{}_{}.safetensors",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&temp_path, serialized).unwrap();
+    struct TempFileCleanup(PathBuf);
+    impl Drop for TempFileCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = TempFileCleanup(temp_path.clone());
+
+    let mut cx = Graph::default();
+    let input = cx.named_tensor("f16_input", 4);
+    let output = input.output();
+
+    cx.build_search_space::<CudaRuntime>();
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_safetensors(&cx, temp_path.to_str().unwrap());
+    rt = cx.search(rt, 5);
+    rt.execute(&cx.dyn_map);
+
+    let result = rt.get_f32(output);
+    assert_eq!(result.len(), expected.len());
+    for (idx, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-3,
+            "Mismatch at index {idx}: expected {want}, got {got}"
+        );
+    }
+}
 
 /// Test that measures bandwidth utilization for a large element-wise add kernel.
 /// This demonstrates that KernelAdd can achieve reasonable bandwidth with large tensors.
