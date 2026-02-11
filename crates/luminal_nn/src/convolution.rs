@@ -118,16 +118,6 @@ impl ConvND {
 
         let unfolded = padded.unfold(kernel_shape, stride_shape, dilation_shape);
 
-        // Move window dimensions to the front for easier indexing.
-        let mut order: Vec<usize> = (rank..2 * rank).collect();
-        order.extend(0..rank);
-        let unfolded = unfolded.permute(order);
-        let unfolded_dims = unfolded.dims();
-
-        // Capture output spatial dimensions from the unfolded view.
-        let output_dims: Vec<Expression> =
-            unfolded_dims[batch_len + 1..batch_len + 1 + spatial].to_vec();
-
         // Reorder to [batch..., out..., channels, kernel_spatial..., kernel_batch..., kernel_channel].
         let mut order2 = Vec::with_capacity(2 * rank);
         // window batch dims
@@ -142,34 +132,27 @@ impl ConvND {
         order2.extend(rank..rank + batch_len + 1);
         let mut patches = unfolded.permute(order2);
 
-        // Drop kernel axes for batch + channel by merging them into the previous dimension.
+        // Remove kernel axes for batch + channel (they are all size 1 due kernel_shape construction).
         for _ in 0..=batch_len {
-            let last = patches.dims().len();
-            patches = patches.merge_dims(last - 2, last - 1);
+            let last = patches.dims().len() - 1;
+            patches = patches.squeeze(last);
         }
 
-        // Flatten channel and kernel spatial dimensions together.
-        for _ in 0..spatial {
-            let channel_axis = batch_len + spatial;
-            patches = patches.merge_dims(channel_axis, channel_axis + 1);
+        // Reshape weight from [ch_out, ch_in * kernel_product] to [ch_out, ch_in, kernel...].
+        let mut weight = self.weight;
+        for k in self.kernel.iter().rev() {
+            weight = weight.split_dims(1, *k);
         }
 
-        // Collapse batch dimensions into one and output dimensions into one for matmul.
-        for _ in 1..batch_len {
-            patches = patches.merge_dims(0, 1);
-        }
-        for _ in 1..spatial {
-            patches = patches.merge_dims(1, 2);
-        }
+        let patch_dims = patches.dims();
 
-        let mut out = patches.matmul(self.weight.permute((1, 0)));
+        // Broadcasted multiply across [channels, kernel...] then reduce those axes.
+        let mut out = patches.expand_dim(batch_len + spatial, self.ch_out)
+            * weight.expand_lhs(&patch_dims[..batch_len + spatial]);
 
-        // Restore batch and spatial dimensions.
-        for dim in self.input_batch_dims(&input_dims, batch_len).iter().rev() {
-            out = out.split_dims(0, *dim);
-        }
-        for dim in output_dims.iter().rev() {
-            out = out.split_dims(batch_len, *dim);
+        for _ in 0..=spatial {
+            let last_axis = out.dims().len() - 1;
+            out = out.sum(last_axis);
         }
 
         // Move channel dimension ahead of the spatial axes: [batch..., ch_out, spatial...]
@@ -178,16 +161,15 @@ impl ConvND {
         final_order.extend(batch_len..batch_len + spatial);
         out = out.permute(final_order);
 
-        if let Some(_b) = self.bias {
-            todo!()
-            // out += b.expand(out.shape);
+        if let Some(b) = self.bias {
+            let out_dims = out.dims();
+            let spatial_len = self.kernel.len();
+            let batch_len = out_dims.len() - spatial_len - 1;
+            out += b.expand_lhs(&out_dims[..batch_len])
+                    .expand_rhs(&out_dims[batch_len + 1..]);
         }
 
         out
-    }
-
-    fn input_batch_dims(&self, input_dims: &[Expression], batch_len: usize) -> Vec<Expression> {
-        input_dims[..batch_len].to_vec()
     }
 
     pub fn infer_output_shape(&self, input: &[usize]) -> Vec<usize> {
@@ -226,6 +208,7 @@ impl ConvND {
 mod tests {
     use super::ConvND;
     use candle_core::{Device, Tensor};
+    use luminal::prelude::{NativeRuntime, Runtime};
 
     fn assert_close(a: &[f32], b: &[f32]) {
         assert_eq!(
@@ -402,5 +385,38 @@ mod tests {
         // width: (6 - dilation*(3-1) -1 + 1 +1)/2 +1 = 3
         let inferred = conv.infer_output_shape(&[1, 3, 5, 6]);
         assert_eq!(inferred, vec![1, 2, 4, 3]);
+    }
+
+    #[test]
+    fn test_conv1d_with_bias() -> candle_core::Result<()> {
+        let mut cx = luminal::graph::Graph::new();
+        let conv = ConvND::new(1, 1, vec![3], vec![1], vec![1], vec![1], true, &mut cx);
+
+        let width = 5;
+        let input_values = vec![1.0, 2.0, 0.0, -1.0, 3.0];
+        let weight_values = vec![1.0, -0.5, 0.25];
+        let bias_values = vec![0.1];
+
+        let input_tensor = cx.tensor((1, conv.ch_in, width));
+        let output = conv.forward(input_tensor).output();
+
+        cx.build_search_space::<NativeRuntime>();
+        let mut rt = cx.search(NativeRuntime::default(), 1);
+
+        rt.set_data(input_tensor.id, input_values.clone());
+        rt.set_data(conv.weight.id, weight_values.clone());
+        rt.set_data(conv.bias.unwrap().id, bias_values.clone());
+        rt.execute(&cx.dyn_map);
+
+        let expected = candle_conv1d_output(
+            &conv,
+            &input_values,
+            width,
+            &weight_values,
+            Some(&bias_values),
+        )?;
+
+        assert_close(rt.get_f32(output.id), &expected);
+        Ok(())
     }
 }
