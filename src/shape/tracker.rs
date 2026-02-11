@@ -256,10 +256,7 @@ impl ShapeTracker {
         let inner_stride = self.strides.remove(axis2);
         let inner_dim = self.dims.remove(axis2);
         self.dims[axis1] *= inner_dim;
-        self.strides[axis1] = (self.strides[axis1]
-            .substitute('z', Expression::from('z') / inner_dim)
-            + inner_stride.substitute('z', Expression::from('z') % inner_dim))
-        .simplify();
+        self.strides[axis1] = inner_stride;
     }
 
     /// Split a dim into 2 dims, new dim is placed directly after original dim
@@ -300,20 +297,24 @@ mod tests {
         assert_eq!(split.dims.len(), 2);
         assert_eq!(split.dims[0], Expression::from(6));
         assert_eq!(split.dims[1], Expression::from(4));
+        assert_eq!(split.strides[0], Expression::from(4));
+        assert_eq!(split.strides[1], Expression::from(1));
     }
 
     #[test]
-    fn test_merge_dims_after_permute() {
+    fn test_merge_dims_contiguous() {
         let mut tracker = ShapeTracker::new([
             Expression::from(1),
             Expression::from(2),
             Expression::from(8),
             Expression::from(32),
         ]);
-        tracker.permute(&[0, 2, 1, 3]); // [1, 8, 2, 32]
-        tracker.merge_dims(2, 3); // [1, 8, 64]
+        tracker.merge_dims(2, 3); // [1, 2, 256]
         assert_eq!(tracker.dims.len(), 3);
-        assert_eq!(tracker.dims[2], Expression::from(64));
+        assert_eq!(tracker.dims[2], Expression::from(256));
+        assert_eq!(tracker.strides[0], Expression::from(512));
+        assert_eq!(tracker.strides[1], Expression::from(256));
+        assert_eq!(tracker.strides[2], Expression::from(1));
     }
 
     proptest! {

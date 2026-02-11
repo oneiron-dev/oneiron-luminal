@@ -66,6 +66,10 @@ impl GraphTensor {
 
     /// Merge two dimensions together
     pub fn merge_dims(mut self, axis1: usize, axis2: usize) -> GraphTensor {
+        if !self.shape.is_contiguous() {
+            let materialized = self * 1.0;
+            self = materialized;
+        }
         self.shape.merge_dims(axis1, axis2);
         self
     }
@@ -443,6 +447,39 @@ mod tests {
                 (rows, cols),
                 |a| a.transpose(0, 1) * 1.0,
                 |a| a.transpose(0, 1).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_after_transpose() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((1, 2, 4, 3));
+        let b = a.transpose(2, 3).merge_dims(2, 3).output();
+        cx.build_search_space::<NativeRuntime>();
+        let mut rt = cx.search(NativeRuntime::default(), 1);
+
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        rt.set_data(a.id, data.clone());
+        rt.execute(&cx.dyn_map);
+        let result = rt.get_f32(b.id);
+
+        let device = candle_core::Device::Cpu;
+        let ref_a = Tensor::from_vec(data, (1, 2, 4, 3), &device).unwrap();
+        let ref_b = ref_a
+            .transpose(2, 3)
+            .unwrap()
+            .contiguous()
+            .unwrap()
+            .reshape((1, 2, 12))
+            .unwrap();
+        let expected = ref_b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        assert_eq!(result.len(), expected.len());
+        for (i, (actual, expected_val)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected_val).abs() < 1e-5,
+                "mismatch at {i}: {actual} vs {expected_val}"
             );
         }
     }
