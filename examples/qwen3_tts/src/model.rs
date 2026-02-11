@@ -13,6 +13,7 @@ pub const N_KV_HEADS: usize = 8;
 pub const KV_GROUPS: usize = 2;
 pub const INTERMEDIATE: usize = 6144;
 pub const VOCAB_SIZE: usize = 3072;
+pub const TEXT_VOCAB_SIZE: usize = 151_936;
 pub const RMS_NORM_EPS: f32 = 1e-6;
 pub const ROPE_THETA: f32 = 1_000_000.0;
 
@@ -26,6 +27,7 @@ pub struct TalkerConfig {
     pub kv_groups: usize,
     pub intermediate: usize,
     pub vocab_size: usize,
+    pub text_vocab_size: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
 }
@@ -41,14 +43,45 @@ impl Default for TalkerConfig {
             kv_groups: KV_GROUPS,
             intermediate: INTERMEDIATE,
             vocab_size: VOCAB_SIZE,
+            text_vocab_size: TEXT_VOCAB_SIZE,
             rms_norm_eps: RMS_NORM_EPS,
             rope_theta: ROPE_THETA,
         }
     }
 }
 
+pub struct TextProjection {
+    pub fc1_weight: GraphTensor,
+    pub fc1_bias: GraphTensor,
+    pub fc2_weight: GraphTensor,
+    pub fc2_bias: GraphTensor,
+}
+
+impl TextProjection {
+    pub fn new(hidden: usize, cx: &mut Graph) -> Self {
+        Self {
+            fc1_weight: cx
+                .named_tensor("talker.text_projection.linear_fc1.weight", (hidden, hidden)),
+            fc1_bias: cx.named_tensor("talker.text_projection.linear_fc1.bias", hidden),
+            fc2_weight: cx
+                .named_tensor("talker.text_projection.linear_fc2.weight", (hidden, hidden)),
+            fc2_bias: cx.named_tensor("talker.text_projection.linear_fc2.bias", hidden),
+        }
+    }
+
+    pub fn forward(&self, x: GraphTensor) -> GraphTensor {
+        let dims = x.dims();
+        let leading = &dims[..dims.len() - 1];
+        let h = (x.matmul(self.fc1_weight.t()) + self.fc1_bias.expand_lhs(leading)).silu();
+        h.matmul(self.fc2_weight.t()) + self.fc2_bias.expand_lhs(leading)
+    }
+}
+
 pub struct TalkerModel {
-    pub embedding: GraphTensor,
+    pub codec_embedding: GraphTensor,
+    pub text_embedding: GraphTensor,
+    pub text_projection: TextProjection,
+    pub codec_head: GraphTensor,
     pub layers: Vec<TalkerLayer>,
     pub final_norm: LayerNorm,
     pub config: TalkerConfig,
@@ -83,36 +116,36 @@ impl TalkerModel {
         for i in 0..config.layers {
             layers.push(TalkerLayer {
                 q_proj: cx.named_tensor(
-                    format!("talker.layers.{i}.self_attn.q_proj.weight"),
+                    format!("talker.model.layers.{i}.self_attn.q_proj.weight"),
                     (config.n_heads * config.head_dim, config.hidden),
                 ),
                 k_proj: cx.named_tensor(
-                    format!("talker.layers.{i}.self_attn.k_proj.weight"),
+                    format!("talker.model.layers.{i}.self_attn.k_proj.weight"),
                     (config.n_kv_heads * config.head_dim, config.hidden),
                 ),
                 v_proj: cx.named_tensor(
-                    format!("talker.layers.{i}.self_attn.v_proj.weight"),
+                    format!("talker.model.layers.{i}.self_attn.v_proj.weight"),
                     (config.n_kv_heads * config.head_dim, config.hidden),
                 ),
                 o_proj: cx.named_tensor(
-                    format!("talker.layers.{i}.self_attn.o_proj.weight"),
+                    format!("talker.model.layers.{i}.self_attn.o_proj.weight"),
                     (config.hidden, config.n_heads * config.head_dim),
                 ),
                 gate_proj: cx.named_tensor(
-                    format!("talker.layers.{i}.mlp.gate_proj.weight"),
+                    format!("talker.model.layers.{i}.mlp.gate_proj.weight"),
                     (config.intermediate, config.hidden),
                 ),
                 up_proj: cx.named_tensor(
-                    format!("talker.layers.{i}.mlp.up_proj.weight"),
+                    format!("talker.model.layers.{i}.mlp.up_proj.weight"),
                     (config.intermediate, config.hidden),
                 ),
                 down_proj: cx.named_tensor(
-                    format!("talker.layers.{i}.mlp.down_proj.weight"),
+                    format!("talker.model.layers.{i}.mlp.down_proj.weight"),
                     (config.hidden, config.intermediate),
                 ),
                 input_norm: LayerNorm::new(
                     config.hidden,
-                    Some(&format!("talker.layers.{i}.input_layernorm.weight")),
+                    Some(&format!("talker.model.layers.{i}.input_layernorm.weight")),
                     None,
                     false,
                     config.rms_norm_eps,
@@ -121,7 +154,7 @@ impl TalkerModel {
                 post_attn_norm: LayerNorm::new(
                     config.hidden,
                     Some(&format!(
-                        "talker.layers.{i}.post_attention_layernorm.weight"
+                        "talker.model.layers.{i}.post_attention_layernorm.weight"
                     )),
                     None,
                     false,
@@ -133,29 +166,41 @@ impl TalkerModel {
 
         let final_norm = LayerNorm::new(
             config.hidden,
-            Some("talker.norm.weight"),
+            Some("talker.model.norm.weight"),
             None,
             false,
             config.rms_norm_eps,
             cx,
         );
 
-        let embedding = cx.named_tensor(
-            "talker.embed_tokens.weight",
+        let codec_embedding = cx.named_tensor(
+            "talker.model.codec_embedding.weight",
+            (config.vocab_size, config.hidden),
+        );
+        let text_embedding = cx.named_tensor(
+            "talker.model.text_embedding.weight",
+            (config.text_vocab_size, config.hidden),
+        );
+        let text_projection = TextProjection::new(config.hidden, cx);
+        let codec_head = cx.named_tensor(
+            "talker.codec_head.weight",
             (config.vocab_size, config.hidden),
         );
 
         Self {
-            embedding,
+            codec_embedding,
+            text_embedding,
+            text_projection,
+            codec_head,
             layers,
             final_norm,
             config,
         }
     }
 
-    pub fn embed_tokens(&self, token_ids: GraphTensor) -> GraphTensor {
+    pub fn embed_codec(&self, token_ids: GraphTensor) -> GraphTensor {
         let (batch, seq) = token_ids.dims2();
-        self.embedding.gather(
+        self.codec_embedding.gather(
             (token_ids * self.config.hidden).expand_dim(2, self.config.hidden)
                 + token_ids
                     .graph()
@@ -164,18 +209,37 @@ impl TalkerModel {
         )
     }
 
-    pub fn forward_hidden(&self, token_ids: GraphTensor) -> GraphTensor {
-        let mut x = self.embed_tokens(token_ids);
+    pub fn embed_tokens(&self, token_ids: GraphTensor) -> GraphTensor {
+        self.embed_codec(token_ids)
+    }
+
+    pub fn embed_text(&self, text_token_ids: GraphTensor) -> GraphTensor {
+        let (batch, seq) = text_token_ids.dims2();
+        let embedded = self.text_embedding.gather(
+            (text_token_ids * self.config.hidden).expand_dim(2, self.config.hidden)
+                + text_token_ids
+                    .graph()
+                    .arange(self.config.hidden)
+                    .expand_lhs([batch, seq]),
+        );
+        self.text_projection.forward(embedded)
+    }
+
+    pub fn forward_embeds(&self, embeds: GraphTensor) -> GraphTensor {
+        let mut x = embeds;
         for layer in &self.layers {
             x = layer.forward(x, &self.config);
         }
         x
     }
 
+    pub fn forward_hidden(&self, token_ids: GraphTensor) -> GraphTensor {
+        self.forward_embeds(self.embed_codec(token_ids))
+    }
+
     pub fn forward(&self, token_ids: GraphTensor) -> GraphTensor {
-        self.final_norm
-            .forward(self.forward_hidden(token_ids))
-            .matmul(self.embedding.t())
+        let hidden = self.final_norm.forward(self.forward_hidden(token_ids));
+        hidden.matmul(self.codec_head.t())
     }
 }
 
