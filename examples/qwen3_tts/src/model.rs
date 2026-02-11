@@ -2,7 +2,6 @@ use luminal::{
     graph::Graph,
     op::DType,
     prelude::{F32Pow, GraphTensor},
-    shape::ShapeTracker,
 };
 use luminal_nn::LayerNorm;
 
@@ -247,9 +246,7 @@ impl TalkerLayer {
         );
         let probs = masked_scores.softmax(3);
 
-        let mut context = probs.matmul(v).transpose(1, 2) * 1.0;
-        let (b, s, _, _) = context.dims4();
-        context.shape = ShapeTracker::new((b, s, config.hidden));
+        let context = probs.matmul(v).transpose(1, 2).merge_dims(2, 3);
         x = residual + context.matmul(self.o_proj.t());
 
         let ff_in = self.post_attn_norm.forward(x);
