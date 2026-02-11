@@ -252,15 +252,14 @@ impl ShapeTracker {
     }
 
     /// Merge two dimensions together
-    pub fn merge_dims(&mut self, _axis1: usize, _axis2: usize) {
-        todo!("Need CuTE-style nested dims for this!");
-        // let inner_stride = self.strides.remove(axis2);
-        // let inner_dim = self.dims.remove(axis2);
-        // self.dims[axis1] *= inner_dim;
-        // self.strides[axis1] = (self.strides[axis1]
-        //     .substitute('z', Expression::from('z') / inner_dim)
-        //     + inner_stride.substitute('z', Expression::from('z') % inner_dim))
-        // .simplify();
+    pub fn merge_dims(&mut self, axis1: usize, axis2: usize) {
+        let inner_stride = self.strides.remove(axis2);
+        let inner_dim = self.dims.remove(axis2);
+        self.dims[axis1] *= inner_dim;
+        self.strides[axis1] = (self.strides[axis1]
+            .substitute('z', Expression::from('z') / inner_dim)
+            + inner_stride.substitute('z', Expression::from('z') % inner_dim))
+        .simplify();
     }
 
     /// Split a dim into 2 dims, new dim is placed directly after original dim
@@ -289,6 +288,32 @@ mod tests {
         println!("Strides: {:?}", tracker.strides);
         println!("Ind: {:?}", tracker.index_expression());
         println!("Val: {:?}", tracker.valid_expression());
+    }
+
+    #[test]
+    fn test_merge_dims_roundtrip() {
+        let original = ShapeTracker::new([Expression::from(6), Expression::from(4)]);
+        let mut split = original.clone();
+        split.split_dims(0, 3); // [6, 4] -> [2, 3, 4]
+        assert_eq!(split.dims.len(), 3);
+        split.merge_dims(0, 1); // [2, 3, 4] -> [6, 4]
+        assert_eq!(split.dims.len(), 2);
+        assert_eq!(split.dims[0], Expression::from(6));
+        assert_eq!(split.dims[1], Expression::from(4));
+    }
+
+    #[test]
+    fn test_merge_dims_after_permute() {
+        let mut tracker = ShapeTracker::new([
+            Expression::from(1),
+            Expression::from(2),
+            Expression::from(8),
+            Expression::from(32),
+        ]);
+        tracker.permute(&[0, 2, 1, 3]); // [1, 8, 2, 32]
+        tracker.merge_dims(2, 3); // [1, 8, 64]
+        assert_eq!(tracker.dims.len(), 3);
+        assert_eq!(tracker.dims[2], Expression::from(64));
     }
 
     proptest! {
