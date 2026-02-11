@@ -146,6 +146,18 @@ impl CudaRuntime {
                         let dev = f32s.to_cuda_input(&self.cuda_stream);
                         self.hlir_buffers.insert(node, dev);
                     }
+                    safetensors::Dtype::F16 => {
+                        let f32s = tensor
+                            .data()
+                            .chunks_exact(2)
+                            .map(|chunk| {
+                                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                                half::f16::from_bits(bits).to_f32()
+                            })
+                            .collect_vec();
+                        let dev = f32s.to_cuda_input(&self.cuda_stream);
+                        self.hlir_buffers.insert(node, dev);
+                    }
                     safetensors::Dtype::U8 => {
                         let bytes = tensor.data();
                         let dev = bytes.to_cuda_input(&self.cuda_stream);
