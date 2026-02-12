@@ -11,10 +11,17 @@ use crate::{
 use candle_core::{Device, Result as CandleResult, Tensor};
 use candle_nn::ops::softmax;
 use half::bf16;
+use luminal::hlir::Input;
+use luminal::prelude::petgraph::Direction;
 use luminal::prelude::*;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use safetensors::{serialize, tensor::TensorView, Dtype};
-use std::{collections::HashMap, fs, path::PathBuf, time::SystemTime};
+use safetensors::{serialize, tensor::TensorView, Dtype, SafeTensors};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 const TEST_EPS: f32 = 1e-3;
 
@@ -2951,6 +2958,205 @@ fn test_full_waveform_decoder() {
     let mut shape = out.shape;
     shape.resolve_dyn_dims(&cx.dyn_map);
     assert_eq!(shape.shape_usize(), vec![batch, 1, 64]);
+}
+
+fn validate_named_inputs_against_safetensors(
+    cx: &Graph,
+    tensors: &SafeTensors<'_>,
+    required_prefix: Option<&str>,
+) -> (usize, Vec<String>, Vec<String>, Vec<String>) {
+    let mut matched = 0usize;
+    let mut missing = Vec::new();
+    let mut mismatched = Vec::new();
+    let mut prefix_violations = Vec::new();
+
+    for node in cx.graph.node_indices() {
+        let Some(input) = cx.graph[node].as_any().downcast_ref::<Input>() else {
+            continue;
+        };
+        if input.label.is_empty() {
+            continue;
+        }
+
+        if let Some(prefix) = required_prefix {
+            if !input.label.starts_with(prefix) {
+                prefix_violations.push(input.label.clone());
+            }
+        }
+
+        let expected = cx
+            .graph
+            .edges_directed(node, Direction::Outgoing)
+            .next()
+            .and_then(|e| e.weight().n_elements().exec(&cx.dyn_map));
+
+        let Ok(view) = tensors.tensor(&input.label) else {
+            missing.push(input.label.clone());
+            continue;
+        };
+
+        let actual = view.shape().iter().product::<usize>();
+        match expected {
+            Some(expected) if expected == actual => matched += 1,
+            Some(expected) => mismatched.push(format!(
+                "{}: expected {} elements, found {} (shape {:?})",
+                input.label,
+                expected,
+                actual,
+                view.shape()
+            )),
+            None => mismatched.push(format!(
+                "{}: could not resolve expected graph element count (shape {:?})",
+                input.label,
+                view.shape()
+            )),
+        }
+    }
+
+    (matched, missing, mismatched, prefix_violations)
+}
+
+#[test]
+#[ignore]
+fn test_main_model_weight_names() {
+    use crate::code_predictor::*;
+    use crate::model::*;
+
+    let talker_config = TalkerConfig {
+        layers: LAYERS,
+        hidden: HIDDEN,
+        head_dim: HEAD_DIM,
+        n_heads: N_HEADS,
+        n_kv_heads: N_KV_HEADS,
+        kv_groups: KV_GROUPS,
+        intermediate: INTERMEDIATE,
+        vocab_size: VOCAB_SIZE,
+        text_vocab_size: TEXT_VOCAB_SIZE,
+        rms_norm_eps: RMS_NORM_EPS,
+        rope_theta: ROPE_THETA,
+    };
+    let predictor_config = CodePredictorConfig {
+        hidden: CODE_PREDICTOR_HIDDEN,
+        head_dim: CODE_PREDICTOR_HEAD_DIM,
+        n_heads: CODE_PREDICTOR_N_HEADS,
+        n_kv_heads: CODE_PREDICTOR_N_KV_HEADS,
+        kv_groups: CODE_PREDICTOR_KV_GROUPS,
+        intermediate: CODE_PREDICTOR_INTERMEDIATE,
+        layers: CODE_PREDICTOR_LAYERS,
+        codebook_vocab: CODE_PREDICTOR_CODEBOOK_VOCAB,
+        num_code_groups: CODE_PREDICTOR_NUM_CODE_GROUPS,
+        rms_norm_eps: CODE_PREDICTOR_RMS_NORM_EPS,
+        rope_theta: CODE_PREDICTOR_ROPE_THETA,
+        talker_hidden: CODE_PREDICTOR_TALKER_HIDDEN,
+    };
+
+    let mut cx = Graph::new();
+    let _pipeline = TtsPipeline::new(&mut cx, talker_config, predictor_config);
+
+    let path = Path::new(
+        "/home/ubuntu/projects/luminal-qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/model.safetensors",
+    );
+    let data =
+        std::fs::read(path).unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+    let tensors = SafeTensors::deserialize(&data)
+        .unwrap_or_else(|e| panic!("Failed to parse {}: {e}", path.display()));
+
+    let all_names = tensors.names();
+    assert_eq!(
+        all_names.len(),
+        404,
+        "Expected 404 tensors in {}, found {}",
+        path.display(),
+        all_names.len()
+    );
+
+    let (matched, missing, mismatched, _) =
+        validate_named_inputs_against_safetensors(&cx, &tensors, None);
+
+    println!("Validated {matched} weights");
+    assert!(
+        missing.is_empty(),
+        "Missing {} safetensors keys:\n{}",
+        missing.len(),
+        missing.join("\n")
+    );
+    assert!(
+        mismatched.is_empty(),
+        "Found {} element-count mismatches:\n{}",
+        mismatched.len(),
+        mismatched.join("\n")
+    );
+}
+
+#[test]
+#[ignore]
+fn test_speech_decoder_weight_names() {
+    use crate::speech_decoder::*;
+
+    let config = SpeechDecoderConfig {
+        codebook_dim: SPEECH_DECODER_CODEBOOK_DIM,
+        vq_dim: SPEECH_DECODER_VQ_DIM,
+        latent_dim: SPEECH_DECODER_LATENT_DIM,
+        hidden_size: SPEECH_DECODER_HIDDEN_SIZE,
+        num_attention_heads: SPEECH_DECODER_NUM_ATTENTION_HEADS,
+        num_key_value_heads: SPEECH_DECODER_NUM_KEY_VALUE_HEADS,
+        intermediate_size: SPEECH_DECODER_INTERMEDIATE_SIZE,
+        num_hidden_layers: SPEECH_DECODER_NUM_HIDDEN_LAYERS,
+        rms_norm_eps: SPEECH_DECODER_RMS_NORM_EPS,
+        rope_theta: SPEECH_DECODER_ROPE_THETA,
+        sliding_window: SPEECH_DECODER_SLIDING_WINDOW,
+        head_dim: SPEECH_DECODER_HEAD_DIM,
+        semantic_codebook_size: SPEECH_DECODER_SEMANTIC_CODEBOOK_SIZE,
+        acoustic_codebook_size: SPEECH_DECODER_ACOUSTIC_CODEBOOK_SIZE,
+        num_semantic_quantizers: SPEECH_DECODER_NUM_SEMANTIC_QUANTIZERS,
+        num_acoustic_quantizers: SPEECH_DECODER_NUM_ACOUSTIC_QUANTIZERS,
+        decoder_dim: SPEECH_DECODER_DECODER_DIM,
+        upsample_rates: vec![8, 5, 4, 3],
+        upsampling_ratios: vec![2, 2],
+        layer_scale_initial: SPEECH_DECODER_LAYER_SCALE_INITIAL,
+    };
+
+    let mut cx = Graph::new();
+    let _decoder = SpeechDecoder::new(&mut cx, config);
+
+    let path =
+        Path::new("/home/ubuntu/projects/luminal-qwen/Qwen3-TTS-Tokenizer-12Hz/model.safetensors");
+    let data =
+        std::fs::read(path).unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+    let tensors = SafeTensors::deserialize(&data)
+        .unwrap_or_else(|e| panic!("Failed to parse {}: {e}", path.display()));
+
+    let all_names = tensors.names();
+    assert_eq!(
+        all_names.len(),
+        496,
+        "Expected 496 tensors in {}, found {}",
+        path.display(),
+        all_names.len()
+    );
+
+    let (matched, missing, mismatched, non_decoder_labels) =
+        validate_named_inputs_against_safetensors(&cx, &tensors, Some("decoder."));
+
+    println!("Validated {matched} weights");
+    assert!(
+        non_decoder_labels.is_empty(),
+        "Found {} non-decoder graph labels:\n{}",
+        non_decoder_labels.len(),
+        non_decoder_labels.join("\n")
+    );
+    assert!(
+        missing.is_empty(),
+        "Missing {} safetensors keys:\n{}",
+        missing.len(),
+        missing.join("\n")
+    );
+    assert!(
+        mismatched.is_empty(),
+        "Found {} element-count mismatches:\n{}",
+        mismatched.len(),
+        mismatched.join("\n")
+    );
 }
 
 #[test]
