@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 luminal = { path = "../.." }
 luminal_nn = { path = "../../crates/luminal_nn" }
+safetensors = "0.7.0"
+half = "2.7.1"
 
 [dev-dependencies]
 candle-core = "0.9.1"

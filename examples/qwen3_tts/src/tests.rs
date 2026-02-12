@@ -1,15 +1,19 @@
 use crate::{
     code_predictor::{CodePredictorConfig, CodePredictorModel},
     model::{TalkerConfig, TalkerModel, TextProjection, VOCAB_SIZE},
-    pipeline::{sample_greedy, StreamingPromptInputs, TtsPipeline},
+    pipeline::{StreamingPromptInputs, TtsPipeline, sample_greedy},
     speech_decoder::{
         CausalConv1d, SnakeBeta, SpeechDecoder, SpeechDecoderConfig, SplitResidualVectorQuantizer,
     },
+    weight_loader::load_safetensors_to_native,
 };
 use candle_core::{Device, Result as CandleResult, Tensor};
 use candle_nn::ops::softmax;
+use half::bf16;
 use luminal::prelude::*;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
+use safetensors::{Dtype, serialize, tensor::TensorView};
+use std::{collections::HashMap, fs, path::PathBuf, time::SystemTime};
 
 const TEST_EPS: f32 = 1e-3;
 
@@ -28,6 +32,28 @@ fn assert_close(a: &[f32], b: &[f32], tol: f32) {
             "mismatch at index {i}: {lhs} vs {rhs} (|diff|={diff}, tol={tol})"
         );
     }
+}
+
+struct TempFileCleanup(PathBuf);
+
+impl Drop for TempFileCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn write_temp_safetensors(tensors: &HashMap<String, TensorView<'_>>, tag: &str) -> PathBuf {
+    let serialized = serialize(tensors, None).expect("serialize safetensors");
+    let path = std::env::temp_dir().join(format!(
+        "qwen3_tts_{tag}_{}_{}.safetensors",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos()
+    ));
+    fs::write(&path, serialized).expect("write temp safetensors");
+    path
 }
 
 fn set_random_code_predictor_params(
@@ -2252,4 +2278,104 @@ fn test_speech_decoder_scaffold() {
     rt.execute(&cx.dyn_map);
     let out_data = rt.get_f32(out.id).clone();
     assert_eq!(out_data.len(), batch * config.latent_dim * seq);
+}
+
+#[test]
+fn test_load_safetensors_basic() {
+    let expected_a = vec![1.0f32, -2.0, 3.5, 4.25];
+    let expected_b = vec![0.5f32, 0.25, -1.0, 2.0];
+
+    let a_bytes: Vec<u8> = expected_a.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let b_bytes: Vec<u8> = expected_b.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut tensors: HashMap<String, TensorView<'_>> = HashMap::new();
+    tensors.insert(
+        "a".to_string(),
+        TensorView::new(Dtype::F32, vec![expected_a.len()], &a_bytes).expect("f32 tensor view a"),
+    );
+    tensors.insert(
+        "b".to_string(),
+        TensorView::new(Dtype::F32, vec![expected_b.len()], &b_bytes).expect("f32 tensor view b"),
+    );
+
+    let path = write_temp_safetensors(&tensors, "basic");
+    let _cleanup = TempFileCleanup(path.clone());
+
+    let mut cx = Graph::new();
+    let a = cx.named_tensor("a", expected_a.len());
+    let b = cx.named_tensor("b", expected_b.len());
+    let out_a = (a * 1.0).output();
+    let out_b = (b + 0.0).output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+    let loaded = load_safetensors_to_native(&mut rt, &cx, &path).expect("load safetensors");
+    assert_eq!(loaded, 2);
+
+    rt.execute(&cx.dyn_map);
+    assert_close(rt.get_f32(out_a.id), &expected_a, TEST_EPS);
+    assert_close(rt.get_f32(out_b.id), &expected_b, TEST_EPS);
+}
+
+#[test]
+fn test_load_safetensors_bf16_conversion() {
+    let source = vec![-1.3f32, 0.0, 2.75, 6.5, -0.125];
+    let expected: Vec<f32> = source.iter().map(|v| bf16::from_f32(*v).to_f32()).collect();
+    let bf16_bytes: Vec<u8> = source
+        .iter()
+        .flat_map(|v| bf16::from_f32(*v).to_bits().to_le_bytes())
+        .collect();
+
+    let mut tensors: HashMap<String, TensorView<'_>> = HashMap::new();
+    tensors.insert(
+        "bf16_input".to_string(),
+        TensorView::new(Dtype::BF16, vec![source.len()], &bf16_bytes).expect("bf16 tensor view"),
+    );
+
+    let path = write_temp_safetensors(&tensors, "bf16");
+    let _cleanup = TempFileCleanup(path.clone());
+
+    let mut cx = Graph::new();
+    let input = cx.named_tensor("bf16_input", source.len());
+    let out = (input * 1.0).output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+    let loaded = load_safetensors_to_native(&mut rt, &cx, &path).expect("load bf16 safetensors");
+    assert_eq!(loaded, 1);
+
+    rt.execute(&cx.dyn_map);
+    assert_close(rt.get_f32(out.id), &expected, 1e-6);
+}
+
+#[test]
+fn test_load_safetensors_missing_keys() {
+    let present_values = vec![3.0f32, -4.0, 5.5];
+    let present_bytes: Vec<u8> = present_values
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+
+    let mut tensors: HashMap<String, TensorView<'_>> = HashMap::new();
+    tensors.insert(
+        "present".to_string(),
+        TensorView::new(Dtype::F32, vec![present_values.len()], &present_bytes)
+            .expect("present tensor view"),
+    );
+
+    let path = write_temp_safetensors(&tensors, "missing");
+    let _cleanup = TempFileCleanup(path.clone());
+
+    let mut cx = Graph::new();
+    let present = cx.named_tensor("present", present_values.len());
+    let _missing = cx.named_tensor("missing", present_values.len());
+    let out = (present * 1.0).output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+    let loaded = load_safetensors_to_native(&mut rt, &cx, &path).expect("load with missing keys");
+    assert_eq!(loaded, 1);
+    assert_eq!(rt.buffers.len(), 1);
+
+    rt.execute(&cx.dyn_map);
+    assert_close(rt.get_f32(out.id), &present_values, TEST_EPS);
 }
