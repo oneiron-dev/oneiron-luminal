@@ -3,7 +3,8 @@ use crate::{
     model::{TalkerConfig, TalkerModel, TextProjection, VOCAB_SIZE},
     pipeline::{StreamingPromptInputs, TtsPipeline, sample_greedy},
     speech_decoder::{
-        CausalConv1d, SnakeBeta, SpeechDecoder, SpeechDecoderConfig, SplitResidualVectorQuantizer,
+        CausalConv1d, PreTransformer, SnakeBeta, SpeechDecoder, SpeechDecoderConfig,
+        SplitResidualVectorQuantizer,
     },
     weight_loader::load_safetensors_to_native,
 };
@@ -1994,22 +1995,157 @@ fn test_predictor_generate_codes() {
     );
 }
 
+fn random_positive_vec(rng: &mut StdRng, n: usize, min: f32, max: f32) -> Vec<f32> {
+    (0..n).map(|_| rng.random_range(min..max)).collect()
+}
+
+fn small_speech_decoder_config() -> SpeechDecoderConfig {
+    SpeechDecoderConfig {
+        codebook_dim: 8,
+        vq_dim: 4,
+        latent_dim: 16,
+        hidden_size: 8,
+        num_attention_heads: 2,
+        num_key_value_heads: 2,
+        intermediate_size: 16,
+        num_hidden_layers: 1,
+        head_dim: 4,
+        semantic_codebook_size: 8,
+        acoustic_codebook_size: 8,
+        sliding_window: 4,
+        ..SpeechDecoderConfig::default()
+    }
+}
+
+fn set_random_rvq_params(
+    rt: &mut NativeRuntime,
+    quantizer: &SplitResidualVectorQuantizer,
+    config: &SpeechDecoderConfig,
+    rng: &mut StdRng,
+) {
+    for codebook in &quantizer.rvq_first.codebooks {
+        rt.set_data(
+            codebook.embedding_sum.id,
+            random_vec(&mut *rng, config.semantic_codebook_size * config.vq_dim),
+        );
+        rt.set_data(
+            codebook.cluster_usage.id,
+            random_positive_vec(&mut *rng, config.semantic_codebook_size, 0.1, 2.0),
+        );
+    }
+    for codebook in &quantizer.rvq_rest.codebooks {
+        rt.set_data(
+            codebook.embedding_sum.id,
+            random_vec(&mut *rng, config.acoustic_codebook_size * config.vq_dim),
+        );
+        rt.set_data(
+            codebook.cluster_usage.id,
+            random_positive_vec(&mut *rng, config.acoustic_codebook_size, 0.1, 2.0),
+        );
+    }
+    rt.set_data(
+        quantizer.rvq_first.output_proj_weight.id,
+        random_vec(&mut *rng, config.codebook_dim * config.vq_dim),
+    );
+    rt.set_data(
+        quantizer.rvq_rest.output_proj_weight.id,
+        random_vec(&mut *rng, config.codebook_dim * config.vq_dim),
+    );
+}
+
+fn set_random_pre_transformer_params(
+    rt: &mut NativeRuntime,
+    pre_transformer: &PreTransformer,
+    config: &SpeechDecoderConfig,
+    rng: &mut StdRng,
+) {
+    let attn_proj_dim = config.num_attention_heads * config.head_dim;
+
+    rt.set_data(
+        pre_transformer.input_proj_weight.id,
+        random_vec(&mut *rng, config.hidden_size * config.latent_dim),
+    );
+    rt.set_data(
+        pre_transformer.input_proj_bias.id,
+        random_vec(&mut *rng, config.hidden_size),
+    );
+
+    for layer in &pre_transformer.layers {
+        rt.set_data(
+            layer
+                .input_layernorm
+                .weight
+                .expect("pre-transformer input layernorm weight")
+                .id,
+            random_vec(&mut *rng, config.hidden_size),
+        );
+        rt.set_data(
+            layer.q_proj.id,
+            random_vec(&mut *rng, attn_proj_dim * config.hidden_size),
+        );
+        rt.set_data(
+            layer.k_proj.id,
+            random_vec(&mut *rng, attn_proj_dim * config.hidden_size),
+        );
+        rt.set_data(
+            layer.v_proj.id,
+            random_vec(&mut *rng, attn_proj_dim * config.hidden_size),
+        );
+        rt.set_data(
+            layer.o_proj.id,
+            random_vec(&mut *rng, config.hidden_size * attn_proj_dim),
+        );
+        rt.set_data(
+            layer.self_attn_layer_scale.scale.id,
+            random_positive_vec(&mut *rng, config.hidden_size, 0.01, 0.2),
+        );
+        rt.set_data(
+            layer
+                .post_attention_layernorm
+                .weight
+                .expect("pre-transformer post attention layernorm weight")
+                .id,
+            random_vec(&mut *rng, config.hidden_size),
+        );
+        rt.set_data(
+            layer.gate_proj.id,
+            random_vec(&mut *rng, config.intermediate_size * config.hidden_size),
+        );
+        rt.set_data(
+            layer.up_proj.id,
+            random_vec(&mut *rng, config.intermediate_size * config.hidden_size),
+        );
+        rt.set_data(
+            layer.down_proj.id,
+            random_vec(&mut *rng, config.hidden_size * config.intermediate_size),
+        );
+        rt.set_data(
+            layer.mlp_layer_scale.scale.id,
+            random_positive_vec(&mut *rng, config.hidden_size, 0.01, 0.2),
+        );
+    }
+
+    rt.set_data(
+        pre_transformer
+            .norm
+            .weight
+            .expect("pre-transformer final norm weight")
+            .id,
+        random_vec(&mut *rng, config.hidden_size),
+    );
+    rt.set_data(
+        pre_transformer.output_proj_weight.id,
+        random_vec(&mut *rng, config.latent_dim * config.hidden_size),
+    );
+    rt.set_data(
+        pre_transformer.output_proj_bias.id,
+        random_vec(&mut *rng, config.latent_dim),
+    );
+}
+
 #[test]
 fn test_rvq_decode_shape() {
-    let config = SpeechDecoderConfig {
-        codebook_dim: 8,
-        latent_dim: 16,
-        hidden_size: 32,
-        num_attention_heads: 4,
-        num_key_value_heads: 4,
-        intermediate_size: 64,
-        num_hidden_layers: 2,
-        head_dim: 8,
-        semantic_codebook_size: 16,
-        acoustic_codebook_size: 16,
-        ..SpeechDecoderConfig::default()
-    };
-
+    let config = small_speech_decoder_config();
     let batch = 1;
     let seq = 4;
 
@@ -2024,161 +2160,203 @@ fn test_rvq_decode_shape() {
     let mut rt = cx.search(NativeRuntime::default(), 1);
 
     let mut rng = StdRng::seed_from_u64(1601);
-    rt.set_data(
-        quantizer.semantic_codebook.id,
-        random_vec(
-            &mut rng,
-            config.semantic_codebook_size * config.codebook_dim,
-        ),
-    );
-    for codebook in &quantizer.acoustic_codebooks {
-        rt.set_data(
-            codebook.id,
-            random_vec(
-                &mut rng,
-                config.acoustic_codebook_size * config.codebook_dim,
-            ),
-        );
-    }
+    set_random_rvq_params(&mut rt, &quantizer, &config, &mut rng);
 
     for (i, code_ids) in code_tensors.iter().enumerate() {
-        let mut ids = Vec::with_capacity(batch * seq);
-        for t in 0..seq {
-            ids.push(((i + t) % config.acoustic_codebook_size) as i32);
-        }
+        let vocab = if i == 0 {
+            config.semantic_codebook_size
+        } else {
+            config.acoustic_codebook_size
+        };
+        let ids: Vec<i32> = (0..seq).map(|t| ((i + t) % vocab) as i32).collect();
         rt.set_data(code_ids.id, ids);
     }
 
     rt.execute(&cx.dyn_map);
     let out = rt.get_f32(decoded.id).clone();
-    assert_eq!(out.len(), batch * seq * config.codebook_dim);
+    assert_eq!(out.len(), batch * config.codebook_dim * seq);
 
     let mut shape = decoded.shape;
     shape.resolve_dyn_dims(&cx.dyn_map);
-    assert_eq!(shape.shape_usize(), vec![batch, seq, config.codebook_dim]);
+    assert_eq!(shape.shape_usize(), vec![batch, config.codebook_dim, seq]);
 }
 
 #[test]
-fn test_rvq_decode_values() {
+fn test_rvq_decode_normalized() {
     let config = SpeechDecoderConfig {
         codebook_dim: 4,
+        vq_dim: 2,
         latent_dim: 8,
-        hidden_size: 32,
-        num_attention_heads: 4,
-        num_key_value_heads: 4,
-        intermediate_size: 64,
-        num_hidden_layers: 2,
-        head_dim: 8,
-        semantic_codebook_size: 8,
-        acoustic_codebook_size: 8,
+        hidden_size: 8,
+        num_attention_heads: 2,
+        num_key_value_heads: 2,
+        intermediate_size: 16,
+        num_hidden_layers: 1,
+        head_dim: 4,
+        semantic_codebook_size: 4,
+        acoustic_codebook_size: 4,
+        num_acoustic_quantizers: 1,
+        sliding_window: 4,
         ..SpeechDecoderConfig::default()
     };
 
     let batch = 1;
     let seq = 3;
-    let num_codebooks = 1 + config.num_acoustic_quantizers;
 
     let mut cx = Graph::new();
     let quantizer = SplitResidualVectorQuantizer::new(&mut cx, &config);
-    let code_tensors: Vec<GraphTensor> = (0..num_codebooks)
-        .map(|_| cx.tensor((batch, seq)).as_dtype(DType::Int))
-        .collect();
-    let decoded = quantizer.decode(code_tensors.clone()).output();
+    let semantic_codes = cx.tensor((batch, seq)).as_dtype(DType::Int);
+    let acoustic_codes = cx.tensor((batch, seq)).as_dtype(DType::Int);
+    let decoded = quantizer
+        .decode(vec![semantic_codes, acoustic_codes])
+        .output();
 
-    let semantic_embed: Vec<f32> = (0..config.semantic_codebook_size)
-        .flat_map(|code| (0..config.codebook_dim).map(move |d| (10 * code + d) as f32))
-        .collect();
-    let acoustic_embeds: Vec<Vec<f32>> = (0..config.num_acoustic_quantizers)
-        .map(|q| {
-            (0..config.acoustic_codebook_size)
-                .flat_map(|code| {
-                    (0..config.codebook_dim).map(move |d| (1000 * (q + 1) + 10 * code + d) as f32)
-                })
-                .collect()
-        })
-        .collect();
+    let semantic_embedding_sum = vec![
+        2.0, 4.0, //
+        6.0, 8.0, //
+        10.0, 12.0, //
+        14.0, 16.0,
+    ];
+    let semantic_cluster_usage = vec![1.0, 2.0, 5.0, 4.0];
+    let acoustic_embedding_sum = vec![
+        1.0, 3.0, //
+        5.0, 7.0, //
+        9.0, 11.0, //
+        13.0, 15.0,
+    ];
+    let acoustic_cluster_usage = vec![1.0, 5.0, 3.0, 2.0];
 
-    let mut code_values: Vec<Vec<i32>> = Vec::with_capacity(num_codebooks);
-    for q in 0..num_codebooks {
-        let vocab = if q == 0 {
-            config.semantic_codebook_size
-        } else {
-            config.acoustic_codebook_size
-        };
-        code_values.push(
-            (0..seq)
-                .map(|t| ((q + 2 * t) % vocab) as i32)
-                .collect::<Vec<_>>(),
-        );
-    }
+    let first_output_proj = vec![
+        1.0, 0.0, //
+        0.0, 1.0, //
+        1.0, 1.0, //
+        2.0, -1.0,
+    ];
+    let rest_output_proj = vec![
+        0.5, 0.0, //
+        0.0, 0.5, //
+        1.0, -1.0, //
+        -0.5, 1.0,
+    ];
+
+    let semantic_ids = vec![0i32, 1, 2];
+    let acoustic_ids = vec![2i32, 1, 0];
 
     cx.build_search_space::<NativeRuntime>();
     let mut rt = cx.search(NativeRuntime::default(), 1);
-    rt.set_data(quantizer.semantic_codebook.id, semantic_embed.clone());
-    for (codebook, data) in quantizer
-        .acoustic_codebooks
-        .iter()
-        .zip(acoustic_embeds.iter())
-    {
-        rt.set_data(codebook.id, data.clone());
-    }
-    for (tensor, ids) in code_tensors.iter().zip(code_values.iter()) {
-        rt.set_data(tensor.id, ids.clone());
-    }
+
+    rt.set_data(
+        quantizer.rvq_first.codebooks[0].embedding_sum.id,
+        semantic_embedding_sum.clone(),
+    );
+    rt.set_data(
+        quantizer.rvq_first.codebooks[0].cluster_usage.id,
+        semantic_cluster_usage.clone(),
+    );
+    rt.set_data(
+        quantizer.rvq_rest.codebooks[0].embedding_sum.id,
+        acoustic_embedding_sum.clone(),
+    );
+    rt.set_data(
+        quantizer.rvq_rest.codebooks[0].cluster_usage.id,
+        acoustic_cluster_usage.clone(),
+    );
+    rt.set_data(
+        quantizer.rvq_first.output_proj_weight.id,
+        first_output_proj.clone(),
+    );
+    rt.set_data(
+        quantizer.rvq_rest.output_proj_weight.id,
+        rest_output_proj.clone(),
+    );
+    rt.set_data(semantic_codes.id, semantic_ids.clone());
+    rt.set_data(acoustic_codes.id, acoustic_ids.clone());
 
     rt.execute(&cx.dyn_map);
     let out = rt.get_f32(decoded.id).clone();
 
-    let mut expected = vec![0.0f32; batch * seq * config.codebook_dim];
-    for t in 0..seq {
-        let sem_code = code_values[0][t] as usize;
-        for d in 0..config.codebook_dim {
-            expected[t * config.codebook_dim + d] +=
-                semantic_embed[sem_code * config.codebook_dim + d];
-        }
-        for q in 0..config.num_acoustic_quantizers {
-            let ac_code = code_values[q + 1][t] as usize;
-            for d in 0..config.codebook_dim {
-                expected[t * config.codebook_dim + d] +=
-                    acoustic_embeds[q][ac_code * config.codebook_dim + d];
+    let lookup = |embedding_sum: &[f32], usage: &[f32], code: usize| -> Vec<f32> {
+        let denom = usage[code].max(1e-5);
+        vec![
+            embedding_sum[code * config.vq_dim] / denom,
+            embedding_sum[code * config.vq_dim + 1] / denom,
+        ]
+    };
+    let apply_proj = |proj: &[f32], x: &[f32]| -> Vec<f32> {
+        let mut y = vec![0.0f32; config.codebook_dim];
+        for out_c in 0..config.codebook_dim {
+            for in_c in 0..config.vq_dim {
+                y[out_c] += proj[out_c * config.vq_dim + in_c] * x[in_c];
             }
+        }
+        y
+    };
+
+    let mut expected = vec![0.0f32; batch * config.codebook_dim * seq];
+    for t in 0..seq {
+        let sem = lookup(
+            &semantic_embedding_sum,
+            &semantic_cluster_usage,
+            semantic_ids[t] as usize,
+        );
+        let ac = lookup(
+            &acoustic_embedding_sum,
+            &acoustic_cluster_usage,
+            acoustic_ids[t] as usize,
+        );
+        let first = apply_proj(&first_output_proj, &sem);
+        let rest = apply_proj(&rest_output_proj, &ac);
+
+        for c in 0..config.codebook_dim {
+            expected[c * seq + t] = first[c] + rest[c];
         }
     }
 
     assert_close(&out, &expected, 1e-5);
+
+    let mut shape = decoded.shape;
+    shape.resolve_dyn_dims(&cx.dyn_map);
+    assert_eq!(shape.shape_usize(), vec![batch, config.codebook_dim, seq]);
 }
 
 #[test]
-fn test_snake_beta_activation() {
+fn test_snakebeta_exp_transform() {
     let mut cx = Graph::new();
     let snake = SnakeBeta::new(3, "test.snake.alpha", "test.snake.beta", &mut cx);
-
     let x = cx.tensor((1, 3, 4));
     let out = snake.forward(x).output();
 
-    cx.build_search_space::<NativeRuntime>();
-    let mut rt = cx.search(NativeRuntime::default(), 1);
     let input = vec![
         -1.0, -0.5, 0.0, 0.5, //
         -0.8, -0.2, 0.2, 0.9, //
         -1.2, -0.4, 0.3, 1.1,
     ];
+    let alpha = vec![-0.7, 0.4, 1.2];
+    let beta = vec![-0.2, 0.3, 0.9];
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
     rt.set_data(x.id, input.clone());
-    rt.set_data(snake.alpha.id, vec![0.7, 1.1, 1.5]);
-    rt.set_data(snake.beta.id, vec![0.9, 1.3, 1.7]);
+    rt.set_data(snake.alpha.id, alpha.clone());
+    rt.set_data(snake.beta.id, beta.clone());
 
     rt.execute(&cx.dyn_map);
     let out_data = rt.get_f32(out.id).clone();
 
-    assert_eq!(out_data.len(), 12);
-    assert!(out_data.iter().all(|v| v.is_finite()));
-    assert!(
-        out_data
-            .iter()
-            .zip(input.iter())
-            .any(|(o, i)| (o - i).abs() > 1e-6),
-        "SnakeBeta output should differ from identity for non-trivial alpha/beta"
-    );
+    let mut expected = vec![0.0f32; input.len()];
+    let time = 4;
+    for c in 0..3 {
+        let alpha_exp = alpha[c].exp();
+        let beta_exp = beta[c].exp();
+        for t in 0..time {
+            let idx = c * time + t;
+            let x_val = input[idx];
+            let sin_val = (x_val * alpha_exp).sin();
+            expected[idx] = x_val + (sin_val * sin_val) / (beta_exp + 1e-9);
+        }
+    }
+
+    assert_close(&out_data, &expected, 1e-6);
 }
 
 #[test]
@@ -2212,21 +2390,50 @@ fn test_causal_conv_shape() {
 }
 
 #[test]
-fn test_speech_decoder_scaffold() {
-    let config = SpeechDecoderConfig {
-        codebook_dim: 8,
-        latent_dim: 12,
-        hidden_size: 32,
-        num_attention_heads: 4,
-        num_key_value_heads: 4,
-        intermediate_size: 64,
-        num_hidden_layers: 2,
-        head_dim: 8,
-        semantic_codebook_size: 16,
-        acoustic_codebook_size: 16,
-        ..SpeechDecoderConfig::default()
-    };
+fn test_pre_transformer_builds() {
+    let config = small_speech_decoder_config();
+    let mut cx = Graph::new();
+    let pre_transformer = PreTransformer::new(&mut cx, &config);
+    let hidden = cx.tensor((1, 3, config.latent_dim));
+    let _out = pre_transformer.forward(hidden, &config).output();
 
+    cx.build_search_space::<NativeRuntime>();
+    let _rt = cx.search(NativeRuntime::default(), 1);
+}
+
+#[test]
+fn test_pre_transformer_forward_shape() {
+    let config = small_speech_decoder_config();
+    let batch = 2;
+    let seq = 5;
+
+    let mut cx = Graph::new();
+    let pre_transformer = PreTransformer::new(&mut cx, &config);
+    let hidden = cx.tensor((batch, seq, config.latent_dim));
+    let out = pre_transformer.forward(hidden, &config).output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+    let mut rng = StdRng::seed_from_u64(1604);
+
+    rt.set_data(
+        hidden.id,
+        random_vec(&mut rng, batch * seq * config.latent_dim),
+    );
+    set_random_pre_transformer_params(&mut rt, &pre_transformer, &config, &mut rng);
+
+    rt.execute(&cx.dyn_map);
+    let out_data = rt.get_f32(out.id).clone();
+    assert_eq!(out_data.len(), batch * seq * config.latent_dim);
+
+    let mut shape = out.shape;
+    shape.resolve_dyn_dims(&cx.dyn_map);
+    assert_eq!(shape.shape_usize(), vec![batch, seq, config.latent_dim]);
+}
+
+#[test]
+fn test_speech_decoder_with_transformer() {
+    let config = small_speech_decoder_config();
     let batch = 1;
     let seq = 4;
 
@@ -2239,33 +2446,19 @@ fn test_speech_decoder_scaffold() {
 
     cx.build_search_space::<NativeRuntime>();
     let mut rt = cx.search(NativeRuntime::default(), 1);
-    let mut rng = StdRng::seed_from_u64(1603);
+    let mut rng = StdRng::seed_from_u64(1605);
 
     for (i, code_ids) in code_tensors.iter().enumerate() {
-        let mut ids = Vec::with_capacity(batch * seq);
-        for t in 0..seq {
-            ids.push(((i + t) % config.acoustic_codebook_size) as i32);
-        }
+        let vocab = if i == 0 {
+            config.semantic_codebook_size
+        } else {
+            config.acoustic_codebook_size
+        };
+        let ids: Vec<i32> = (0..seq).map(|t| ((i + t) % vocab) as i32).collect();
         rt.set_data(code_ids.id, ids);
     }
 
-    rt.set_data(
-        decoder.quantizer.semantic_codebook.id,
-        random_vec(
-            &mut rng,
-            config.semantic_codebook_size * config.codebook_dim,
-        ),
-    );
-    for codebook in &decoder.quantizer.acoustic_codebooks {
-        rt.set_data(
-            codebook.id,
-            random_vec(
-                &mut rng,
-                config.acoustic_codebook_size * config.codebook_dim,
-            ),
-        );
-    }
-
+    set_random_rvq_params(&mut rt, &decoder.quantizer, &config, &mut rng);
     rt.set_data(
         decoder.pre_conv.conv.weight.id,
         random_vec(&mut rng, config.latent_dim * config.codebook_dim * 3),
@@ -2274,10 +2467,15 @@ fn test_speech_decoder_scaffold() {
         decoder.pre_conv.conv.bias.expect("pre-conv bias").id,
         random_vec(&mut rng, config.latent_dim),
     );
+    set_random_pre_transformer_params(&mut rt, &decoder.pre_transformer, &config, &mut rng);
 
     rt.execute(&cx.dyn_map);
     let out_data = rt.get_f32(out.id).clone();
     assert_eq!(out_data.len(), batch * config.latent_dim * seq);
+
+    let mut shape = out.shape;
+    shape.resolve_dyn_dims(&cx.dyn_map);
+    assert_eq!(shape.shape_usize(), vec![batch, config.latent_dim, seq]);
 }
 
 #[test]

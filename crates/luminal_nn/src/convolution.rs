@@ -104,8 +104,8 @@ fn conv_forward_unfold(
     let patch_dims = patches.dims();
 
     // Broadcasted multiply across [channels, kernel...] then reduce those axes.
-    let mut out =
-        patches.expand_dim(batch_len + spatial, ch_out) * reshaped_weight.expand_lhs(&patch_dims[..batch_len + spatial]);
+    let mut out = patches.expand_dim(batch_len + spatial, ch_out)
+        * reshaped_weight.expand_lhs(&patch_dims[..batch_len + spatial]);
 
     for _ in 0..=spatial {
         let last_axis = out.dims().len() - 1;
@@ -693,9 +693,10 @@ mod tests {
         let input_values: Vec<f32> = (0..(conv.ch_in * width))
             .map(|i| (i as f32 - 6.0) * 0.2)
             .collect();
-        let weight_values: Vec<f32> = (0..(conv.ch_out * (conv.ch_in / conv.groups) * conv.kernel[0]))
-            .map(|i| (i as f32 - 5.0) * 0.1)
-            .collect();
+        let weight_values: Vec<f32> =
+            (0..(conv.ch_out * (conv.ch_in / conv.groups) * conv.kernel[0]))
+                .map(|i| (i as f32 - 5.0) * 0.1)
+                .collect();
 
         let input_tensor = cx.tensor((1, conv.ch_in, width));
         let output = conv.forward(input_tensor).output();
@@ -721,9 +722,10 @@ mod tests {
         let input_values: Vec<f32> = (0..(conv.ch_in * width))
             .map(|i| (i as f32 - 7.0) * 0.15)
             .collect();
-        let weight_values: Vec<f32> = (0..(conv.ch_out * (conv.ch_in / conv.groups) * conv.kernel[0]))
-            .map(|i| (i as f32 - 9.0) * 0.07)
-            .collect();
+        let weight_values: Vec<f32> =
+            (0..(conv.ch_out * (conv.ch_in / conv.groups) * conv.kernel[0]))
+                .map(|i| (i as f32 - 9.0) * 0.07)
+                .collect();
         let bias_values: Vec<f32> = (0..conv.ch_out).map(|i| i as f32 * 0.25 - 0.4).collect();
 
         let input_tensor = cx.tensor((1, conv.ch_in, width));
