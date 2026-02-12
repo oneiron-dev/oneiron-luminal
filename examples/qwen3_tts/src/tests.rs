@@ -27,6 +27,88 @@ fn assert_close(a: &[f32], b: &[f32], tol: f32) {
     }
 }
 
+fn set_random_code_predictor_params(
+    rt: &mut NativeRuntime,
+    model: &CodePredictorModel,
+    config: &CodePredictorConfig,
+    rng: &mut StdRng,
+) {
+    for codec_embedding in &model.codec_embeddings {
+        rt.set_data(
+            codec_embedding.id,
+            random_vec(rng, config.codebook_vocab * config.talker_hidden),
+        );
+    }
+    rt.set_data(
+        model.projection_weight.id,
+        random_vec(rng, config.hidden * config.talker_hidden),
+    );
+    rt.set_data(model.projection_bias.id, random_vec(rng, config.hidden));
+
+    for layer in &model.layers {
+        rt.set_data(
+            layer.q_proj.id,
+            random_vec(rng, config.n_heads * config.head_dim * config.hidden),
+        );
+        rt.set_data(
+            layer.k_proj.id,
+            random_vec(rng, config.n_kv_heads * config.head_dim * config.hidden),
+        );
+        rt.set_data(
+            layer.v_proj.id,
+            random_vec(rng, config.n_kv_heads * config.head_dim * config.hidden),
+        );
+        rt.set_data(
+            layer.o_proj.id,
+            random_vec(rng, config.hidden * config.n_heads * config.head_dim),
+        );
+        rt.set_data(
+            layer.gate_proj.id,
+            random_vec(rng, config.intermediate * config.hidden),
+        );
+        rt.set_data(
+            layer.up_proj.id,
+            random_vec(rng, config.intermediate * config.hidden),
+        );
+        rt.set_data(
+            layer.down_proj.id,
+            random_vec(rng, config.hidden * config.intermediate),
+        );
+        rt.set_data(
+            layer
+                .input_norm
+                .weight
+                .expect("predictor input norm weight")
+                .id,
+            random_vec(rng, config.hidden),
+        );
+        rt.set_data(
+            layer
+                .post_attn_norm
+                .weight
+                .expect("predictor post attention norm weight")
+                .id,
+            random_vec(rng, config.hidden),
+        );
+    }
+
+    rt.set_data(
+        model
+            .final_norm
+            .weight
+            .expect("predictor final norm weight")
+            .id,
+        random_vec(rng, config.hidden),
+    );
+
+    for lm_head in &model.lm_heads {
+        rt.set_data(
+            lm_head.id,
+            random_vec(rng, config.codebook_vocab * config.hidden),
+        );
+    }
+}
+
 #[derive(Clone)]
 struct OneLayerWeights {
     embed: Vec<f32>,
@@ -921,4 +1003,102 @@ fn test_pipeline_end_to_end_shapes() {
         rt.get_f32(second_logits.id).len(),
         2 * predictor_config.codebook_vocab
     );
+}
+
+#[test]
+fn test_predictor_per_group_logits() {
+    let config = CodePredictorConfig {
+        hidden: 32,
+        head_dim: 16,
+        n_heads: 4,
+        n_kv_heads: 2,
+        kv_groups: 2,
+        intermediate: 64,
+        layers: 1,
+        codebook_vocab: 48,
+        num_code_groups: 4,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+        talker_hidden: 64,
+    };
+
+    let batch = 1;
+    let seq = 2;
+
+    let mut cx = Graph::new();
+    let model = CodePredictorModel::new(&mut cx, config.clone());
+    let input_embeds = cx.tensor((batch, seq, config.talker_hidden));
+    let hidden = model.forward(input_embeds);
+
+    let logits0 = model.logits_for_group(hidden, 0).output();
+    let logits1 = model.logits_for_group(hidden, 1).output();
+    let logits2 = model.logits_for_group(hidden, 2).output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    let mut rng = StdRng::seed_from_u64(99);
+    rt.set_data(
+        input_embeds.id,
+        random_vec(&mut rng, batch * seq * config.talker_hidden),
+    );
+    set_random_code_predictor_params(&mut rt, &model, &config, &mut rng);
+
+    rt.execute(&cx.dyn_map);
+
+    let out0 = rt.get_f32(logits0.id).clone();
+    let out1 = rt.get_f32(logits1.id).clone();
+    let out2 = rt.get_f32(logits2.id).clone();
+
+    assert_eq!(out0.len(), batch * seq * config.codebook_vocab);
+    assert_eq!(out1.len(), batch * seq * config.codebook_vocab);
+    assert_eq!(out2.len(), batch * seq * config.codebook_vocab);
+
+    assert_ne!(out0, out1);
+    assert_ne!(out0, out2);
+    assert_ne!(out1, out2);
+}
+
+#[test]
+fn test_predictor_per_group_embedding() {
+    let config = CodePredictorConfig {
+        hidden: 32,
+        head_dim: 16,
+        n_heads: 4,
+        n_kv_heads: 2,
+        kv_groups: 2,
+        intermediate: 64,
+        layers: 1,
+        codebook_vocab: 48,
+        num_code_groups: 4,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+        talker_hidden: 64,
+    };
+
+    let batch = 1;
+    let seq = 3;
+
+    let mut cx = Graph::new();
+    let model = CodePredictorModel::new(&mut cx, config.clone());
+    let code_ids = cx.tensor((batch, seq)).as_dtype(DType::Int);
+
+    let emb0 = model.embed_for_group(code_ids, 0).output();
+    let emb1 = model.embed_for_group(code_ids, 1).output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    let mut rng = StdRng::seed_from_u64(100);
+    rt.set_data(code_ids.id, vec![0i32, 1, 2]);
+    set_random_code_predictor_params(&mut rt, &model, &config, &mut rng);
+
+    rt.execute(&cx.dyn_map);
+
+    let out0 = rt.get_f32(emb0.id).clone();
+    let out1 = rt.get_f32(emb1.id).clone();
+
+    assert_eq!(out0.len(), batch * seq * config.talker_hidden);
+    assert_eq!(out1.len(), batch * seq * config.talker_hidden);
+    assert_ne!(out0, out1);
 }
