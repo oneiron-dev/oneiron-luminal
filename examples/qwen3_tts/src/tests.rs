@@ -1,6 +1,7 @@
 use crate::{
     code_predictor::{CodePredictorConfig, CodePredictorModel},
     model::{TalkerConfig, TalkerModel, TextProjection, VOCAB_SIZE},
+    pipeline::TtsPipeline,
 };
 use candle_core::{Device, Result as CandleResult, Tensor};
 use candle_nn::ops::softmax;
@@ -563,4 +564,361 @@ fn test_text_projection_vs_candle() -> CandleResult<()> {
 
     assert_close(&luminal_out, &candle_out, TEST_EPS);
     Ok(())
+}
+
+#[test]
+fn test_embedding_sum_executes() {
+    let config = TalkerConfig {
+        layers: 1,
+        hidden: 64,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 32,
+        kv_groups: 2,
+        intermediate: 128,
+        vocab_size: 96,
+        text_vocab_size: 128,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+    };
+
+    let mut cx = Graph::new();
+    let talker = TalkerModel::new(&mut cx, config.clone());
+
+    let text_ids = cx.tensor((1, 4)).as_dtype(DType::Int);
+    let codec_ids = cx.tensor((1, 4)).as_dtype(DType::Int);
+    let text_embeds = talker.embed_text(text_ids);
+    let codec_embeds = talker.embed_codec(codec_ids);
+    let summed = text_embeds + codec_embeds;
+    let hidden = talker.forward_embeds(summed);
+    let normed = talker.final_norm.forward(hidden);
+    let logits = normed.matmul(talker.codec_head.t()).output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    let mut rng = StdRng::seed_from_u64(101);
+    rt.set_data(text_ids.id, vec![0i32, 1, 2, 3]);
+    rt.set_data(codec_ids.id, vec![0i32, 1, 2, 3]);
+
+    rt.set_data(
+        talker.text_embedding.id,
+        random_vec(&mut rng, config.text_vocab_size * config.hidden),
+    );
+    rt.set_data(
+        talker.codec_embedding.id,
+        random_vec(&mut rng, config.vocab_size * config.hidden),
+    );
+    rt.set_data(
+        talker.text_projection.fc1_weight.id,
+        random_vec(&mut rng, config.hidden * config.hidden),
+    );
+    rt.set_data(
+        talker.text_projection.fc1_bias.id,
+        random_vec(&mut rng, config.hidden),
+    );
+    rt.set_data(
+        talker.text_projection.fc2_weight.id,
+        random_vec(&mut rng, config.hidden * config.hidden),
+    );
+    rt.set_data(
+        talker.text_projection.fc2_bias.id,
+        random_vec(&mut rng, config.hidden),
+    );
+    rt.set_data(
+        talker.codec_head.id,
+        random_vec(&mut rng, config.vocab_size * config.hidden),
+    );
+
+    let layer = &talker.layers[0];
+    rt.set_data(
+        layer.q_proj.id,
+        random_vec(&mut rng, config.n_heads * config.head_dim * config.hidden),
+    );
+    rt.set_data(
+        layer.k_proj.id,
+        random_vec(
+            &mut rng,
+            config.n_kv_heads * config.head_dim * config.hidden,
+        ),
+    );
+    rt.set_data(
+        layer.v_proj.id,
+        random_vec(
+            &mut rng,
+            config.n_kv_heads * config.head_dim * config.hidden,
+        ),
+    );
+    rt.set_data(
+        layer.o_proj.id,
+        random_vec(&mut rng, config.hidden * config.n_heads * config.head_dim),
+    );
+    rt.set_data(
+        layer.gate_proj.id,
+        random_vec(&mut rng, config.intermediate * config.hidden),
+    );
+    rt.set_data(
+        layer.up_proj.id,
+        random_vec(&mut rng, config.intermediate * config.hidden),
+    );
+    rt.set_data(
+        layer.down_proj.id,
+        random_vec(&mut rng, config.hidden * config.intermediate),
+    );
+    rt.set_data(
+        layer.input_norm.weight.expect("input norm weight").id,
+        random_vec(&mut rng, config.hidden),
+    );
+    rt.set_data(
+        layer
+            .post_attn_norm
+            .weight
+            .expect("post attention norm weight")
+            .id,
+        random_vec(&mut rng, config.hidden),
+    );
+    rt.set_data(
+        talker.final_norm.weight.expect("final norm weight").id,
+        random_vec(&mut rng, config.hidden),
+    );
+
+    rt.execute(&cx.dyn_map);
+    let out = rt.get_f32(logits.id);
+    assert_eq!(out.len(), 4 * config.vocab_size);
+}
+
+#[test]
+fn test_pipeline_end_to_end_shapes() {
+    let talker_config = TalkerConfig {
+        layers: 1,
+        hidden: 64,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 32,
+        kv_groups: 2,
+        intermediate: 128,
+        vocab_size: 96,
+        text_vocab_size: 128,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+    };
+    let predictor_config = CodePredictorConfig {
+        hidden: 32,
+        head_dim: 16,
+        n_heads: 4,
+        n_kv_heads: 2,
+        kv_groups: 2,
+        intermediate: 64,
+        layers: 1,
+        codebook_vocab: 48,
+        num_code_groups: 2,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+        talker_hidden: 64,
+    };
+
+    let mut cx = Graph::new();
+    let pipeline = TtsPipeline::new(&mut cx, talker_config.clone(), predictor_config.clone());
+
+    let prompt_embeds = cx.tensor((1, 6, talker_config.hidden));
+    let predictor_input = cx.tensor((1, 2, predictor_config.talker_hidden));
+
+    let talker_hidden = pipeline.talker.forward_embeds(prompt_embeds);
+    let talker_normed = pipeline.talker.final_norm.forward(talker_hidden);
+    let first_logits = talker_normed
+        .matmul(pipeline.talker.codec_head.t())
+        .output();
+
+    let pred_hidden = pipeline.code_predictor.forward(predictor_input);
+    let second_logits = pred_hidden
+        .matmul(pipeline.code_predictor.lm_heads[0].t())
+        .output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    let mut rng = StdRng::seed_from_u64(2026);
+    rt.set_data(
+        prompt_embeds.id,
+        random_vec(&mut rng, 6 * talker_config.hidden),
+    );
+    rt.set_data(
+        predictor_input.id,
+        random_vec(&mut rng, 2 * predictor_config.talker_hidden),
+    );
+
+    let talker_layer = &pipeline.talker.layers[0];
+    rt.set_data(
+        talker_layer.q_proj.id,
+        random_vec(
+            &mut rng,
+            talker_config.n_heads * talker_config.head_dim * talker_config.hidden,
+        ),
+    );
+    rt.set_data(
+        talker_layer.k_proj.id,
+        random_vec(
+            &mut rng,
+            talker_config.n_kv_heads * talker_config.head_dim * talker_config.hidden,
+        ),
+    );
+    rt.set_data(
+        talker_layer.v_proj.id,
+        random_vec(
+            &mut rng,
+            talker_config.n_kv_heads * talker_config.head_dim * talker_config.hidden,
+        ),
+    );
+    rt.set_data(
+        talker_layer.o_proj.id,
+        random_vec(
+            &mut rng,
+            talker_config.hidden * talker_config.n_heads * talker_config.head_dim,
+        ),
+    );
+    rt.set_data(
+        talker_layer.gate_proj.id,
+        random_vec(&mut rng, talker_config.intermediate * talker_config.hidden),
+    );
+    rt.set_data(
+        talker_layer.up_proj.id,
+        random_vec(&mut rng, talker_config.intermediate * talker_config.hidden),
+    );
+    rt.set_data(
+        talker_layer.down_proj.id,
+        random_vec(&mut rng, talker_config.hidden * talker_config.intermediate),
+    );
+    rt.set_data(
+        talker_layer
+            .input_norm
+            .weight
+            .expect("input norm weight")
+            .id,
+        random_vec(&mut rng, talker_config.hidden),
+    );
+    rt.set_data(
+        talker_layer
+            .post_attn_norm
+            .weight
+            .expect("post attention norm weight")
+            .id,
+        random_vec(&mut rng, talker_config.hidden),
+    );
+    rt.set_data(
+        pipeline
+            .talker
+            .final_norm
+            .weight
+            .expect("talker final norm weight")
+            .id,
+        random_vec(&mut rng, talker_config.hidden),
+    );
+    rt.set_data(
+        pipeline.talker.codec_head.id,
+        random_vec(&mut rng, talker_config.vocab_size * talker_config.hidden),
+    );
+
+    rt.set_data(
+        pipeline.code_predictor.projection_weight.id,
+        random_vec(
+            &mut rng,
+            predictor_config.hidden * predictor_config.talker_hidden,
+        ),
+    );
+    rt.set_data(
+        pipeline.code_predictor.projection_bias.id,
+        random_vec(&mut rng, predictor_config.hidden),
+    );
+    let predictor_layer = &pipeline.code_predictor.layers[0];
+    rt.set_data(
+        predictor_layer.q_proj.id,
+        random_vec(
+            &mut rng,
+            predictor_config.n_heads * predictor_config.head_dim * predictor_config.hidden,
+        ),
+    );
+    rt.set_data(
+        predictor_layer.k_proj.id,
+        random_vec(
+            &mut rng,
+            predictor_config.n_kv_heads * predictor_config.head_dim * predictor_config.hidden,
+        ),
+    );
+    rt.set_data(
+        predictor_layer.v_proj.id,
+        random_vec(
+            &mut rng,
+            predictor_config.n_kv_heads * predictor_config.head_dim * predictor_config.hidden,
+        ),
+    );
+    rt.set_data(
+        predictor_layer.o_proj.id,
+        random_vec(
+            &mut rng,
+            predictor_config.hidden * predictor_config.n_heads * predictor_config.head_dim,
+        ),
+    );
+    rt.set_data(
+        predictor_layer.gate_proj.id,
+        random_vec(
+            &mut rng,
+            predictor_config.intermediate * predictor_config.hidden,
+        ),
+    );
+    rt.set_data(
+        predictor_layer.up_proj.id,
+        random_vec(
+            &mut rng,
+            predictor_config.intermediate * predictor_config.hidden,
+        ),
+    );
+    rt.set_data(
+        predictor_layer.down_proj.id,
+        random_vec(
+            &mut rng,
+            predictor_config.hidden * predictor_config.intermediate,
+        ),
+    );
+    rt.set_data(
+        predictor_layer
+            .input_norm
+            .weight
+            .expect("predictor input norm weight")
+            .id,
+        random_vec(&mut rng, predictor_config.hidden),
+    );
+    rt.set_data(
+        predictor_layer
+            .post_attn_norm
+            .weight
+            .expect("predictor post attention norm weight")
+            .id,
+        random_vec(&mut rng, predictor_config.hidden),
+    );
+    rt.set_data(
+        pipeline
+            .code_predictor
+            .final_norm
+            .weight
+            .expect("predictor final norm weight")
+            .id,
+        random_vec(&mut rng, predictor_config.hidden),
+    );
+    rt.set_data(
+        pipeline.code_predictor.lm_heads[0].id,
+        random_vec(
+            &mut rng,
+            predictor_config.codebook_vocab * predictor_config.hidden,
+        ),
+    );
+
+    rt.execute(&cx.dyn_map);
+    assert_eq!(
+        rt.get_f32(first_logits.id).len(),
+        6 * talker_config.vocab_size
+    );
+    assert_eq!(
+        rt.get_f32(second_logits.id).len(),
+        2 * predictor_config.codebook_vocab
+    );
 }
