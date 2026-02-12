@@ -57,6 +57,8 @@ pub struct CodePredictorLayer {
     pub q_proj: GraphTensor,
     pub k_proj: GraphTensor,
     pub v_proj: GraphTensor,
+    pub q_norm: LayerNorm,
+    pub k_norm: LayerNorm,
     pub o_proj: GraphTensor,
     pub gate_proj: GraphTensor,
     pub up_proj: GraphTensor,
@@ -124,6 +126,26 @@ impl CodePredictorModel {
                 v_proj: cx.named_tensor(
                     format!("talker.code_predictor.model.layers.{i}.self_attn.v_proj.weight"),
                     (config.n_kv_heads * config.head_dim, config.hidden),
+                ),
+                q_norm: LayerNorm::new(
+                    config.head_dim,
+                    Some(&format!(
+                        "talker.code_predictor.model.layers.{i}.self_attn.q_norm.weight"
+                    )),
+                    None,
+                    false,
+                    config.rms_norm_eps,
+                    cx,
+                ),
+                k_norm: LayerNorm::new(
+                    config.head_dim,
+                    Some(&format!(
+                        "talker.code_predictor.model.layers.{i}.self_attn.k_norm.weight"
+                    )),
+                    None,
+                    false,
+                    config.rms_norm_eps,
+                    cx,
                 ),
                 o_proj: cx.named_tensor(
                     format!("talker.code_predictor.model.layers.{i}.self_attn.o_proj.weight"),
@@ -268,16 +290,15 @@ fn apply_rope(input: GraphTensor, config: &CodePredictorConfig) -> GraphTensor {
     let pos = input.graph().arange(seq).cast(DType::F32);
     let theta = pos.expand_dim(1, half_head) * inv_freq.expand_dim(0, seq);
 
-    let split = input.split_dims(3, 2);
-    let even = split.slice((.., .., .., .., ..1)).squeeze(4);
-    let odd = split.slice((.., .., .., .., 1..)).squeeze(4);
+    let first_half = input.slice((.., .., .., ..half_head));
+    let second_half = input.slice((.., .., .., half_head..));
 
     let cos = theta.cos().expand_dim(0, batch).expand_dim(1, heads);
     let sin = theta.sin().expand_dim(0, batch).expand_dim(1, heads);
 
-    let even_out = even * cos - odd * sin;
-    let odd_out = even * sin + odd * cos;
-    even_out.concat_along(odd_out, 3)
+    let rotated_first = first_half * cos - second_half * sin;
+    let rotated_second = second_half * cos + first_half * sin;
+    rotated_first.concat_along(rotated_second, 3)
 }
 
 fn repeat_kv_heads(kv: GraphTensor, kv_groups: usize) -> GraphTensor {
@@ -303,6 +324,9 @@ impl CodePredictorLayer {
         q = q.split_dims(2, config.head_dim).transpose(1, 2);
         k = k.split_dims(2, config.head_dim).transpose(1, 2);
         v = v.split_dims(2, config.head_dim).transpose(1, 2);
+
+        q = self.q_norm.forward(q);
+        k = self.k_norm.forward(k);
 
         q = apply_rope(q, config);
         k = apply_rope(k, config);

@@ -59,6 +59,14 @@ fn set_random_code_predictor_params(
             random_vec(rng, config.n_kv_heads * config.head_dim * config.hidden),
         );
         rt.set_data(
+            layer.q_norm.weight.expect("predictor q norm weight").id,
+            random_vec(rng, config.head_dim),
+        );
+        rt.set_data(
+            layer.k_norm.weight.expect("predictor k norm weight").id,
+            random_vec(rng, config.head_dim),
+        );
+        rt.set_data(
             layer.o_proj.id,
             random_vec(rng, config.hidden * config.n_heads * config.head_dim),
         );
@@ -158,6 +166,14 @@ fn set_random_talker_params(
             random_vec(rng, config.n_kv_heads * config.head_dim * config.hidden),
         );
         rt.set_data(
+            layer.q_norm.weight.expect("talker q norm weight").id,
+            random_vec(rng, config.head_dim),
+        );
+        rt.set_data(
+            layer.k_norm.weight.expect("talker k norm weight").id,
+            random_vec(rng, config.head_dim),
+        );
+        rt.set_data(
             layer.o_proj.id,
             random_vec(rng, config.hidden * config.n_heads * config.head_dim),
         );
@@ -203,6 +219,8 @@ struct OneLayerWeights {
     q_proj: Vec<f32>,
     k_proj: Vec<f32>,
     v_proj: Vec<f32>,
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
     o_proj: Vec<f32>,
     gate_proj: Vec<f32>,
     up_proj: Vec<f32>,
@@ -218,6 +236,8 @@ struct CodePredictorOneLayerWeights {
     q_proj: Vec<f32>,
     k_proj: Vec<f32>,
     v_proj: Vec<f32>,
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
     o_proj: Vec<f32>,
     gate_proj: Vec<f32>,
     up_proj: Vec<f32>,
@@ -240,6 +260,21 @@ fn rms_norm_3d(x: &Tensor, weight: &Tensor, eps: f32) -> CandleResult<Tensor> {
         .reshape((b, s, 1))?
         .broadcast_as((b, s, h))?;
     let w = weight.reshape((1, 1, h))?.broadcast_as((b, s, h))?;
+    x.mul(&inv_rms)?.mul(&w)
+}
+
+fn rms_norm_4d_lastdim(x: &Tensor, weight: &Tensor, eps: f32) -> CandleResult<Tensor> {
+    let dims = x.dims();
+    let (b, h, s, d) = (dims[0], dims[1], dims[2], dims[3]);
+    let inv_rms = x
+        .powf(2.0)?
+        .mean(3)?
+        .broadcast_add(&Tensor::new(eps, x.device())?)?
+        .sqrt()?
+        .recip()?
+        .reshape((b, h, s, 1))?
+        .broadcast_as((b, h, s, d))?;
+    let w = weight.reshape((1, 1, 1, d))?.broadcast_as((b, h, s, d))?;
     x.mul(&inv_rms)?.mul(&w)
 }
 
@@ -270,13 +305,12 @@ fn candle_rope_with_theta(input: &Tensor, rope_theta: f32) -> CandleResult<Tenso
         .reshape((1, 1, s, half))?
         .broadcast_as((b, h, s, half))?;
 
-    let split = input.reshape((b, h, s, half, 2))?;
-    let even = split.narrow(4, 0, 1)?.squeeze(4)?;
-    let odd = split.narrow(4, 1, 1)?.squeeze(4)?;
+    let first_half = input.narrow(3, 0, half)?;
+    let second_half = input.narrow(3, half, half)?;
 
-    let even_out = even.mul(&cos)?.sub(&odd.mul(&sin)?)?;
-    let odd_out = even.mul(&sin)?.add(&odd.mul(&cos)?)?;
-    Tensor::cat(&[&even_out, &odd_out], 3)
+    let rotated_first = first_half.mul(&cos)?.sub(&second_half.mul(&sin)?)?;
+    let rotated_second = second_half.mul(&cos)?.add(&first_half.mul(&sin)?)?;
+    Tensor::cat(&[&rotated_first, &rotated_second], 3)
 }
 
 fn candle_rope(input: &Tensor, config: &TalkerConfig) -> CandleResult<Tensor> {
@@ -336,6 +370,8 @@ fn candle_single_layer_hidden(
 
     let input_norm_w = Tensor::from_vec(w.input_norm.clone(), hidden, &device)?;
     let post_attn_norm_w = Tensor::from_vec(w.post_attn_norm.clone(), hidden, &device)?;
+    let q_norm_w = Tensor::from_vec(w.q_norm.clone(), config.head_dim, &device)?;
+    let k_norm_w = Tensor::from_vec(w.k_norm.clone(), config.head_dim, &device)?;
 
     let q_proj = Tensor::from_vec(w.q_proj.clone(), (q_dim, hidden), &device)?;
     let k_proj = Tensor::from_vec(w.k_proj.clone(), (kv_dim, hidden), &device)?;
@@ -355,6 +391,9 @@ fn candle_single_layer_hidden(
     let mut v = linear_3d(&x_attn, &v_proj)?
         .reshape((batch, seq, config.n_kv_heads, config.head_dim))?
         .transpose(1, 2)?;
+
+    q = rms_norm_4d_lastdim(&q, &q_norm_w, config.rms_norm_eps)?;
+    k = rms_norm_4d_lastdim(&k, &k_norm_w, config.rms_norm_eps)?;
 
     q = candle_rope(&q, config)?;
     k = candle_rope(&k, config)?;
@@ -424,6 +463,8 @@ fn candle_code_predictor_one_layer(
     let input_norm_w = Tensor::from_vec(w.input_norm.clone(), hidden, &device)?;
     let post_attn_norm_w = Tensor::from_vec(w.post_attn_norm.clone(), hidden, &device)?;
     let final_norm_w = Tensor::from_vec(w.final_norm.clone(), hidden, &device)?;
+    let q_norm_w = Tensor::from_vec(w.q_norm.clone(), config.head_dim, &device)?;
+    let k_norm_w = Tensor::from_vec(w.k_norm.clone(), config.head_dim, &device)?;
 
     let q_proj = Tensor::from_vec(w.q_proj.clone(), (q_dim, hidden), &device)?;
     let k_proj = Tensor::from_vec(w.k_proj.clone(), (kv_dim, hidden), &device)?;
@@ -444,6 +485,9 @@ fn candle_code_predictor_one_layer(
     let mut v = linear_3d(&x_attn, &v_proj)?
         .reshape((batch, seq, config.n_kv_heads, config.head_dim))?
         .transpose(1, 2)?;
+
+    q = rms_norm_4d_lastdim(&q, &q_norm_w, config.rms_norm_eps)?;
+    k = rms_norm_4d_lastdim(&k, &k_norm_w, config.rms_norm_eps)?;
 
     q = candle_rope_with_theta(&q, config.rope_theta)?;
     k = candle_rope_with_theta(&k, config.rope_theta)?;
@@ -546,6 +590,8 @@ fn test_single_layer_vs_candle() -> CandleResult<()> {
             &mut rng,
             config.n_kv_heads * config.head_dim * config.hidden,
         ),
+        q_norm: random_vec(&mut rng, config.head_dim),
+        k_norm: random_vec(&mut rng, config.head_dim),
         o_proj: random_vec(&mut rng, config.hidden * config.n_heads * config.head_dim),
         gate_proj: random_vec(&mut rng, config.intermediate * config.hidden),
         up_proj: random_vec(&mut rng, config.intermediate * config.hidden),
@@ -569,6 +615,14 @@ fn test_single_layer_vs_candle() -> CandleResult<()> {
     rt.set_data(layer.q_proj.id, weights.q_proj.clone());
     rt.set_data(layer.k_proj.id, weights.k_proj.clone());
     rt.set_data(layer.v_proj.id, weights.v_proj.clone());
+    rt.set_data(
+        layer.q_norm.weight.expect("q norm weight").id,
+        weights.q_norm.clone(),
+    );
+    rt.set_data(
+        layer.k_norm.weight.expect("k norm weight").id,
+        weights.k_norm.clone(),
+    );
     rt.set_data(layer.o_proj.id, weights.o_proj.clone());
     rt.set_data(layer.gate_proj.id, weights.gate_proj.clone());
     rt.set_data(layer.up_proj.id, weights.up_proj.clone());
@@ -595,6 +649,115 @@ fn test_single_layer_vs_candle() -> CandleResult<()> {
 
     assert_close(&luminal_out, &candle_out, TEST_EPS);
     Ok(())
+}
+
+#[test]
+fn test_qk_norm_changes_output() {
+    let config = TalkerConfig {
+        layers: 1,
+        hidden: 64,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 32,
+        kv_groups: 2,
+        intermediate: 128,
+        vocab_size: 96,
+        ..TalkerConfig::default()
+    };
+
+    let batch = 1;
+    let seq = 5;
+    let mut rng = StdRng::seed_from_u64(1234);
+
+    let mut cx = Graph::new();
+    let model = TalkerModel::new(&mut cx, config.clone());
+    let token_ids = cx.tensor((batch, seq)).as_dtype(DType::Int);
+    let hidden = model.forward_hidden(token_ids).output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    rt.set_data(token_ids.id, vec![0i32, 1, 2, 3, 4]);
+    rt.set_data(
+        model.codec_embedding.id,
+        random_vec(&mut rng, config.vocab_size * config.hidden),
+    );
+
+    let layer = &model.layers[0];
+    rt.set_data(
+        layer.q_proj.id,
+        random_vec(&mut rng, config.n_heads * config.head_dim * config.hidden),
+    );
+    rt.set_data(
+        layer.k_proj.id,
+        random_vec(
+            &mut rng,
+            config.n_kv_heads * config.head_dim * config.hidden,
+        ),
+    );
+    rt.set_data(
+        layer.v_proj.id,
+        random_vec(
+            &mut rng,
+            config.n_kv_heads * config.head_dim * config.hidden,
+        ),
+    );
+    rt.set_data(
+        layer.k_norm.weight.expect("k norm weight").id,
+        random_vec(&mut rng, config.head_dim),
+    );
+    rt.set_data(
+        layer.o_proj.id,
+        random_vec(&mut rng, config.hidden * config.n_heads * config.head_dim),
+    );
+    rt.set_data(
+        layer.gate_proj.id,
+        random_vec(&mut rng, config.intermediate * config.hidden),
+    );
+    rt.set_data(
+        layer.up_proj.id,
+        random_vec(&mut rng, config.intermediate * config.hidden),
+    );
+    rt.set_data(
+        layer.down_proj.id,
+        random_vec(&mut rng, config.hidden * config.intermediate),
+    );
+    rt.set_data(
+        layer.input_norm.weight.expect("input norm weight").id,
+        random_vec(&mut rng, config.hidden),
+    );
+    rt.set_data(
+        layer
+            .post_attn_norm
+            .weight
+            .expect("post attention norm weight")
+            .id,
+        random_vec(&mut rng, config.hidden),
+    );
+
+    let q_norm_a = vec![1.0f32; config.head_dim];
+    let q_norm_b: Vec<f32> = (0..config.head_dim)
+        .map(|i| if i % 2 == 0 { 0.5 } else { 1.5 })
+        .collect();
+
+    rt.set_data(layer.q_norm.weight.expect("q norm weight").id, q_norm_a);
+    rt.execute(&cx.dyn_map);
+    let out_a = rt.get_f32(hidden.id).clone();
+
+    rt.set_data(layer.q_norm.weight.expect("q norm weight").id, q_norm_b);
+    rt.execute(&cx.dyn_map);
+    let out_b = rt.get_f32(hidden.id).clone();
+
+    let max_diff = out_a
+        .iter()
+        .zip(out_b.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    assert!(
+        max_diff > 1e-5,
+        "changing q_norm should change output, got max diff {max_diff}"
+    );
 }
 
 #[test]
@@ -630,6 +793,8 @@ fn test_code_predictor_single_layer_vs_candle() -> CandleResult<()> {
             &mut rng,
             config.n_kv_heads * config.head_dim * config.hidden,
         ),
+        q_norm: random_vec(&mut rng, config.head_dim),
+        k_norm: random_vec(&mut rng, config.head_dim),
         o_proj: random_vec(&mut rng, config.hidden * config.n_heads * config.head_dim),
         gate_proj: random_vec(&mut rng, config.intermediate * config.hidden),
         up_proj: random_vec(&mut rng, config.intermediate * config.hidden),
@@ -660,6 +825,14 @@ fn test_code_predictor_single_layer_vs_candle() -> CandleResult<()> {
     rt.set_data(layer.q_proj.id, weights.q_proj.clone());
     rt.set_data(layer.k_proj.id, weights.k_proj.clone());
     rt.set_data(layer.v_proj.id, weights.v_proj.clone());
+    rt.set_data(
+        layer.q_norm.weight.expect("q norm weight").id,
+        weights.q_norm.clone(),
+    );
+    rt.set_data(
+        layer.k_norm.weight.expect("k norm weight").id,
+        weights.k_norm.clone(),
+    );
     rt.set_data(layer.o_proj.id, weights.o_proj.clone());
     rt.set_data(layer.gate_proj.id, weights.gate_proj.clone());
     rt.set_data(layer.up_proj.id, weights.up_proj.clone());
@@ -818,6 +991,14 @@ fn test_embedding_sum_executes() {
             &mut rng,
             config.n_kv_heads * config.head_dim * config.hidden,
         ),
+    );
+    rt.set_data(
+        layer.q_norm.weight.expect("q norm weight").id,
+        random_vec(&mut rng, config.head_dim),
+    );
+    rt.set_data(
+        layer.k_norm.weight.expect("k norm weight").id,
+        random_vec(&mut rng, config.head_dim),
     );
     rt.set_data(
         layer.o_proj.id,
@@ -1048,6 +1229,14 @@ fn test_streaming_prompt_assembly() {
         ),
     );
     rt.set_data(
+        layer.q_norm.weight.expect("q norm weight").id,
+        random_vec(&mut rng, talker_config.head_dim),
+    );
+    rt.set_data(
+        layer.k_norm.weight.expect("k norm weight").id,
+        random_vec(&mut rng, talker_config.head_dim),
+    );
+    rt.set_data(
         layer.o_proj.id,
         random_vec(
             &mut rng,
@@ -1181,6 +1370,14 @@ fn test_pipeline_end_to_end_shapes() {
         ),
     );
     rt.set_data(
+        talker_layer.q_norm.weight.expect("talker q norm weight").id,
+        random_vec(&mut rng, talker_config.head_dim),
+    );
+    rt.set_data(
+        talker_layer.k_norm.weight.expect("talker k norm weight").id,
+        random_vec(&mut rng, talker_config.head_dim),
+    );
+    rt.set_data(
         talker_layer.o_proj.id,
         random_vec(
             &mut rng,
@@ -1261,6 +1458,22 @@ fn test_pipeline_end_to_end_shapes() {
             &mut rng,
             predictor_config.n_kv_heads * predictor_config.head_dim * predictor_config.hidden,
         ),
+    );
+    rt.set_data(
+        predictor_layer
+            .q_norm
+            .weight
+            .expect("predictor q norm weight")
+            .id,
+        random_vec(&mut rng, predictor_config.head_dim),
+    );
+    rt.set_data(
+        predictor_layer
+            .k_norm
+            .weight
+            .expect("predictor k norm weight")
+            .id,
+        random_vec(&mut rng, predictor_config.head_dim),
     );
     rt.set_data(
         predictor_layer.o_proj.id,
