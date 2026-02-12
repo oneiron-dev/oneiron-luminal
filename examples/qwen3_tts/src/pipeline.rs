@@ -1,6 +1,12 @@
 use crate::code_predictor::{CodePredictorConfig, CodePredictorModel};
 use crate::model::{TalkerConfig, TalkerModel};
-use luminal::{graph::Graph, prelude::GraphTensor};
+use crate::weight_loader::load_weights_from_map;
+use luminal::{
+    graph::Graph,
+    op::{DType, Runtime},
+    prelude::{GraphTensor, NativeRuntime},
+};
+use std::collections::HashMap;
 
 // Codec token IDs from HuggingFace config.json
 pub const CODEC_PAD_ID: i32 = 2148;
@@ -31,6 +37,70 @@ pub fn sample_greedy(logits: &[f32], vocab_size: usize) -> Vec<u32> {
                 .0 as u32
         })
         .collect()
+}
+
+pub fn generate_frames(
+    talker_config: &TalkerConfig,
+    predictor_config: &CodePredictorConfig,
+    initial_embeds: &[f32],
+    prompt_len: usize,
+    num_frames: usize,
+    weights: &HashMap<String, Vec<f32>>,
+) -> Vec<Vec<u32>> {
+    let hidden = talker_config.hidden;
+    let mut embeddings = initial_embeds.to_vec();
+    let mut all_frames = Vec::with_capacity(num_frames);
+
+    for frame in 0..num_frames {
+        let seq_len = prompt_len + frame;
+
+        let mut cx = Graph::new();
+        let pipeline = TtsPipeline::new(&mut cx, talker_config.clone(), predictor_config.clone());
+        let prompt = cx.tensor((1, seq_len, hidden));
+
+        let (logits, normed) = pipeline.talker.decode_step(prompt);
+        let last_logits = logits.slice((.., (seq_len - 1).., ..));
+        let code_0 = last_logits.argmax(2);
+        let code_0_embed = pipeline.talker.embed_codec(code_0);
+        let last_hidden = normed.slice((.., (seq_len - 1).., ..));
+        let pred_out = pipeline
+            .code_predictor
+            .generate_codes(last_hidden, code_0_embed);
+
+        let mut codec_sum = code_0_embed;
+        for embed in &pred_out.embeds {
+            codec_sum = codec_sum + *embed;
+        }
+
+        let code_0_out = code_0.cast(DType::F32).output();
+        let code_outs: Vec<_> = pred_out
+            .codes
+            .iter()
+            .map(|code| code.cast(DType::F32).output())
+            .collect();
+        let codec_sum_out = codec_sum.output();
+
+        cx.build_search_space::<NativeRuntime>();
+        let mut rt = cx.search(NativeRuntime::default(), 1);
+        load_weights_from_map(&mut rt, &cx, weights);
+        rt.set_data(prompt.id, embeddings.clone());
+        rt.execute(&cx.dyn_map);
+
+        let code_0_val = rt.get_f32(code_0_out.id)[0] as u32;
+        let pred_codes: Vec<u32> = code_outs
+            .iter()
+            .map(|code| rt.get_f32(code.id)[0] as u32)
+            .collect();
+
+        let mut frame_codes = vec![code_0_val];
+        frame_codes.extend(pred_codes);
+        all_frames.push(frame_codes);
+
+        let codec_sum_data = rt.get_f32(codec_sum_out.id);
+        embeddings.extend_from_slice(codec_sum_data);
+    }
+
+    all_frames
 }
 
 pub struct StreamingPromptInputs {

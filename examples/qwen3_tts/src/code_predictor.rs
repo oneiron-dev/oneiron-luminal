@@ -79,6 +79,7 @@ pub struct CodePredictorModel {
 
 pub struct PredictorCodeOutput {
     pub embeds: Vec<GraphTensor>,
+    pub codes: Vec<GraphTensor>,
 }
 
 impl CodePredictorModel {
@@ -260,6 +261,7 @@ impl CodePredictorModel {
     ) -> PredictorCodeOutput {
         let groups = self.config.num_code_groups - 1;
         let mut embeds = Vec::with_capacity(groups);
+        let mut codes = Vec::with_capacity(groups);
         let mut seq = talker_hidden.concat_along(code_0_embed, 1);
 
         for group in 0..groups {
@@ -267,6 +269,7 @@ impl CodePredictorModel {
             let logits = self.logits_for_group(hidden, group);
             let last_logits = logits.slice((.., (group + 1).., ..));
             let code = last_logits.argmax(2);
+            codes.push(code);
             let embed = self.embed_for_group(code, group);
             embeds.push(embed);
             if group + 1 < groups {
@@ -274,7 +277,7 @@ impl CodePredictorModel {
             }
         }
 
-        PredictorCodeOutput { embeds }
+        PredictorCodeOutput { embeds, codes }
     }
 }
 

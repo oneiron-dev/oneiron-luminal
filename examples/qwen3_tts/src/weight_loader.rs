@@ -2,6 +2,7 @@ use luminal::hlir::Input;
 use luminal::prelude::petgraph::Direction;
 use luminal::prelude::{Graph, NativeRuntime};
 use safetensors::{Dtype, SafeTensors};
+use std::collections::HashMap;
 use std::path::Path;
 
 fn to_f32_vec(dtype: Dtype, data: &[u8], name: &str) -> Result<Vec<f32>, String> {
@@ -54,9 +55,28 @@ fn to_f32_vec(dtype: Dtype, data: &[u8], name: &str) -> Result<Vec<f32>, String>
     }
 }
 
-fn expected_element_count(cx: &Graph, node: luminal::prelude::NodeIndex) -> Option<usize> {
+pub fn expected_element_count(cx: &Graph, node: luminal::prelude::NodeIndex) -> Option<usize> {
     let edge = cx.graph.edges_directed(node, Direction::Outgoing).next()?;
     edge.weight().n_elements().exec(&cx.dyn_map)
+}
+
+pub fn load_weights_from_map(
+    rt: &mut NativeRuntime,
+    cx: &Graph,
+    weights: &HashMap<String, Vec<f32>>,
+) -> usize {
+    let mut loaded = 0usize;
+    for node in cx.graph.node_indices() {
+        let Some(input) = cx.graph[node].as_any().downcast_ref::<Input>() else {
+            continue;
+        };
+        let Some(data) = weights.get(&input.label) else {
+            continue;
+        };
+        rt.set_data(node, data.clone());
+        loaded += 1;
+    }
+    loaded
 }
 
 pub fn load_safetensors_to_native(

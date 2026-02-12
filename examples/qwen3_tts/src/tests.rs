@@ -1,19 +1,19 @@
 use crate::{
     code_predictor::{CodePredictorConfig, CodePredictorModel},
     model::{TalkerConfig, TalkerModel, TextProjection, VOCAB_SIZE},
-    pipeline::{StreamingPromptInputs, TtsPipeline, sample_greedy},
+    pipeline::{generate_frames, sample_greedy, StreamingPromptInputs, TtsPipeline},
     speech_decoder::{
         CausalConv1d, CausalTransConv1d, ConvNeXtBlock, DecoderBlock, PreTransformer, SnakeBeta,
         SpeechDecoder, SpeechDecoderConfig, SplitResidualVectorQuantizer, WaveformDecoder,
     },
-    weight_loader::load_safetensors_to_native,
+    weight_loader::{expected_element_count, load_safetensors_to_native},
 };
 use candle_core::{Device, Result as CandleResult, Tensor};
 use candle_nn::ops::softmax;
 use half::bf16;
 use luminal::prelude::*;
-use rand::{Rng, SeedableRng, rngs::StdRng};
-use safetensors::{Dtype, serialize, tensor::TensorView};
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use safetensors::{serialize, tensor::TensorView, Dtype};
 use std::{collections::HashMap, fs, path::PathBuf, time::SystemTime};
 
 const TEST_EPS: f32 = 1e-3;
@@ -22,6 +22,45 @@ fn random_vec(rng: &mut StdRng, n: usize) -> Vec<f32> {
     (0..n)
         .map(|_| rng.random_range(-0.25f32..0.25f32))
         .collect()
+}
+
+fn build_random_weight_map(
+    talker_config: &TalkerConfig,
+    predictor_config: &CodePredictorConfig,
+    rng: &mut StdRng,
+) -> HashMap<String, Vec<f32>> {
+    use luminal::hlir::Input;
+
+    let mut cx = Graph::new();
+    let pipeline = TtsPipeline::new(&mut cx, talker_config.clone(), predictor_config.clone());
+    let prompt = cx.tensor((1, 1, talker_config.hidden));
+    let (logits, normed) = pipeline.talker.decode_step(prompt);
+    let last_logits = logits.slice((.., 0.., ..));
+    let code_0 = last_logits.argmax(2);
+    let code_0_embed = pipeline.talker.embed_codec(code_0);
+    let last_hidden = normed.slice((.., 0.., ..));
+    let pred_out = pipeline
+        .code_predictor
+        .generate_codes(last_hidden, code_0_embed);
+    let mut codec_sum = code_0_embed;
+    for embed in &pred_out.embeds {
+        codec_sum = codec_sum + *embed;
+    }
+    let _ = codec_sum.output();
+
+    let mut map = HashMap::new();
+    for node in cx.graph.node_indices() {
+        let Some(input) = cx.graph[node].as_any().downcast_ref::<Input>() else {
+            continue;
+        };
+        if input.label.is_empty() {
+            continue;
+        }
+        if let Some(count) = expected_element_count(&cx, node) {
+            map.insert(input.label.clone(), random_vec(rng, count));
+        }
+    }
+    map
 }
 
 fn assert_close(a: &[f32], b: &[f32], tol: f32) {
@@ -1833,6 +1872,75 @@ fn test_two_frame_generation() {
 }
 
 #[test]
+fn test_generate_frames() {
+    let talker_config = TalkerConfig {
+        layers: 1,
+        hidden: 64,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 32,
+        kv_groups: 2,
+        intermediate: 128,
+        vocab_size: 96,
+        text_vocab_size: 128,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+    };
+    let predictor_config = CodePredictorConfig {
+        hidden: 32,
+        head_dim: 16,
+        n_heads: 4,
+        n_kv_heads: 2,
+        kv_groups: 2,
+        intermediate: 64,
+        layers: 1,
+        codebook_vocab: 48,
+        num_code_groups: 3,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+        talker_hidden: 64,
+    };
+
+    let prompt_len = 6;
+    let num_frames = 3;
+
+    let mut rng = StdRng::seed_from_u64(99);
+    let weights = build_random_weight_map(&talker_config, &predictor_config, &mut rng);
+    let initial_embeds = random_vec(&mut rng, prompt_len * talker_config.hidden);
+
+    let frames = generate_frames(
+        &talker_config,
+        &predictor_config,
+        &initial_embeds,
+        prompt_len,
+        num_frames,
+        &weights,
+    );
+
+    assert_eq!(frames.len(), num_frames);
+    for (i, frame) in frames.iter().enumerate() {
+        assert_eq!(frame.len(), predictor_config.num_code_groups, "frame {i}");
+        assert!((frame[0] as usize) < talker_config.vocab_size);
+        for &code in &frame[1..] {
+            assert!((code as usize) < predictor_config.codebook_vocab);
+        }
+    }
+
+    let mut rng2 = StdRng::seed_from_u64(99);
+    let weights2 = build_random_weight_map(&talker_config, &predictor_config, &mut rng2);
+    let initial_embeds2 = random_vec(&mut rng2, prompt_len * talker_config.hidden);
+    let frames2 = generate_frames(
+        &talker_config,
+        &predictor_config,
+        &initial_embeds2,
+        prompt_len,
+        num_frames,
+        &weights2,
+    );
+    assert_eq!(frames, frames2, "generation should be deterministic");
+}
+
+#[test]
 fn test_predictor_per_group_logits() {
     let config = CodePredictorConfig {
         hidden: 32,
@@ -1955,9 +2063,13 @@ fn test_predictor_generate_codes() {
     let out = model.generate_codes(talker_hidden, code_0_embed);
 
     assert_eq!(out.embeds.len(), config.num_code_groups - 1);
+    assert_eq!(out.codes.len(), config.num_code_groups - 1);
     let embed0 = out.embeds[0].output();
     let embed1 = out.embeds[1].output();
     let embed2 = out.embeds[2].output();
+    let code0 = out.codes[0].cast(DType::F32).output();
+    let code1 = out.codes[1].cast(DType::F32).output();
+    let code2 = out.codes[2].cast(DType::F32).output();
 
     cx.build_search_space::<NativeRuntime>();
     let mut rt = cx.search(NativeRuntime::default(), 1);
@@ -1972,6 +2084,9 @@ fn test_predictor_generate_codes() {
     let out0 = rt.get_f32(embed0.id).clone();
     let out1 = rt.get_f32(embed1.id).clone();
     let out2 = rt.get_f32(embed2.id).clone();
+    let code0_val = rt.get_f32(code0.id)[0] as usize;
+    let code1_val = rt.get_f32(code1.id)[0] as usize;
+    let code2_val = rt.get_f32(code2.id)[0] as usize;
 
     assert_eq!(out0.len(), 1 * 1 * config.talker_hidden);
     assert_eq!(out1.len(), 1 * 1 * config.talker_hidden);
@@ -1993,6 +2108,9 @@ fn test_predictor_generate_codes() {
         !(out0 == out1 && out1 == out2),
         "all generated predictor embeddings were identical"
     );
+    assert!(code0_val < config.codebook_vocab);
+    assert!(code1_val < config.codebook_vocab);
+    assert!(code2_val < config.codebook_vocab);
 }
 
 fn random_positive_vec(rng: &mut StdRng, n: usize, min: f32, max: f32) -> Vec<f32> {
