@@ -201,6 +201,29 @@ impl CodePredictorModel {
 
         self.final_norm.forward(x)
     }
+
+    /// Apply the LM head for a specific code group to hidden states.
+    /// `group` is 0-indexed (0 = code group 1, ..., 14 = code group 15).
+    pub fn logits_for_group(&self, hidden: GraphTensor, group: usize) -> GraphTensor {
+        assert!(group < self.lm_heads.len(), "group index out of bounds");
+        hidden.matmul(self.lm_heads[group].t())
+    }
+
+    /// Embed codec token IDs using the embedding table for a specific code group.
+    /// `group` is 0-indexed (0 = code group 1, ..., 14 = code group 15).
+    /// Returns embeddings in talker_hidden dimension (NOT predictor_hidden).
+    pub fn embed_for_group(&self, code_ids: GraphTensor, group: usize) -> GraphTensor {
+        assert!(
+            group < self.codec_embeddings.len(),
+            "group index out of bounds"
+        );
+        let (batch, seq) = code_ids.dims2();
+        let dim = self.config.talker_hidden;
+        self.codec_embeddings[group].gather(
+            (code_ids * dim).expand_dim(2, dim)
+                + code_ids.graph().arange(dim).expand_lhs([batch, seq]),
+        )
+    }
 }
 
 fn apply_rope(input: GraphTensor, config: &CodePredictorConfig) -> GraphTensor {
