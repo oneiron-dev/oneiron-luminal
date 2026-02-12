@@ -34,13 +34,13 @@ pub fn sample_greedy(logits: &[f32], vocab_size: usize) -> Vec<u32> {
 }
 
 pub struct StreamingPromptInputs {
-    pub role_text_ids: GraphTensor,       // [1, 3] - role prefix text tokens
-    pub overlay_text_ids: GraphTensor,    // [1, overlay_len] - tts_pad repeated + tts_bos
-    pub overlay_codec_ids: GraphTensor,   // [1, overlay_len] - codec control tokens
-    pub transition_text_id: GraphTensor,  // [1, 1] - first real content text token
+    pub role_text_ids: GraphTensor,     // [1, 3] - role prefix text tokens
+    pub overlay_text_ids: GraphTensor,  // [1, overlay_len] - tts_pad repeated + tts_bos
+    pub overlay_codec_ids: GraphTensor, // [1, overlay_len] - codec control tokens
+    pub transition_text_id: GraphTensor, // [1, 1] - first real content text token
     pub transition_codec_id: GraphTensor, // [1, 1] - codec BOS token
-    pub trailing_text_ids: GraphTensor,   // [1, trailing_len] - rest of text + tts_eos
-    pub tts_pad_text_id: GraphTensor,     // [1, 1] - tts_pad for generation loop
+    pub trailing_text_ids: GraphTensor, // [1, trailing_len] - rest of text + tts_eos
+    pub tts_pad_text_id: GraphTensor,   // [1, 1] - tts_pad for generation loop
 }
 
 pub struct StreamingPromptOutputs {
@@ -90,7 +90,9 @@ impl TtsPipeline {
         let transition = transition_text + transition_codec;
 
         // 4. Concatenate: [role | overlay | transition]
-        let initial = role_embeds.concat_along(overlay, 1).concat_along(transition, 1);
+        let initial = role_embeds
+            .concat_along(overlay, 1)
+            .concat_along(transition, 1);
 
         StreamingPromptOutputs {
             initial_embeds: initial,
