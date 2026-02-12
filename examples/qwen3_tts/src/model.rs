@@ -237,6 +237,13 @@ impl TalkerModel {
         self.forward_embeds(self.embed_codec(token_ids))
     }
 
+    pub fn decode_step(&self, embeds: GraphTensor) -> (GraphTensor, GraphTensor) {
+        let hidden = self.forward_embeds(embeds);
+        let normed = self.final_norm.forward(hidden);
+        let logits = normed.matmul(self.codec_head.t());
+        (logits, normed)
+    }
+
     pub fn forward(&self, token_ids: GraphTensor) -> GraphTensor {
         let hidden = self.final_norm.forward(self.forward_hidden(token_ids));
         hidden.matmul(self.codec_head.t())
