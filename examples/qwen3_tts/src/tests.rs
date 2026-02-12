@@ -1,7 +1,7 @@
 use crate::{
     code_predictor::{CodePredictorConfig, CodePredictorModel},
     model::{TalkerConfig, TalkerModel, TextProjection, VOCAB_SIZE},
-    pipeline::TtsPipeline,
+    pipeline::{StreamingPromptInputs, TtsPipeline},
 };
 use candle_core::{Device, Result as CandleResult, Tensor};
 use candle_nn::ops::softmax;
@@ -685,6 +685,177 @@ fn test_embedding_sum_executes() {
     rt.execute(&cx.dyn_map);
     let out = rt.get_f32(logits.id);
     assert_eq!(out.len(), 4 * config.vocab_size);
+}
+
+#[test]
+fn test_streaming_prompt_assembly() {
+    let talker_config = TalkerConfig {
+        layers: 1,
+        hidden: 64,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 32,
+        kv_groups: 2,
+        intermediate: 128,
+        vocab_size: 96,
+        text_vocab_size: 256,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+    };
+    let predictor_config = CodePredictorConfig {
+        layers: 1,
+        hidden: 32,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 16,
+        kv_groups: 2,
+        intermediate: 64,
+        codebook_vocab: 48,
+        num_code_groups: 2,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+        talker_hidden: 64,
+    };
+
+    let mut cx = Graph::new();
+    let pipeline = TtsPipeline::new(&mut cx, talker_config.clone(), predictor_config);
+
+    let role_text_ids = cx.tensor((1, 3)).as_dtype(DType::Int);
+    let overlay_text_ids = cx.tensor((1, 5)).as_dtype(DType::Int);
+    let overlay_codec_ids = cx.tensor((1, 5)).as_dtype(DType::Int);
+    let transition_text_id = cx.tensor((1, 1)).as_dtype(DType::Int);
+    let transition_codec_id = cx.tensor((1, 1)).as_dtype(DType::Int);
+    let trailing_text_ids = cx.tensor((1, 3)).as_dtype(DType::Int);
+    let tts_pad_text_id = cx.tensor((1, 1)).as_dtype(DType::Int);
+
+    let outputs = pipeline.assemble_streaming_prompt(&StreamingPromptInputs {
+        role_text_ids,
+        overlay_text_ids,
+        overlay_codec_ids,
+        transition_text_id,
+        transition_codec_id,
+        trailing_text_ids,
+        tts_pad_text_id,
+    });
+    let initial_embeds = outputs.initial_embeds.output();
+    let trailing_text_hidden = outputs.trailing_text_hidden.output();
+    let tts_pad_embed = outputs.tts_pad_embed.output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    rt.set_data(role_text_ids.id, vec![0i32, 1, 2]);
+    rt.set_data(overlay_text_ids.id, vec![10i32, 10, 10, 10, 11]);
+    rt.set_data(overlay_codec_ids.id, vec![4i32, 5, 6, 7, 8]);
+    rt.set_data(transition_text_id.id, vec![20i32]);
+    rt.set_data(transition_codec_id.id, vec![9i32]);
+    rt.set_data(trailing_text_ids.id, vec![21i32, 22, 12]);
+    rt.set_data(tts_pad_text_id.id, vec![10i32]);
+
+    let mut rng = StdRng::seed_from_u64(777);
+    rt.set_data(
+        pipeline.talker.text_embedding.id,
+        random_vec(
+            &mut rng,
+            talker_config.text_vocab_size * talker_config.hidden,
+        ),
+    );
+    rt.set_data(
+        pipeline.talker.codec_embedding.id,
+        random_vec(&mut rng, talker_config.vocab_size * talker_config.hidden),
+    );
+    rt.set_data(
+        pipeline.talker.text_projection.fc1_weight.id,
+        random_vec(&mut rng, talker_config.hidden * talker_config.hidden),
+    );
+    rt.set_data(
+        pipeline.talker.text_projection.fc1_bias.id,
+        random_vec(&mut rng, talker_config.hidden),
+    );
+    rt.set_data(
+        pipeline.talker.text_projection.fc2_weight.id,
+        random_vec(&mut rng, talker_config.hidden * talker_config.hidden),
+    );
+    rt.set_data(
+        pipeline.talker.text_projection.fc2_bias.id,
+        random_vec(&mut rng, talker_config.hidden),
+    );
+    rt.set_data(
+        pipeline.talker.codec_head.id,
+        random_vec(&mut rng, talker_config.vocab_size * talker_config.hidden),
+    );
+
+    let layer = &pipeline.talker.layers[0];
+    rt.set_data(
+        layer.q_proj.id,
+        random_vec(
+            &mut rng,
+            talker_config.n_heads * talker_config.head_dim * talker_config.hidden,
+        ),
+    );
+    rt.set_data(
+        layer.k_proj.id,
+        random_vec(
+            &mut rng,
+            talker_config.n_kv_heads * talker_config.head_dim * talker_config.hidden,
+        ),
+    );
+    rt.set_data(
+        layer.v_proj.id,
+        random_vec(
+            &mut rng,
+            talker_config.n_kv_heads * talker_config.head_dim * talker_config.hidden,
+        ),
+    );
+    rt.set_data(
+        layer.o_proj.id,
+        random_vec(
+            &mut rng,
+            talker_config.hidden * talker_config.n_heads * talker_config.head_dim,
+        ),
+    );
+    rt.set_data(
+        layer.gate_proj.id,
+        random_vec(&mut rng, talker_config.intermediate * talker_config.hidden),
+    );
+    rt.set_data(
+        layer.up_proj.id,
+        random_vec(&mut rng, talker_config.intermediate * talker_config.hidden),
+    );
+    rt.set_data(
+        layer.down_proj.id,
+        random_vec(&mut rng, talker_config.hidden * talker_config.intermediate),
+    );
+    rt.set_data(
+        layer.input_norm.weight.expect("input norm weight").id,
+        random_vec(&mut rng, talker_config.hidden),
+    );
+    rt.set_data(
+        layer
+            .post_attn_norm
+            .weight
+            .expect("post attention norm weight")
+            .id,
+        random_vec(&mut rng, talker_config.hidden),
+    );
+    rt.set_data(
+        pipeline
+            .talker
+            .final_norm
+            .weight
+            .expect("final norm weight")
+            .id,
+        random_vec(&mut rng, talker_config.hidden),
+    );
+
+    rt.execute(&cx.dyn_map);
+
+    assert_eq!(rt.get_f32(initial_embeds.id).len(), 9 * talker_config.hidden);
+    assert_eq!(
+        rt.get_f32(trailing_text_hidden.id).len(),
+        3 * talker_config.hidden
+    );
+    assert_eq!(rt.get_f32(tts_pad_embed.id).len(), talker_config.hidden);
 }
 
 #[test]
