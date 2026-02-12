@@ -188,6 +188,7 @@ impl CausalConv1d {
                 vec![dilation],
                 vec![0],
                 bias,
+                1,
                 cx,
             ),
             left_pad,
