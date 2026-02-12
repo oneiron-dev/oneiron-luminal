@@ -20,6 +20,19 @@ pub const TTS_PAD_TOKEN_ID: i32 = 151671;
 pub const CODEC_LANG_ENGLISH: i32 = 2050;
 pub const CODEC_LANG_CHINESE: i32 = 2055;
 
+pub fn sample_greedy(logits: &[f32], vocab_size: usize) -> Vec<u32> {
+    logits
+        .chunks_exact(vocab_size)
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .unwrap()
+                .0 as u32
+        })
+        .collect()
+}
+
 pub struct StreamingPromptInputs {
     pub role_text_ids: GraphTensor,       // [1, 3] - role prefix text tokens
     pub overlay_text_ids: GraphTensor,    // [1, overlay_len] - tts_pad repeated + tts_bos

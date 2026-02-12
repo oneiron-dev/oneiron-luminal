@@ -1,7 +1,7 @@
 use crate::{
     code_predictor::{CodePredictorConfig, CodePredictorModel},
     model::{TalkerConfig, TalkerModel, TextProjection, VOCAB_SIZE},
-    pipeline::{StreamingPromptInputs, TtsPipeline},
+    pipeline::{sample_greedy, StreamingPromptInputs, TtsPipeline},
 };
 use candle_core::{Device, Result as CandleResult, Tensor};
 use candle_nn::ops::softmax;
@@ -855,6 +855,76 @@ fn test_embedding_sum_executes() {
     rt.execute(&cx.dyn_map);
     let out = rt.get_f32(logits.id);
     assert_eq!(out.len(), 4 * config.vocab_size);
+}
+
+#[test]
+fn test_decode_step() {
+    let config = TalkerConfig {
+        layers: 1,
+        hidden: 64,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 32,
+        kv_groups: 2,
+        intermediate: 128,
+        vocab_size: 96,
+        text_vocab_size: 128,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+    };
+
+    let mut cx = Graph::new();
+    let talker = TalkerModel::new(&mut cx, config.clone());
+    let embeds = cx.tensor((1, 4, config.hidden));
+
+    let (decode_logits, decode_normed) = talker.decode_step(embeds);
+    let decode_logits = decode_logits.output();
+    let decode_normed = decode_normed.output();
+
+    let manual_hidden = talker.forward_embeds(embeds);
+    let manual_normed = talker.final_norm.forward(manual_hidden);
+    let manual_logits = manual_normed.matmul(talker.codec_head.t());
+    let manual_normed = manual_normed.output();
+    let manual_logits = manual_logits.output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    let mut rng = StdRng::seed_from_u64(2027);
+    rt.set_data(embeds.id, random_vec(&mut rng, 1 * 4 * config.hidden));
+    set_random_talker_params(&mut rt, &talker, &config, &mut rng);
+
+    rt.execute(&cx.dyn_map);
+
+    let decode_logits_data = rt.get_f32(decode_logits.id).clone();
+    let decode_normed_data = rt.get_f32(decode_normed.id).clone();
+    let manual_logits_data = rt.get_f32(manual_logits.id).clone();
+    let manual_normed_data = rt.get_f32(manual_normed.id).clone();
+
+    assert_eq!(decode_logits_data.len(), 1 * 4 * 96);
+    assert_eq!(decode_normed_data.len(), 1 * 4 * 64);
+
+    assert!(
+        decode_logits_data.iter().all(|v| v.is_finite()),
+        "decode logits contained NaN/Inf"
+    );
+    assert!(
+        decode_normed_data.iter().all(|v| v.is_finite()),
+        "decode normed hidden contained NaN/Inf"
+    );
+
+    assert_close(&decode_logits_data, &manual_logits_data, TEST_EPS);
+    assert_close(&decode_normed_data, &manual_normed_data, TEST_EPS);
+}
+
+#[test]
+fn test_sample_greedy() {
+    let logits = vec![
+        0.1, 0.5, 0.3, 0.2, // max at index 1
+        0.4, 0.1, 0.2, 0.8, // max at index 3
+    ];
+    let tokens = sample_greedy(&logits, 4);
+    assert_eq!(tokens, vec![1, 3]);
 }
 
 #[test]
