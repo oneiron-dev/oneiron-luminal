@@ -1427,6 +1427,159 @@ fn test_single_frame_generation_flow() {
 }
 
 #[test]
+fn test_two_frame_generation() {
+    let talker_config = TalkerConfig {
+        layers: 1,
+        hidden: 64,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 32,
+        kv_groups: 2,
+        intermediate: 128,
+        vocab_size: 96,
+        text_vocab_size: 128,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+    };
+    let predictor_config = CodePredictorConfig {
+        hidden: 32,
+        head_dim: 16,
+        n_heads: 4,
+        n_kv_heads: 2,
+        kv_groups: 2,
+        intermediate: 64,
+        layers: 1,
+        codebook_vocab: 48,
+        num_code_groups: 3,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+        talker_hidden: 64,
+    };
+
+    let mut cx0 = Graph::new();
+    let pipeline0 = TtsPipeline::new(&mut cx0, talker_config.clone(), predictor_config.clone());
+    let prompt0 = cx0.tensor((1, 6, talker_config.hidden));
+    let prompt0_out = prompt0.output();
+
+    let (logits0, normed0) = pipeline0.talker.decode_step(prompt0);
+    let logits0_out = logits0.output();
+
+    let last_logits0 = logits0.slice((.., 5.., ..));
+    let code0 = last_logits0.argmax(2);
+    let code0_embed = pipeline0.talker.embed_codec(code0);
+
+    let last_hidden0 = normed0.slice((.., 5.., ..));
+    let pred_out0 = pipeline0
+        .code_predictor
+        .generate_codes(last_hidden0, code0_embed);
+
+    let mut codec_sum0 = code0_embed;
+    for embed in &pred_out0.embeds {
+        codec_sum0 = codec_sum0 + *embed;
+    }
+    let codec_sum0_out = codec_sum0.output();
+
+    cx0.build_search_space::<NativeRuntime>();
+    let mut rt0 = cx0.search(NativeRuntime::default(), 1);
+
+    let mut rng = StdRng::seed_from_u64(42);
+    rt0.set_data(prompt0.id, random_vec(&mut rng, 6 * talker_config.hidden));
+    let rng_before_weights = rng.clone();
+    set_random_talker_params(&mut rt0, &pipeline0.talker, &talker_config, &mut rng);
+    set_random_code_predictor_params(
+        &mut rt0,
+        &pipeline0.code_predictor,
+        &predictor_config,
+        &mut rng,
+    );
+    rt0.execute(&cx0.dyn_map);
+
+    let logits0_data = rt0.get_f32(logits0_out.id).clone();
+    let codec_sum0_data = rt0.get_f32(codec_sum0_out.id).clone();
+
+    assert_eq!(logits0_data.len(), 6 * talker_config.vocab_size);
+    assert_eq!(codec_sum0_data.len(), talker_config.hidden);
+    assert!(
+        logits0_data.iter().all(|v| v.is_finite()),
+        "frame 0 talker logits contained NaN/Inf"
+    );
+    assert!(
+        codec_sum0_data.iter().all(|v| v.is_finite()),
+        "frame 0 codec sum contained NaN/Inf"
+    );
+
+    let sampled0 = sample_greedy(
+        &logits0_data[5 * talker_config.vocab_size..],
+        talker_config.vocab_size,
+    );
+    assert_eq!(sampled0.len(), 1);
+    assert!(
+        (sampled0[0] as usize) < talker_config.vocab_size,
+        "sampled token {} out of range {}",
+        sampled0[0],
+        talker_config.vocab_size
+    );
+
+    let mut cx1 = Graph::new();
+    let pipeline1 = TtsPipeline::new(&mut cx1, talker_config.clone(), predictor_config.clone());
+    let prompt1 = cx1.tensor((1, 7, talker_config.hidden));
+
+    let (logits1, normed1) = pipeline1.talker.decode_step(prompt1);
+    let logits1_out = logits1.output();
+
+    let last_logits1 = logits1.slice((.., 6.., ..));
+    let code1_0 = last_logits1.argmax(2);
+    let code1_0_embed = pipeline1.talker.embed_codec(code1_0);
+
+    let last_hidden1 = normed1.slice((.., 6.., ..));
+    let pred_out1 = pipeline1
+        .code_predictor
+        .generate_codes(last_hidden1, code1_0_embed);
+
+    let mut codec_sum1 = code1_0_embed;
+    for embed in &pred_out1.embeds {
+        codec_sum1 = codec_sum1 + *embed;
+    }
+    let codec_sum1_out = codec_sum1.output();
+
+    cx1.build_search_space::<NativeRuntime>();
+    let mut rt1 = cx1.search(NativeRuntime::default(), 1);
+
+    let mut prompt1_data = rt0.get_f32(prompt0_out.id).clone();
+    prompt1_data.extend_from_slice(&codec_sum0_data);
+    assert_eq!(prompt1_data.len(), 7 * talker_config.hidden);
+    rt1.set_data(prompt1.id, prompt1_data);
+
+    let mut rng1 = rng_before_weights.clone();
+    set_random_talker_params(&mut rt1, &pipeline1.talker, &talker_config, &mut rng1);
+    set_random_code_predictor_params(
+        &mut rt1,
+        &pipeline1.code_predictor,
+        &predictor_config,
+        &mut rng1,
+    );
+    rt1.execute(&cx1.dyn_map);
+
+    let logits1_data = rt1.get_f32(logits1_out.id).clone();
+    let codec_sum1_data = rt1.get_f32(codec_sum1_out.id).clone();
+
+    assert_eq!(logits1_data.len(), 7 * talker_config.vocab_size);
+    assert_eq!(codec_sum1_data.len(), talker_config.hidden);
+    assert!(
+        logits1_data.iter().all(|v| v.is_finite()),
+        "frame 1 talker logits contained NaN/Inf"
+    );
+    assert!(
+        codec_sum1_data.iter().all(|v| v.is_finite()),
+        "frame 1 codec sum contained NaN/Inf"
+    );
+    assert_ne!(
+        codec_sum0_data, codec_sum1_data,
+        "frame 0 and frame 1 codec sums should differ"
+    );
+}
+
+#[test]
 fn test_predictor_per_group_logits() {
     let config = CodePredictorConfig {
         hidden: 32,
