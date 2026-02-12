@@ -3,7 +3,7 @@ use luminal::{
     op::DType,
     prelude::{F32Pow, GraphTensor},
 };
-use luminal_nn::{ConvND, LayerNorm};
+use luminal_nn::{ConvND, ConvTranspose1d, LayerNorm};
 
 pub const SPEECH_DECODER_CODEBOOK_DIM: usize = 512;
 pub const SPEECH_DECODER_VQ_DIM: usize = 256;
@@ -243,6 +243,7 @@ impl CausalConv1d {
         dilation: usize,
         bias: bool,
         cx: &mut Graph,
+        groups: usize,
     ) -> Self {
         let left_pad = dilation * (kernel - 1);
         Self {
@@ -254,7 +255,7 @@ impl CausalConv1d {
                 vec![dilation],
                 vec![0],
                 bias,
-                1,
+                groups,
                 cx,
             ),
             left_pad,
@@ -264,6 +265,327 @@ impl CausalConv1d {
     pub fn forward(&self, x: GraphTensor) -> GraphTensor {
         let padded = x.pad(((0, 0), (0, 0), (self.left_pad, 0)), 0.0);
         self.conv.forward(padded)
+    }
+}
+
+pub struct CausalTransConv1d {
+    pub conv: ConvTranspose1d,
+    trim_right: usize,
+    stride: usize,
+}
+
+impl CausalTransConv1d {
+    pub fn new(
+        ch_in: usize,
+        ch_out: usize,
+        kernel: usize,
+        stride: usize,
+        bias: bool,
+        cx: &mut Graph,
+    ) -> Self {
+        assert!(
+            kernel >= stride,
+            "CausalTransConv1d requires kernel >= stride (got kernel={kernel}, stride={stride})"
+        );
+
+        Self {
+            conv: ConvTranspose1d::new(ch_in, ch_out, kernel, stride, 0, bias, cx),
+            trim_right: kernel - stride,
+            stride,
+        }
+    }
+
+    pub fn forward(&self, x: GraphTensor) -> GraphTensor {
+        let (_, _, input_len) = x.dims3();
+        let out = self.conv.forward(x);
+        if self.trim_right > 0 {
+            let target_len = input_len * self.stride;
+            out.slice((.., .., ..target_len))
+        } else {
+            out
+        }
+    }
+}
+
+pub struct ConvNeXtBlock {
+    pub dwconv: CausalConv1d,
+    pub norm: LayerNorm,
+    pub pwconv1_weight: GraphTensor,
+    pub pwconv1_bias: GraphTensor,
+    pub pwconv2_weight: GraphTensor,
+    pub pwconv2_bias: GraphTensor,
+    pub gamma: GraphTensor,
+}
+
+impl ConvNeXtBlock {
+    pub fn new(dim: usize, prefix: impl AsRef<str>, cx: &mut Graph) -> Self {
+        let prefix = prefix.as_ref();
+
+        let dwconv = CausalConv1d::new(dim, dim, 7, 1, true, cx, dim);
+        dwconv
+            .conv
+            .weight
+            .set_name(&format!("{prefix}.dwconv.conv.weight"));
+        if let Some(bias) = dwconv.conv.bias {
+            bias.set_name(&format!("{prefix}.dwconv.conv.bias"));
+        }
+
+        let norm_weight = format!("{prefix}.norm.weight");
+        let norm_bias = format!("{prefix}.norm.bias");
+        let norm = LayerNorm::new(
+            dim,
+            Some(norm_weight.as_str()),
+            Some(norm_bias.as_str()),
+            true,
+            1e-6,
+            cx,
+        );
+
+        Self {
+            dwconv,
+            norm,
+            pwconv1_weight: cx.named_tensor(format!("{prefix}.pwconv1.weight"), (4 * dim, dim)),
+            pwconv1_bias: cx.named_tensor(format!("{prefix}.pwconv1.bias"), 4 * dim),
+            pwconv2_weight: cx.named_tensor(format!("{prefix}.pwconv2.weight"), (dim, 4 * dim)),
+            pwconv2_bias: cx.named_tensor(format!("{prefix}.pwconv2.bias"), dim),
+            gamma: cx.named_tensor(format!("{prefix}.gamma"), dim),
+        }
+    }
+
+    pub fn forward(&self, x: GraphTensor) -> GraphTensor {
+        let residual = x;
+        let h = self.dwconv.forward(x);
+        let h = h.transpose(1, 2);
+        let h = self.norm.forward(h);
+        let dims = h.dims();
+        let h = h.matmul(self.pwconv1_weight.t()) + self.pwconv1_bias.expand_lhs(&dims[..2]);
+        let h = h.gelu();
+        let dims = h.dims();
+        let h = h.matmul(self.pwconv2_weight.t()) + self.pwconv2_bias.expand_lhs(&dims[..2]);
+        let dims = h.dims();
+        let h = self.gamma.expand_lhs(&dims[..2]) * h;
+        let h = h.transpose(1, 2);
+        residual + h
+    }
+}
+
+pub struct DecoderResidualUnit {
+    pub act1: SnakeBeta,
+    pub conv1: CausalConv1d,
+    pub act2: SnakeBeta,
+    pub conv2: CausalConv1d,
+}
+
+impl DecoderResidualUnit {
+    pub fn new(channels: usize, dilation: usize, prefix: impl AsRef<str>, cx: &mut Graph) -> Self {
+        let prefix = prefix.as_ref();
+
+        let conv1 = CausalConv1d::new(channels, channels, 7, dilation, true, cx, 1);
+        conv1
+            .conv
+            .weight
+            .set_name(&format!("{prefix}.conv1.conv.weight"));
+        if let Some(bias) = conv1.conv.bias {
+            bias.set_name(&format!("{prefix}.conv1.conv.bias"));
+        }
+
+        let conv2 = CausalConv1d::new(channels, channels, 1, 1, true, cx, 1);
+        conv2
+            .conv
+            .weight
+            .set_name(&format!("{prefix}.conv2.conv.weight"));
+        if let Some(bias) = conv2.conv.bias {
+            bias.set_name(&format!("{prefix}.conv2.conv.bias"));
+        }
+
+        Self {
+            act1: SnakeBeta::new(
+                channels,
+                &format!("{prefix}.act1.alpha"),
+                &format!("{prefix}.act1.beta"),
+                cx,
+            ),
+            conv1,
+            act2: SnakeBeta::new(
+                channels,
+                &format!("{prefix}.act2.alpha"),
+                &format!("{prefix}.act2.beta"),
+                cx,
+            ),
+            conv2,
+        }
+    }
+
+    pub fn forward(&self, x: GraphTensor) -> GraphTensor {
+        let residual = x;
+        let hidden = self.act1.forward(x);
+        let hidden = self.conv1.forward(hidden);
+        let hidden = self.act2.forward(hidden);
+        let hidden = self.conv2.forward(hidden);
+        residual + hidden
+    }
+}
+
+pub struct DecoderBlock {
+    pub snake: SnakeBeta,
+    pub trans_conv: CausalTransConv1d,
+    pub residual_units: Vec<DecoderResidualUnit>,
+}
+
+impl DecoderBlock {
+    pub fn new(
+        in_dim: usize,
+        out_dim: usize,
+        rate: usize,
+        prefix: impl AsRef<str>,
+        cx: &mut Graph,
+    ) -> Self {
+        let prefix = prefix.as_ref();
+        let snake = SnakeBeta::new(
+            in_dim,
+            &format!("{prefix}.block.0.alpha"),
+            &format!("{prefix}.block.0.beta"),
+            cx,
+        );
+
+        let trans_conv = CausalTransConv1d::new(in_dim, out_dim, 2 * rate, rate, true, cx);
+        trans_conv
+            .conv
+            .weight
+            .set_name(&format!("{prefix}.block.1.conv.weight"));
+        if let Some(bias) = trans_conv.conv.bias {
+            bias.set_name(&format!("{prefix}.block.1.conv.bias"));
+        }
+
+        let mut residual_units = Vec::with_capacity(3);
+        for (i, dilation) in [1, 3, 9].into_iter().enumerate() {
+            residual_units.push(DecoderResidualUnit::new(
+                out_dim,
+                dilation,
+                format!("{prefix}.block.{}", i + 2),
+                cx,
+            ));
+        }
+
+        Self {
+            snake,
+            trans_conv,
+            residual_units,
+        }
+    }
+
+    pub fn forward(&self, x: GraphTensor) -> GraphTensor {
+        let mut hidden = self.snake.forward(x);
+        hidden = self.trans_conv.forward(hidden);
+        for residual_unit in &self.residual_units {
+            hidden = residual_unit.forward(hidden);
+        }
+        hidden
+    }
+}
+
+pub struct WaveformDecoder {
+    pub initial_upsample: Vec<(CausalTransConv1d, ConvNeXtBlock)>,
+    pub initial_conv: CausalConv1d,
+    pub blocks: Vec<DecoderBlock>,
+    pub final_snake: SnakeBeta,
+    pub final_conv: CausalConv1d,
+}
+
+impl WaveformDecoder {
+    pub fn new(cx: &mut Graph, config: &SpeechDecoderConfig) -> Self {
+        let mut initial_upsample = Vec::with_capacity(config.upsampling_ratios.len());
+        for (i, ratio) in config.upsampling_ratios.iter().copied().enumerate() {
+            let trans_conv = CausalTransConv1d::new(
+                config.latent_dim,
+                config.latent_dim,
+                ratio,
+                ratio,
+                true,
+                cx,
+            );
+            trans_conv
+                .conv
+                .weight
+                .set_name(&format!("decoder.upsample.{i}.0.conv.weight"));
+            if let Some(bias) = trans_conv.conv.bias {
+                bias.set_name(&format!("decoder.upsample.{i}.0.conv.bias"));
+            }
+
+            let convnext =
+                ConvNeXtBlock::new(config.latent_dim, format!("decoder.upsample.{i}.1"), cx);
+            initial_upsample.push((trans_conv, convnext));
+        }
+
+        let initial_conv =
+            CausalConv1d::new(config.latent_dim, config.decoder_dim, 7, 1, true, cx, 1);
+        initial_conv
+            .conv
+            .weight
+            .set_name("decoder.decoder.0.conv.weight");
+        if let Some(bias) = initial_conv.conv.bias {
+            bias.set_name("decoder.decoder.0.conv.bias");
+        }
+
+        let mut blocks = Vec::with_capacity(config.upsample_rates.len());
+        let mut in_dim = config.decoder_dim;
+        for (i, rate) in config.upsample_rates.iter().copied().enumerate() {
+            let out_dim = config.decoder_dim / (1 << (i + 1));
+            assert!(
+                out_dim > 0,
+                "decoder_dim must be large enough for decoder block {i} channel halving"
+            );
+            blocks.push(DecoderBlock::new(
+                in_dim,
+                out_dim,
+                rate,
+                format!("decoder.decoder.{}", i + 1),
+                cx,
+            ));
+            in_dim = out_dim;
+        }
+
+        let final_snake_idx = config.upsample_rates.len() + 1;
+        let final_conv_idx = final_snake_idx + 1;
+        let final_snake = SnakeBeta::new(
+            in_dim,
+            &format!("decoder.decoder.{final_snake_idx}.alpha"),
+            &format!("decoder.decoder.{final_snake_idx}.beta"),
+            cx,
+        );
+
+        let final_conv = CausalConv1d::new(in_dim, 1, 7, 1, true, cx, 1);
+        final_conv
+            .conv
+            .weight
+            .set_name(&format!("decoder.decoder.{final_conv_idx}.conv.weight"));
+        if let Some(bias) = final_conv.conv.bias {
+            bias.set_name(&format!("decoder.decoder.{final_conv_idx}.conv.bias"));
+        }
+
+        Self {
+            initial_upsample,
+            initial_conv,
+            blocks,
+            final_snake,
+            final_conv,
+        }
+    }
+
+    pub fn forward(&self, x: GraphTensor) -> GraphTensor {
+        let mut hidden = x;
+        for (trans_conv, convnext) in &self.initial_upsample {
+            hidden = trans_conv.forward(hidden);
+            hidden = convnext.forward(hidden);
+        }
+
+        hidden = self.initial_conv.forward(hidden);
+        for block in &self.blocks {
+            hidden = block.forward(hidden);
+        }
+        hidden = self.final_snake.forward(hidden);
+        hidden = self.final_conv.forward(hidden);
+        hidden.clip(-1.0, 1.0)
     }
 }
 
@@ -506,6 +828,7 @@ pub struct SpeechDecoder {
     pub quantizer: SplitResidualVectorQuantizer,
     pub pre_conv: CausalConv1d,
     pub pre_transformer: PreTransformer,
+    pub waveform_decoder: WaveformDecoder,
     pub config: SpeechDecoderConfig,
 }
 
@@ -523,8 +846,9 @@ impl SpeechDecoder {
         assert!(config.sliding_window > 0, "sliding_window must be > 0");
 
         let quantizer = SplitResidualVectorQuantizer::new(cx, &config);
-        let pre_conv = CausalConv1d::new(config.codebook_dim, config.latent_dim, 3, 1, true, cx);
+        let pre_conv = CausalConv1d::new(config.codebook_dim, config.latent_dim, 3, 1, true, cx, 1);
         let pre_transformer = PreTransformer::new(cx, &config);
+        let waveform_decoder = WaveformDecoder::new(cx, &config);
 
         pre_conv
             .conv
@@ -538,6 +862,7 @@ impl SpeechDecoder {
             quantizer,
             pre_conv,
             pre_transformer,
+            waveform_decoder,
             config,
         }
     }
@@ -547,6 +872,7 @@ impl SpeechDecoder {
         let latent = self.pre_conv.forward(quantized);
         let hidden = latent.transpose(1, 2);
         let transformed = self.pre_transformer.forward(hidden, &self.config);
-        transformed.transpose(1, 2)
+        let latent = transformed.transpose(1, 2);
+        self.waveform_decoder.forward(latent)
     }
 }

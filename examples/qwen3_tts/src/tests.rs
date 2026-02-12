@@ -3,8 +3,8 @@ use crate::{
     model::{TalkerConfig, TalkerModel, TextProjection, VOCAB_SIZE},
     pipeline::{StreamingPromptInputs, TtsPipeline, sample_greedy},
     speech_decoder::{
-        CausalConv1d, PreTransformer, SnakeBeta, SpeechDecoder, SpeechDecoderConfig,
-        SplitResidualVectorQuantizer,
+        CausalConv1d, CausalTransConv1d, ConvNeXtBlock, DecoderBlock, PreTransformer, SnakeBeta,
+        SpeechDecoder, SpeechDecoderConfig, SplitResidualVectorQuantizer, WaveformDecoder,
     },
     weight_loader::load_safetensors_to_native,
 };
@@ -2012,6 +2012,9 @@ fn small_speech_decoder_config() -> SpeechDecoderConfig {
         head_dim: 4,
         semantic_codebook_size: 8,
         acoustic_codebook_size: 8,
+        decoder_dim: 32,
+        upsample_rates: vec![2, 2],
+        upsampling_ratios: vec![2, 2],
         sliding_window: 4,
         ..SpeechDecoderConfig::default()
     }
@@ -2140,6 +2143,170 @@ fn set_random_pre_transformer_params(
     rt.set_data(
         pre_transformer.output_proj_bias.id,
         random_vec(&mut *rng, config.latent_dim),
+    );
+}
+
+fn set_random_waveform_decoder_params(
+    rt: &mut NativeRuntime,
+    waveform_decoder: &WaveformDecoder,
+    config: &SpeechDecoderConfig,
+    rng: &mut StdRng,
+) {
+    for ((trans_conv, convnext), ratio) in waveform_decoder
+        .initial_upsample
+        .iter()
+        .zip(config.upsampling_ratios.iter().copied())
+    {
+        rt.set_data(
+            trans_conv.conv.weight.id,
+            random_vec(&mut *rng, config.latent_dim * config.latent_dim * ratio),
+        );
+        rt.set_data(
+            trans_conv
+                .conv
+                .bias
+                .expect("initial upsample transposed conv bias")
+                .id,
+            random_vec(&mut *rng, config.latent_dim),
+        );
+
+        rt.set_data(
+            convnext.dwconv.conv.weight.id,
+            random_vec(&mut *rng, config.latent_dim * 7),
+        );
+        rt.set_data(
+            convnext
+                .dwconv
+                .conv
+                .bias
+                .expect("convnext depthwise conv bias")
+                .id,
+            random_vec(&mut *rng, config.latent_dim),
+        );
+        rt.set_data(
+            convnext.norm.weight.expect("convnext norm weight").id,
+            random_vec(&mut *rng, config.latent_dim),
+        );
+        rt.set_data(
+            convnext.norm.bias.expect("convnext norm bias").id,
+            random_vec(&mut *rng, config.latent_dim),
+        );
+        rt.set_data(
+            convnext.pwconv1_weight.id,
+            random_vec(&mut *rng, 4 * config.latent_dim * config.latent_dim),
+        );
+        rt.set_data(
+            convnext.pwconv1_bias.id,
+            random_vec(&mut *rng, 4 * config.latent_dim),
+        );
+        rt.set_data(
+            convnext.pwconv2_weight.id,
+            random_vec(&mut *rng, 4 * config.latent_dim * config.latent_dim),
+        );
+        rt.set_data(
+            convnext.pwconv2_bias.id,
+            random_vec(&mut *rng, config.latent_dim),
+        );
+        rt.set_data(
+            convnext.gamma.id,
+            random_positive_vec(&mut *rng, config.latent_dim, 0.01, 0.2),
+        );
+    }
+
+    rt.set_data(
+        waveform_decoder.initial_conv.conv.weight.id,
+        random_vec(&mut *rng, config.decoder_dim * config.latent_dim * 7),
+    );
+    rt.set_data(
+        waveform_decoder
+            .initial_conv
+            .conv
+            .bias
+            .expect("waveform initial conv bias")
+            .id,
+        random_vec(&mut *rng, config.decoder_dim),
+    );
+
+    let mut in_dim = config.decoder_dim;
+    for (i, (block, rate)) in waveform_decoder
+        .blocks
+        .iter()
+        .zip(config.upsample_rates.iter().copied())
+        .enumerate()
+    {
+        let out_dim = config.decoder_dim / (1 << (i + 1));
+        rt.set_data(block.snake.alpha.id, random_vec(&mut *rng, in_dim));
+        rt.set_data(block.snake.beta.id, random_vec(&mut *rng, in_dim));
+        rt.set_data(
+            block.trans_conv.conv.weight.id,
+            random_vec(&mut *rng, in_dim * out_dim * (2 * rate)),
+        );
+        rt.set_data(
+            block
+                .trans_conv
+                .conv
+                .bias
+                .expect("decoder block transposed conv bias")
+                .id,
+            random_vec(&mut *rng, out_dim),
+        );
+
+        for residual_unit in &block.residual_units {
+            rt.set_data(residual_unit.act1.alpha.id, random_vec(&mut *rng, out_dim));
+            rt.set_data(residual_unit.act1.beta.id, random_vec(&mut *rng, out_dim));
+            rt.set_data(
+                residual_unit.conv1.conv.weight.id,
+                random_vec(&mut *rng, out_dim * out_dim * 7),
+            );
+            rt.set_data(
+                residual_unit
+                    .conv1
+                    .conv
+                    .bias
+                    .expect("decoder residual unit conv1 bias")
+                    .id,
+                random_vec(&mut *rng, out_dim),
+            );
+            rt.set_data(residual_unit.act2.alpha.id, random_vec(&mut *rng, out_dim));
+            rt.set_data(residual_unit.act2.beta.id, random_vec(&mut *rng, out_dim));
+            rt.set_data(
+                residual_unit.conv2.conv.weight.id,
+                random_vec(&mut *rng, out_dim * out_dim),
+            );
+            rt.set_data(
+                residual_unit
+                    .conv2
+                    .conv
+                    .bias
+                    .expect("decoder residual unit conv2 bias")
+                    .id,
+                random_vec(&mut *rng, out_dim),
+            );
+        }
+
+        in_dim = out_dim;
+    }
+
+    rt.set_data(
+        waveform_decoder.final_snake.alpha.id,
+        random_vec(&mut *rng, in_dim),
+    );
+    rt.set_data(
+        waveform_decoder.final_snake.beta.id,
+        random_vec(&mut *rng, in_dim),
+    );
+    rt.set_data(
+        waveform_decoder.final_conv.conv.weight.id,
+        random_vec(&mut *rng, in_dim * 7),
+    );
+    rt.set_data(
+        waveform_decoder
+            .final_conv
+            .conv
+            .bias
+            .expect("waveform final conv bias")
+            .id,
+        random_vec(&mut *rng, 1),
     );
 }
 
@@ -2367,7 +2534,7 @@ fn test_causal_conv_shape() {
     let time = 7;
 
     let mut cx = Graph::new();
-    let conv = CausalConv1d::new(ch_in, ch_out, 3, 2, true, &mut cx);
+    let conv = CausalConv1d::new(ch_in, ch_out, 3, 2, true, &mut cx, 1);
     let x = cx.tensor((batch, ch_in, time));
     let out = conv.forward(x).output();
 
@@ -2387,6 +2554,143 @@ fn test_causal_conv_shape() {
     rt.execute(&cx.dyn_map);
     let out_data = rt.get_f32(out.id).clone();
     assert_eq!(out_data.len(), batch * ch_out * time);
+}
+
+#[test]
+fn test_causal_trans_conv_shape() {
+    let mut cx = Graph::new();
+    let trans_conv = CausalTransConv1d::new(8, 4, 6, 3, true, &mut cx);
+    let x = cx.tensor((1, 8, 5));
+    let out = trans_conv.forward(x).output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+    let mut rng = StdRng::seed_from_u64(1603);
+
+    rt.set_data(x.id, random_vec(&mut rng, 8 * 5));
+    rt.set_data(trans_conv.conv.weight.id, random_vec(&mut rng, 8 * 4 * 6));
+    rt.set_data(
+        trans_conv
+            .conv
+            .bias
+            .expect("causal transposed conv bias")
+            .id,
+        random_vec(&mut rng, 4),
+    );
+
+    rt.execute(&cx.dyn_map);
+    let mut shape = out.shape;
+    shape.resolve_dyn_dims(&cx.dyn_map);
+    assert_eq!(shape.shape_usize(), vec![1, 4, 15]);
+}
+
+#[test]
+fn test_convnext_block_shape() {
+    let mut cx = Graph::new();
+    let block = ConvNeXtBlock::new(8, "test.convnext", &mut cx);
+    let x = cx.tensor((1, 8, 10));
+    let out = block.forward(x).output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+    let mut rng = StdRng::seed_from_u64(1606);
+
+    rt.set_data(x.id, random_vec(&mut rng, 8 * 10));
+    rt.set_data(block.dwconv.conv.weight.id, random_vec(&mut rng, 8 * 7));
+    rt.set_data(
+        block.dwconv.conv.bias.expect("convnext dwconv bias").id,
+        random_vec(&mut rng, 8),
+    );
+    rt.set_data(
+        block.norm.weight.expect("convnext norm weight").id,
+        random_vec(&mut rng, 8),
+    );
+    rt.set_data(
+        block.norm.bias.expect("convnext norm bias").id,
+        random_vec(&mut rng, 8),
+    );
+    rt.set_data(block.pwconv1_weight.id, random_vec(&mut rng, 4 * 8 * 8));
+    rt.set_data(block.pwconv1_bias.id, random_vec(&mut rng, 4 * 8));
+    rt.set_data(block.pwconv2_weight.id, random_vec(&mut rng, 4 * 8 * 8));
+    rt.set_data(block.pwconv2_bias.id, random_vec(&mut rng, 8));
+    rt.set_data(block.gamma.id, random_positive_vec(&mut rng, 8, 0.01, 0.2));
+
+    rt.execute(&cx.dyn_map);
+    let out_data = rt.get_f32(out.id).clone();
+    assert_eq!(out_data.len(), 8 * 10);
+
+    let mut shape = out.shape;
+    shape.resolve_dyn_dims(&cx.dyn_map);
+    assert_eq!(shape.shape_usize(), vec![1, 8, 10]);
+}
+
+#[test]
+fn test_decoder_block_shape() {
+    let mut cx = Graph::new();
+    let block = DecoderBlock::new(16, 8, 2, "test.decoder.1", &mut cx);
+    let x = cx.tensor((1, 16, 6));
+    let out = block.forward(x).output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+    let mut rng = StdRng::seed_from_u64(1607);
+
+    rt.set_data(x.id, random_vec(&mut rng, 16 * 6));
+    rt.set_data(block.snake.alpha.id, random_vec(&mut rng, 16));
+    rt.set_data(block.snake.beta.id, random_vec(&mut rng, 16));
+    rt.set_data(
+        block.trans_conv.conv.weight.id,
+        random_vec(&mut rng, 16 * 8 * 4),
+    );
+    rt.set_data(
+        block
+            .trans_conv
+            .conv
+            .bias
+            .expect("decoder block transposed conv bias")
+            .id,
+        random_vec(&mut rng, 8),
+    );
+    for residual_unit in &block.residual_units {
+        rt.set_data(residual_unit.act1.alpha.id, random_vec(&mut rng, 8));
+        rt.set_data(residual_unit.act1.beta.id, random_vec(&mut rng, 8));
+        rt.set_data(
+            residual_unit.conv1.conv.weight.id,
+            random_vec(&mut rng, 8 * 8 * 7),
+        );
+        rt.set_data(
+            residual_unit
+                .conv1
+                .conv
+                .bias
+                .expect("decoder block conv1 bias")
+                .id,
+            random_vec(&mut rng, 8),
+        );
+        rt.set_data(residual_unit.act2.alpha.id, random_vec(&mut rng, 8));
+        rt.set_data(residual_unit.act2.beta.id, random_vec(&mut rng, 8));
+        rt.set_data(
+            residual_unit.conv2.conv.weight.id,
+            random_vec(&mut rng, 8 * 8),
+        );
+        rt.set_data(
+            residual_unit
+                .conv2
+                .conv
+                .bias
+                .expect("decoder block conv2 bias")
+                .id,
+            random_vec(&mut rng, 8),
+        );
+    }
+
+    rt.execute(&cx.dyn_map);
+    let out_data = rt.get_f32(out.id).clone();
+    assert_eq!(out_data.len(), 8 * 12);
+
+    let mut shape = out.shape;
+    shape.resolve_dyn_dims(&cx.dyn_map);
+    assert_eq!(shape.shape_usize(), vec![1, 8, 12]);
 }
 
 #[test]
@@ -2468,14 +2772,67 @@ fn test_speech_decoder_with_transformer() {
         random_vec(&mut rng, config.latent_dim),
     );
     set_random_pre_transformer_params(&mut rt, &decoder.pre_transformer, &config, &mut rng);
+    set_random_waveform_decoder_params(&mut rt, &decoder.waveform_decoder, &config, &mut rng);
 
     rt.execute(&cx.dyn_map);
     let out_data = rt.get_f32(out.id).clone();
-    assert_eq!(out_data.len(), batch * config.latent_dim * seq);
+    let total_upsample = config.upsampling_ratios.iter().product::<usize>()
+        * config.upsample_rates.iter().product::<usize>();
+    assert_eq!(out_data.len(), batch * seq * total_upsample);
+    assert!(out_data.iter().all(|v| (-1.0..=1.0).contains(v)));
 
     let mut shape = out.shape;
     shape.resolve_dyn_dims(&cx.dyn_map);
-    assert_eq!(shape.shape_usize(), vec![batch, config.latent_dim, seq]);
+    assert_eq!(shape.shape_usize(), vec![batch, 1, seq * total_upsample]);
+}
+
+#[test]
+fn test_full_waveform_decoder() {
+    let config = small_speech_decoder_config();
+    let batch = 1;
+    let seq = 4;
+
+    let mut cx = Graph::new();
+    let decoder = SpeechDecoder::new(&mut cx, config.clone());
+    let code_tensors: Vec<GraphTensor> = (0..(1 + config.num_acoustic_quantizers))
+        .map(|_| cx.tensor((batch, seq)).as_dtype(DType::Int))
+        .collect();
+    let out = decoder.decode_codes(code_tensors.clone()).output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+    let mut rng = StdRng::seed_from_u64(1611);
+
+    for (i, code_ids) in code_tensors.iter().enumerate() {
+        let vocab = if i == 0 {
+            config.semantic_codebook_size
+        } else {
+            config.acoustic_codebook_size
+        };
+        let ids: Vec<i32> = (0..seq).map(|t| ((i + t) % vocab) as i32).collect();
+        rt.set_data(code_ids.id, ids);
+    }
+
+    set_random_rvq_params(&mut rt, &decoder.quantizer, &config, &mut rng);
+    rt.set_data(
+        decoder.pre_conv.conv.weight.id,
+        random_vec(&mut rng, config.latent_dim * config.codebook_dim * 3),
+    );
+    rt.set_data(
+        decoder.pre_conv.conv.bias.expect("pre-conv bias").id,
+        random_vec(&mut rng, config.latent_dim),
+    );
+    set_random_pre_transformer_params(&mut rt, &decoder.pre_transformer, &config, &mut rng);
+    set_random_waveform_decoder_params(&mut rt, &decoder.waveform_decoder, &config, &mut rng);
+
+    rt.execute(&cx.dyn_map);
+    let out_data = rt.get_f32(out.id).clone();
+    assert_eq!(out_data.len(), batch * 64);
+    assert!(out_data.iter().all(|v| (-1.0..=1.0).contains(v)));
+
+    let mut shape = out.shape;
+    shape.resolve_dyn_dims(&cx.dyn_map);
+    assert_eq!(shape.shape_usize(), vec![batch, 1, 64]);
 }
 
 #[test]
