@@ -75,6 +75,10 @@ pub struct CodePredictorModel {
     pub config: CodePredictorConfig,
 }
 
+pub struct PredictorCodeOutput {
+    pub embeds: Vec<GraphTensor>,
+}
+
 impl CodePredictorModel {
     pub fn new(cx: &mut Graph, config: CodePredictorConfig) -> Self {
         assert_eq!(
@@ -223,6 +227,32 @@ impl CodePredictorModel {
             (code_ids * dim).expand_dim(2, dim)
                 + code_ids.graph().arange(dim).expand_lhs([batch, seq]),
         )
+    }
+
+    /// Generate all predictor code embeddings by statically unrolling
+    /// autoregressive predictor steps (code groups 1..num_code_groups-1).
+    pub fn generate_codes(
+        &self,
+        talker_hidden: GraphTensor,
+        code_0_embed: GraphTensor,
+    ) -> PredictorCodeOutput {
+        let groups = self.config.num_code_groups - 1;
+        let mut embeds = Vec::with_capacity(groups);
+        let mut seq = talker_hidden.concat_along(code_0_embed, 1);
+
+        for group in 0..groups {
+            let hidden = self.forward(seq);
+            let logits = self.logits_for_group(hidden, group);
+            let last_logits = logits.slice((.., (group + 1).., ..));
+            let code = last_logits.argmax(2);
+            let embed = self.embed_for_group(code, group);
+            embeds.push(embed);
+            if group + 1 < groups {
+                seq = seq.concat_along(embed, 1);
+            }
+        }
+
+        PredictorCodeOutput { embeds }
     }
 }
 

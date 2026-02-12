@@ -1453,3 +1453,71 @@ fn test_predictor_per_group_embedding() {
     assert_eq!(out1.len(), batch * seq * config.talker_hidden);
     assert_ne!(out0, out1);
 }
+
+#[test]
+fn test_predictor_generate_codes() {
+    let config = CodePredictorConfig {
+        hidden: 32,
+        head_dim: 16,
+        n_heads: 4,
+        n_kv_heads: 2,
+        kv_groups: 2,
+        intermediate: 64,
+        layers: 1,
+        codebook_vocab: 48,
+        num_code_groups: 4,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+        talker_hidden: 64,
+    };
+
+    let mut cx = Graph::new();
+    let model = CodePredictorModel::new(&mut cx, config.clone());
+
+    let talker_hidden = cx.tensor((1, 1, config.talker_hidden));
+    let code_0_embed = cx.tensor((1, 1, config.talker_hidden));
+    let out = model.generate_codes(talker_hidden, code_0_embed);
+
+    assert_eq!(out.embeds.len(), config.num_code_groups - 1);
+    let embed0 = out.embeds[0].output();
+    let embed1 = out.embeds[1].output();
+    let embed2 = out.embeds[2].output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    let mut rng = StdRng::seed_from_u64(101);
+    rt.set_data(
+        talker_hidden.id,
+        random_vec(&mut rng, config.talker_hidden),
+    );
+    rt.set_data(code_0_embed.id, random_vec(&mut rng, config.talker_hidden));
+    set_random_code_predictor_params(&mut rt, &model, &config, &mut rng);
+
+    rt.execute(&cx.dyn_map);
+
+    let out0 = rt.get_f32(embed0.id).clone();
+    let out1 = rt.get_f32(embed1.id).clone();
+    let out2 = rt.get_f32(embed2.id).clone();
+
+    assert_eq!(out0.len(), 1 * 1 * config.talker_hidden);
+    assert_eq!(out1.len(), 1 * 1 * config.talker_hidden);
+    assert_eq!(out2.len(), 1 * 1 * config.talker_hidden);
+
+    assert!(
+        out0.iter().all(|v| v.is_finite()),
+        "group 0 embedding contained NaN/Inf"
+    );
+    assert!(
+        out1.iter().all(|v| v.is_finite()),
+        "group 1 embedding contained NaN/Inf"
+    );
+    assert!(
+        out2.iter().all(|v| v.is_finite()),
+        "group 2 embedding contained NaN/Inf"
+    );
+    assert!(
+        !(out0 == out1 && out1 == out2),
+        "all generated predictor embeddings were identical"
+    );
+}
