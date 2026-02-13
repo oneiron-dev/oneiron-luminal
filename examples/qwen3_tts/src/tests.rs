@@ -1,12 +1,15 @@
 use crate::{
     code_predictor::{CodePredictorConfig, CodePredictorModel},
     model::{TalkerConfig, TalkerModel, TextProjection, VOCAB_SIZE},
-    pipeline::{generate_frames, sample_greedy, StreamingPromptInputs, TtsPipeline},
+    pipeline::{
+        decode_speech, generate_frames, sample_greedy, NonStreamingPromptInputs,
+        StreamingPromptInputs, TtsPipeline,
+    },
     speech_decoder::{
         CausalConv1d, CausalTransConv1d, ConvNeXtBlock, DecoderBlock, PreTransformer, SnakeBeta,
         SpeechDecoder, SpeechDecoderConfig, SplitResidualVectorQuantizer, WaveformDecoder,
     },
-    weight_loader::{expected_element_count, load_safetensors_to_native},
+    weight_loader::{expected_element_count, load_safetensors_to_map, load_safetensors_to_native},
 };
 use candle_core::{Device, Result as CandleResult, Tensor};
 use candle_nn::ops::softmax;
@@ -53,6 +56,34 @@ fn build_random_weight_map(
         codec_sum = codec_sum + *embed;
     }
     let _ = codec_sum.output();
+
+    let mut map = HashMap::new();
+    for node in cx.graph.node_indices() {
+        let Some(input) = cx.graph[node].as_any().downcast_ref::<Input>() else {
+            continue;
+        };
+        if input.label.is_empty() {
+            continue;
+        }
+        if let Some(count) = expected_element_count(&cx, node) {
+            map.insert(input.label.clone(), random_vec(rng, count));
+        }
+    }
+    map
+}
+
+fn build_random_speech_weight_map(
+    speech_config: &SpeechDecoderConfig,
+    rng: &mut StdRng,
+) -> HashMap<String, Vec<f32>> {
+    let mut cx = Graph::new();
+    let decoder = SpeechDecoder::new(&mut cx, speech_config.clone());
+    let num_codebooks =
+        speech_config.num_semantic_quantizers + speech_config.num_acoustic_quantizers;
+    let code_tensors: Vec<GraphTensor> = (0..num_codebooks)
+        .map(|_| cx.tensor((1, 1)).as_dtype(DType::Int))
+        .collect();
+    let _ = decoder.decode_codes(code_tensors).output();
 
     let mut map = HashMap::new();
     for node in cx.graph.node_indices() {
@@ -1370,6 +1401,115 @@ fn test_streaming_prompt_assembly() {
 }
 
 #[test]
+fn test_assemble_nonstreaming_prompt() {
+    let talker_config = TalkerConfig {
+        layers: 1,
+        hidden: 64,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 32,
+        kv_groups: 2,
+        intermediate: 128,
+        vocab_size: 96,
+        text_vocab_size: 256,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+    };
+    let predictor_config = CodePredictorConfig {
+        layers: 1,
+        hidden: 32,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 16,
+        kv_groups: 2,
+        intermediate: 64,
+        codebook_vocab: 48,
+        num_code_groups: 2,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+        talker_hidden: 64,
+    };
+
+    let mut cx = Graph::new();
+    let pipeline = TtsPipeline::new(&mut cx, talker_config.clone(), predictor_config);
+
+    let instruct_ids = cx.tensor((1, 2));
+    let role_ids = cx.tensor((1, 3));
+    let overlay_text_ids = cx.tensor((1, 5));
+    let overlay_codec_ids = cx.tensor((1, 5));
+    let content_ids = cx.tensor((1, 2));
+    let content_codec_ids = cx.tensor((1, 3));
+    let tts_eos_id = cx.tensor((1, 1));
+    let transition_text_id = cx.tensor((1, 1));
+    let transition_codec_id = cx.tensor((1, 1));
+
+    let outputs = pipeline.assemble_nonstreaming_prompt(&NonStreamingPromptInputs {
+        instruct_ids: Some(instruct_ids),
+        role_ids,
+        overlay_text_ids,
+        overlay_codec_ids,
+        content_ids,
+        content_codec_ids,
+        tts_eos_id,
+        transition_text_id,
+        transition_codec_id,
+    });
+    let initial_embeds = outputs.initial_embeds.output();
+    let tts_pad_embed = outputs.tts_pad_embed.output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    rt.set_data(instruct_ids.id, vec![30.0f32, 31.0]);
+    rt.set_data(role_ids.id, vec![0.0f32, 1.0, 2.0]);
+    rt.set_data(overlay_text_ids.id, vec![10.0f32, 10.0, 10.0, 10.0, 11.0]);
+    rt.set_data(overlay_codec_ids.id, vec![4.0f32, 5.0, 6.0, 7.0, 8.0]);
+    rt.set_data(content_ids.id, vec![21.0f32, 22.0]);
+    rt.set_data(content_codec_ids.id, vec![9.0f32, 9.0, 9.0]);
+    rt.set_data(tts_eos_id.id, vec![12.0f32]);
+    rt.set_data(transition_text_id.id, vec![10.0f32]);
+    rt.set_data(transition_codec_id.id, vec![9.0f32]);
+
+    let mut rng = StdRng::seed_from_u64(1701);
+    set_random_talker_params(&mut rt, &pipeline.talker, &talker_config, &mut rng);
+
+    rt.execute(&cx.dyn_map);
+
+    let initial_data = rt.get_f32(initial_embeds.id);
+    let tts_pad_data = rt.get_f32(tts_pad_embed.id);
+    let expected_prompt_len = 2 + 3 + 5 + 3 + 1;
+
+    assert_eq!(
+        initial_data.len(),
+        expected_prompt_len * talker_config.hidden
+    );
+    assert_eq!(tts_pad_data.len(), talker_config.hidden);
+    assert!(
+        initial_data.iter().all(|v| v.is_finite()),
+        "non-streaming initial embeds contained NaN/Inf"
+    );
+    assert!(
+        tts_pad_data.iter().all(|v| v.is_finite()),
+        "non-streaming tts pad embed contained NaN/Inf"
+    );
+    assert!(
+        initial_data.iter().any(|v| v.abs() > 1e-8),
+        "non-streaming initial embeds should not be all zeros"
+    );
+
+    let mut initial_shape = initial_embeds.shape;
+    initial_shape.resolve_dyn_dims(&cx.dyn_map);
+    assert_eq!(
+        initial_shape.shape_usize(),
+        vec![1, expected_prompt_len, talker_config.hidden]
+    );
+
+    let mut tts_shape = tts_pad_embed.shape;
+    tts_shape.resolve_dyn_dims(&cx.dyn_map);
+    assert_eq!(tts_shape.shape_usize(), vec![1, 1, talker_config.hidden]);
+}
+
+#[test]
 fn test_pipeline_end_to_end_shapes() {
     let talker_config = TalkerConfig {
         layers: 1,
@@ -1913,11 +2053,13 @@ fn test_generate_frames() {
     let mut rng = StdRng::seed_from_u64(99);
     let weights = build_random_weight_map(&talker_config, &predictor_config, &mut rng);
     let initial_embeds = random_vec(&mut rng, prompt_len * talker_config.hidden);
+    let tts_pad_embed = random_vec(&mut rng, talker_config.hidden);
 
     let frames = generate_frames(
         &talker_config,
         &predictor_config,
         &initial_embeds,
+        &tts_pad_embed,
         prompt_len,
         num_frames,
         &weights,
@@ -1935,10 +2077,12 @@ fn test_generate_frames() {
     let mut rng2 = StdRng::seed_from_u64(99);
     let weights2 = build_random_weight_map(&talker_config, &predictor_config, &mut rng2);
     let initial_embeds2 = random_vec(&mut rng2, prompt_len * talker_config.hidden);
+    let tts_pad_embed2 = random_vec(&mut rng2, talker_config.hidden);
     let frames2 = generate_frames(
         &talker_config,
         &predictor_config,
         &initial_embeds2,
+        &tts_pad_embed2,
         prompt_len,
         num_frames,
         &weights2,
@@ -2959,6 +3103,63 @@ fn test_full_waveform_decoder() {
     assert_eq!(shape.shape_usize(), vec![batch, 1, 64]);
 }
 
+#[test]
+fn test_decode_speech() {
+    let config = SpeechDecoderConfig {
+        codebook_dim: 4,
+        vq_dim: 2,
+        latent_dim: 4,
+        hidden_size: 4,
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        intermediate_size: 8,
+        num_hidden_layers: 0,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e4,
+        sliding_window: 2,
+        head_dim: 4,
+        semantic_codebook_size: 8,
+        acoustic_codebook_size: 8,
+        num_semantic_quantizers: 1,
+        num_acoustic_quantizers: 1,
+        decoder_dim: 8,
+        upsample_rates: vec![],
+        upsampling_ratios: vec![],
+        layer_scale_initial: 0.01,
+    };
+
+    let num_frames = 5;
+    let num_codebooks = config.num_semantic_quantizers + config.num_acoustic_quantizers;
+
+    let frames: Vec<Vec<u32>> = (0..num_frames)
+        .map(|frame_idx| {
+            (0..num_codebooks)
+                .map(|codebook_idx| {
+                    let vocab = if codebook_idx < config.num_semantic_quantizers {
+                        config.semantic_codebook_size
+                    } else {
+                        config.acoustic_codebook_size
+                    };
+                    ((frame_idx + codebook_idx) % vocab) as u32
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut rng = StdRng::seed_from_u64(1729);
+    let weights = build_random_speech_weight_map(&config, &mut rng);
+    let audio = decode_speech(&frames, &config, &weights);
+
+    let total_upsample = config.upsampling_ratios.iter().product::<usize>()
+        * config.upsample_rates.iter().product::<usize>();
+    assert_eq!(audio.len(), num_frames * total_upsample);
+    assert!(
+        audio.iter().all(|v| v.is_finite()),
+        "decoded speech audio contained NaN/Inf"
+    );
+    assert!(audio.iter().all(|v| (-1.0..=1.0).contains(v)));
+}
+
 fn validate_named_inputs_against_safetensors(
     cx: &Graph,
     tensors: &SafeTensors<'_>,
@@ -3167,6 +3368,52 @@ fn test_load_safetensors_bf16_conversion() {
 
     rt.execute(&cx.dyn_map);
     assert_close(rt.get_f32(out.id), &expected, 1e-6);
+}
+
+#[test]
+fn test_load_safetensors_to_map() {
+    let expected_f32 = vec![1.0f32, -2.0, 3.5, 4.25];
+    let source_bf16 = vec![-1.3f32, 0.0, 2.75, 6.5, -0.125];
+    let expected_bf16: Vec<f32> = source_bf16
+        .iter()
+        .map(|v| bf16::from_f32(*v).to_f32())
+        .collect();
+
+    let f32_bytes: Vec<u8> = expected_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let bf16_bytes: Vec<u8> = source_bf16
+        .iter()
+        .flat_map(|v| bf16::from_f32(*v).to_bits().to_le_bytes())
+        .collect();
+
+    let mut tensors: HashMap<String, TensorView<'_>> = HashMap::new();
+    tensors.insert(
+        "f32_tensor".to_string(),
+        TensorView::new(Dtype::F32, vec![expected_f32.len()], &f32_bytes).expect("f32 tensor view"),
+    );
+    tensors.insert(
+        "bf16_tensor".to_string(),
+        TensorView::new(Dtype::BF16, vec![source_bf16.len()], &bf16_bytes)
+            .expect("bf16 tensor view"),
+    );
+
+    let path = write_temp_safetensors(&tensors, "to_map");
+    let _cleanup = TempFileCleanup(path.clone());
+
+    let loaded = load_safetensors_to_map(&path).expect("load safetensors to map");
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(
+        loaded
+            .get("f32_tensor")
+            .expect("missing f32_tensor in safetensors map"),
+        &expected_f32
+    );
+    assert_close(
+        loaded
+            .get("bf16_tensor")
+            .expect("missing bf16_tensor in safetensors map"),
+        &expected_bf16,
+        1e-6,
+    );
 }
 
 #[test]

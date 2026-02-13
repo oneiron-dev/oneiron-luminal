@@ -117,3 +117,20 @@ pub fn load_safetensors_to_native(
 
     Ok(loaded)
 }
+
+pub fn load_safetensors_to_map(path: &Path) -> Result<HashMap<String, Vec<f32>>, String> {
+    let data =
+        std::fs::read(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let tensors =
+        SafeTensors::deserialize(&data).map_err(|e| format!("Failed to parse safetensors: {e}"))?;
+
+    let mut map = HashMap::new();
+    for (name, _) in tensors.iter() {
+        let view = tensors
+            .tensor(name)
+            .map_err(|e| format!("Failed to access tensor {name}: {e}"))?;
+        let values = to_f32_vec(view.dtype(), view.data(), name)?;
+        map.insert(name.to_string(), values);
+    }
+    Ok(map)
+}
