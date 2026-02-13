@@ -299,6 +299,34 @@ impl TalkerModel {
         (logits, normed, new_caches)
     }
 
+    /// Single-token decode with fixed-size KV buffers.
+    /// Returns (logits, final_norm_hidden, per_layer_new_kv).
+    pub fn decode_fixed(
+        &self,
+        embeds: GraphTensor,
+        kv_bufs: &[(GraphTensor, GraphTensor)],
+        attn_mask: GraphTensor,
+        pos_tensor: GraphTensor,
+    ) -> (GraphTensor, GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
+        assert_eq!(
+            kv_bufs.len(),
+            self.layers.len(),
+            "kv buffer count must match talker layer count"
+        );
+
+        let mut x = embeds;
+        let mut new_kvs = Vec::with_capacity(self.config.layers);
+        for (layer, (k_buf, v_buf)) in self.layers.iter().zip(kv_bufs.iter()) {
+            let (out, k_new, v_new) =
+                layer.forward_decode_fixed(x, *k_buf, *v_buf, attn_mask, &self.config, pos_tensor);
+            new_kvs.push((k_new, v_new));
+            x = out;
+        }
+        let normed = self.final_norm.forward(x);
+        let logits = normed.matmul(self.codec_head.t());
+        (logits, normed, new_kvs)
+    }
+
     pub fn decode_step(&self, embeds: GraphTensor) -> (GraphTensor, GraphTensor) {
         let hidden = self.forward_embeds(embeds);
         let normed = self.final_norm.forward(hidden);
@@ -476,6 +504,56 @@ impl TalkerLayer {
         x += ff;
 
         (x, k_full, v_full)
+    }
+
+    /// Single-token decode pass with fixed-size KV buffers and attention mask.
+    /// Returns (layer_output, new_k, new_v).
+    pub fn forward_decode_fixed(
+        &self,
+        mut x: GraphTensor,
+        k_buf: GraphTensor,
+        v_buf: GraphTensor,
+        attn_mask: GraphTensor,
+        config: &TalkerConfig,
+        pos_tensor: GraphTensor,
+    ) -> (GraphTensor, GraphTensor, GraphTensor) {
+        let residual = x;
+        let x_attn = self.input_norm.forward(x);
+
+        let mut q = x_attn.matmul(self.q_proj.t());
+        let mut k_new = x_attn.matmul(self.k_proj.t());
+        let mut v_new = x_attn.matmul(self.v_proj.t());
+
+        q = q.split_dims(2, config.head_dim).transpose(1, 2);
+        k_new = k_new.split_dims(2, config.head_dim).transpose(1, 2);
+        v_new = v_new.split_dims(2, config.head_dim).transpose(1, 2);
+
+        q = self.q_norm.forward(q);
+        k_new = self.k_norm.forward(k_new);
+
+        q = apply_rope_with_pos(q, config, pos_tensor);
+        k_new = apply_rope_with_pos(k_new, config, pos_tensor);
+
+        let k_full = k_buf.concat_along(k_new, 2);
+        let v_full = v_buf.concat_along(v_new, 2);
+
+        let k_exp = repeat_kv_heads(k_full, config.kv_groups);
+        let v_exp = repeat_kv_heads(v_full, config.kv_groups);
+
+        let scores = q.matmul(k_exp.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+        let (_, heads, _, _) = scores.dims4();
+        let expanded_mask = attn_mask.squeeze(1).expand_dim(1, heads);
+        let probs = (scores + expanded_mask).softmax(3);
+
+        let context = probs.matmul(v_exp).transpose(1, 2).merge_dims(2, 3);
+        x = residual + context.matmul(self.o_proj.t());
+
+        let ff_in = self.post_attn_norm.forward(x);
+        let ff = (ff_in.matmul(self.gate_proj.t()).silu() * ff_in.matmul(self.up_proj.t()))
+            .matmul(self.down_proj.t());
+        x += ff;
+
+        (x, k_new, v_new)
     }
 
     pub fn forward(&self, mut x: GraphTensor, config: &TalkerConfig) -> GraphTensor {

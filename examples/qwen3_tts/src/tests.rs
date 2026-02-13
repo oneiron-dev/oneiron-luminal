@@ -1389,6 +1389,110 @@ fn test_native_runtime_symbolic_dim_reexecution_executes() {
 }
 
 #[test]
+fn test_decode_fixed_matches_decode_cached() {
+    let config = TalkerConfig {
+        layers: 1,
+        hidden: 64,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 32,
+        kv_groups: 2,
+        intermediate: 128,
+        vocab_size: 96,
+        text_vocab_size: 128,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+    };
+    let prompt_len = 4;
+    let num_frames = 3;
+    let max_seq = prompt_len + num_frames;
+
+    let mut cx = Graph::new();
+    let talker = TalkerModel::new(&mut cx, config.clone());
+    let prompt = cx.tensor((1, prompt_len, config.hidden));
+    let new_embed = cx.tensor((1, 1, config.hidden));
+    let pos = cx.tensor(1);
+    let fixed_k_buf = cx.tensor((1, config.n_kv_heads, max_seq, config.head_dim));
+    let fixed_v_buf = cx.tensor((1, config.n_kv_heads, max_seq, config.head_dim));
+    let fixed_mask = cx.tensor((1, 1, 1, max_seq + 1));
+
+    let (_prefill_logits, _prefill_normed, kv_caches) = talker.prefill(prompt);
+    let (prefill_k, prefill_v) = kv_caches[0];
+    let prefill_k_out = prefill_k.output();
+    let prefill_v_out = prefill_v.output();
+
+    let (cached_logits, _cached_normed, _cached_kv) =
+        talker.decode_cached(new_embed, &kv_caches, pos);
+    let cached_logits_out = cached_logits.output();
+
+    let fixed_kvs = vec![(fixed_k_buf, fixed_v_buf)];
+    let (fixed_logits, _fixed_normed, _fixed_new_kv) =
+        talker.decode_fixed(new_embed, &fixed_kvs, fixed_mask, pos);
+    let fixed_logits_out = fixed_logits.output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    let mut rng = StdRng::seed_from_u64(8192);
+    let prompt_data = random_vec(&mut rng, prompt_len * config.hidden);
+    let new_embed_data = random_vec(&mut rng, config.hidden);
+    set_random_talker_params(&mut rt, &talker, &config, &mut rng);
+
+    let kv_buf_size = config.n_kv_heads * max_seq * config.head_dim;
+    let mut fixed_k_data = vec![0.0f32; kv_buf_size];
+    let mut fixed_v_data = vec![0.0f32; kv_buf_size];
+    let mut mask_data = vec![-1e9f32; max_seq + 1];
+    for v in mask_data.iter_mut().take(prompt_len) {
+        *v = 0.0;
+    }
+    // Last index corresponds to concat'd K/V for the current token.
+    mask_data[max_seq] = 0.0;
+
+    rt.set_data(prompt.id, prompt_data.clone());
+    rt.set_data(new_embed.id, new_embed_data.clone());
+    rt.set_data(pos.id, vec![prompt_len as f32]);
+    rt.set_data(fixed_k_buf.id, fixed_k_data.clone());
+    rt.set_data(fixed_v_buf.id, fixed_v_data.clone());
+    rt.set_data(fixed_mask.id, mask_data.clone());
+    rt.execute(&cx.dyn_map);
+
+    let prefill_k_data = rt.get_f32(prefill_k_out.id).clone();
+    let prefill_v_data = rt.get_f32(prefill_v_out.id).clone();
+    assert_eq!(
+        prefill_k_data.len(),
+        config.n_kv_heads * prompt_len * config.head_dim
+    );
+    assert_eq!(
+        prefill_v_data.len(),
+        config.n_kv_heads * prompt_len * config.head_dim
+    );
+
+    for head in 0..config.n_kv_heads {
+        let src_offset = head * prompt_len * config.head_dim;
+        let src_end = src_offset + prompt_len * config.head_dim;
+        let dst_offset = head * max_seq * config.head_dim;
+        let dst_end = dst_offset + prompt_len * config.head_dim;
+        fixed_k_data[dst_offset..dst_end].copy_from_slice(&prefill_k_data[src_offset..src_end]);
+        fixed_v_data[dst_offset..dst_end].copy_from_slice(&prefill_v_data[src_offset..src_end]);
+    }
+
+    rt.set_data(prompt.id, prompt_data);
+    rt.set_data(new_embed.id, new_embed_data);
+    rt.set_data(pos.id, vec![prompt_len as f32]);
+    rt.set_data(fixed_k_buf.id, fixed_k_data);
+    rt.set_data(fixed_v_buf.id, fixed_v_data);
+    rt.set_data(fixed_mask.id, mask_data);
+    rt.execute(&cx.dyn_map);
+
+    let cached_logits_data = rt.get_f32(cached_logits_out.id).clone();
+    let fixed_logits_data = rt.get_f32(fixed_logits_out.id).clone();
+
+    assert_eq!(cached_logits_data.len(), config.vocab_size);
+    assert_eq!(fixed_logits_data.len(), config.vocab_size);
+    assert_close(&fixed_logits_data, &cached_logits_data, TEST_EPS);
+}
+
+#[test]
 fn test_sample_greedy() {
     let logits = vec![
         0.1, 0.5, 0.3, 0.2, // max at index 1
