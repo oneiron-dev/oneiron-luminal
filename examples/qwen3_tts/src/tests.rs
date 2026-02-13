@@ -1330,6 +1330,65 @@ fn test_decode_cached_single_step() {
 }
 
 #[test]
+fn test_native_runtime_symbolic_concat_executes() {
+    // Regression test for NativeRuntime symbolic indexing:
+    // this graph used to panic in Gather due to incorrect symbolic Iota evaluation.
+    let mut cx = Graph::new();
+    let k_cache = cx.tensor((1, 1, 'p', 4));
+    let k_new = cx.tensor((1, 1, 1, 4));
+    let k_full = k_cache.concat_along(k_new, 2).output();
+
+    cx.set_dim('p', 4);
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    let cache: Vec<f32> = (0..16).map(|i| i as f32).collect();
+    let appended = vec![100.0f32, 101.0, 102.0, 103.0];
+    rt.set_data(k_cache.id, cache.clone());
+    rt.set_data(k_new.id, appended.clone());
+    rt.execute(&cx.dyn_map);
+
+    let mut expected = cache;
+    expected.extend_from_slice(&appended);
+    assert_eq!(rt.get_f32(k_full.id), &expected);
+}
+
+#[test]
+fn test_native_runtime_symbolic_dim_reexecution_executes() {
+    // Regression test for symbolic dim re-execution:
+    // execute once with p=4, then re-execute with p=5 on the same compiled runtime.
+    let mut cx = Graph::new();
+    let k_cache = cx.tensor((1, 1, 'p', 4));
+    let k_new = cx.tensor((1, 1, 1, 4));
+    let k_full = k_cache.concat_along(k_new, 2).output();
+
+    cx.set_dim('p', 4);
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    let cache_first: Vec<f32> = (0..16).map(|i| i as f32).collect();
+    let appended_first = vec![100.0f32, 101.0, 102.0, 103.0];
+    rt.set_data(k_cache.id, cache_first.clone());
+    rt.set_data(k_new.id, appended_first.clone());
+    rt.execute(&cx.dyn_map);
+
+    let mut expected_first = cache_first;
+    expected_first.extend_from_slice(&appended_first);
+    assert_eq!(rt.get_f32(k_full.id), &expected_first);
+
+    cx.set_dim('p', 5);
+    let cache_second: Vec<f32> = (0..20).map(|i| 1000.0 + i as f32).collect();
+    let appended_second = vec![2000.0f32, 2001.0, 2002.0, 2003.0];
+    rt.set_data(k_cache.id, cache_second.clone());
+    rt.set_data(k_new.id, appended_second.clone());
+    rt.execute(&cx.dyn_map);
+
+    let mut expected_second = cache_second;
+    expected_second.extend_from_slice(&appended_second);
+    assert_eq!(rt.get_f32(k_full.id), &expected_second);
+}
+
+#[test]
 fn test_sample_greedy() {
     let logits = vec![
         0.1, 0.5, 0.3, 0.2, // max at index 1

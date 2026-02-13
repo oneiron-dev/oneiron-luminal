@@ -504,6 +504,45 @@ impl Expression {
         }
         stack.pop().unwrap() as usize
     }
+    /// Evaluate the expression by binding one iterator variable (typically `z`)
+    /// while resolving all other variables from `variables`.
+    pub fn exec_with_iter(
+        &self,
+        iter_var: char,
+        iter_value: usize,
+        variables: &FxHashMap<char, usize>,
+    ) -> Option<usize> {
+        self.exec_with_iter_stack(iter_var, iter_value, variables, &mut Vec::new())
+    }
+    /// Evaluate the expression with an iterator variable and a provided stack.
+    pub fn exec_with_iter_stack(
+        &self,
+        iter_var: char,
+        iter_value: usize,
+        variables: &FxHashMap<char, usize>,
+        stack: &mut Vec<i64>,
+    ) -> Option<usize> {
+        stack.clear();
+        for term in self.terms.read().iter() {
+            match term {
+                Term::Num(n) => stack.push(*n as i64),
+                Term::Var(c) if *c == iter_var => stack.push(iter_value as i64),
+                Term::Var(c) => {
+                    if let Some(n) = variables.get(c) {
+                        stack.push(*n as i64)
+                    } else {
+                        return None;
+                    }
+                }
+                _ => {
+                    let a = stack.pop().unwrap();
+                    let b = stack.pop().unwrap();
+                    stack.push(term.as_op().unwrap()(a, b).unwrap());
+                }
+            }
+        }
+        stack.pop().map(|i| i as usize)
+    }
     /// Evaluate the expression given variables.
     pub fn exec(&self, variables: &FxHashMap<char, usize>) -> Option<usize> {
         self.exec_stack(variables, &mut Vec::new())

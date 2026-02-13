@@ -305,9 +305,14 @@ impl EgglogOp for Iota {
 impl NativeOp for Iota {
     fn execute(&self, _: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
         let length = self.1.exec(dyn_map).unwrap();
+        let mut stack = Vec::new();
         NativeData::Int(
             (0..length)
-                .map(|i| self.0.exec_single_var(i) as i32)
+                .map(|i| {
+                    self.0
+                        .exec_with_iter_stack('z', i, dyn_map, &mut stack)
+                        .unwrap() as i32
+                })
                 .collect(),
         )
     }
