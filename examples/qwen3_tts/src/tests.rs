@@ -1209,6 +1209,127 @@ fn test_decode_step() {
 }
 
 #[test]
+fn test_prefill_kv_matches_full_forward() {
+    let config = TalkerConfig {
+        layers: 1,
+        hidden: 64,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 32,
+        kv_groups: 2,
+        intermediate: 128,
+        vocab_size: 96,
+        text_vocab_size: 128,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+    };
+    let prompt_len = 4;
+
+    let mut cx = Graph::new();
+    let talker = TalkerModel::new(&mut cx, config.clone());
+    let embeds = cx.tensor((1, prompt_len, config.hidden));
+
+    let (prefill_logits, _prefill_normed, prefill_kv) = talker.prefill(embeds);
+    let (prefill_k, prefill_v) = prefill_kv[0];
+    let prefill_logits_out = prefill_logits.output();
+    let prefill_k_out = prefill_k.output();
+    let prefill_v_out = prefill_v.output();
+
+    let (manual_hidden, manual_k, manual_v) = talker.layers[0].forward_with_kv(embeds, &config);
+    let manual_logits = talker
+        .final_norm
+        .forward(manual_hidden)
+        .matmul(talker.codec_head.t())
+        .output();
+    let manual_k_out = manual_k.output();
+    let manual_v_out = manual_v.output();
+
+    let (decode_logits, _decode_normed) = talker.decode_step(embeds);
+    let decode_logits_out = decode_logits.output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    let mut rng = StdRng::seed_from_u64(2048);
+    rt.set_data(embeds.id, random_vec(&mut rng, prompt_len * config.hidden));
+    set_random_talker_params(&mut rt, &talker, &config, &mut rng);
+    rt.execute(&cx.dyn_map);
+
+    let prefill_logits_data = rt.get_f32(prefill_logits_out.id).clone();
+    let decode_logits_data = rt.get_f32(decode_logits_out.id).clone();
+    let manual_logits_data = rt.get_f32(manual_logits.id).clone();
+    let prefill_k_data = rt.get_f32(prefill_k_out.id).clone();
+    let prefill_v_data = rt.get_f32(prefill_v_out.id).clone();
+    let manual_k_data = rt.get_f32(manual_k_out.id).clone();
+    let manual_v_data = rt.get_f32(manual_v_out.id).clone();
+
+    assert_eq!(prefill_logits_data.len(), prompt_len * config.vocab_size);
+    assert_eq!(
+        prefill_k_data.len(),
+        config.n_kv_heads * prompt_len * config.head_dim
+    );
+    assert_eq!(
+        prefill_v_data.len(),
+        config.n_kv_heads * prompt_len * config.head_dim
+    );
+
+    assert_close(&prefill_logits_data, &decode_logits_data, TEST_EPS);
+    assert_close(&prefill_logits_data, &manual_logits_data, TEST_EPS);
+    assert_close(&prefill_k_data, &manual_k_data, TEST_EPS);
+    assert_close(&prefill_v_data, &manual_v_data, TEST_EPS);
+}
+
+#[test]
+fn test_decode_cached_single_step() {
+    let config = TalkerConfig {
+        layers: 1,
+        hidden: 64,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 32,
+        kv_groups: 2,
+        intermediate: 128,
+        vocab_size: 96,
+        text_vocab_size: 128,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+    };
+    let prompt_len = 4;
+
+    let mut cx = Graph::new();
+    let talker = TalkerModel::new(&mut cx, config.clone());
+    let prompt = cx.tensor((1, prompt_len, config.hidden));
+    let new_embed = cx.tensor((1, 1, config.hidden));
+    let pos = cx.tensor(1);
+
+    let full_input = prompt.concat_along(new_embed, 1);
+    let (full_logits, _full_normed) = talker.decode_step(full_input);
+    let full_last_logits = full_logits.slice((.., prompt_len.., ..)).output();
+
+    let (_prefill_logits, _prefill_normed, kv_caches) = talker.prefill(prompt);
+    let (cached_logits, _cached_normed, _updated_kv) =
+        talker.decode_cached(new_embed, &kv_caches, pos);
+    let cached_logits_out = cached_logits.output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let mut rt = cx.search(NativeRuntime::default(), 1);
+
+    let mut rng = StdRng::seed_from_u64(4096);
+    rt.set_data(prompt.id, random_vec(&mut rng, prompt_len * config.hidden));
+    rt.set_data(new_embed.id, random_vec(&mut rng, config.hidden));
+    rt.set_data(pos.id, vec![prompt_len as f32]);
+    set_random_talker_params(&mut rt, &talker, &config, &mut rng);
+    rt.execute(&cx.dyn_map);
+
+    let full_last_logits_data = rt.get_f32(full_last_logits.id).clone();
+    let cached_logits_data = rt.get_f32(cached_logits_out.id).clone();
+
+    assert_eq!(full_last_logits_data.len(), config.vocab_size);
+    assert_eq!(cached_logits_data.len(), config.vocab_size);
+    assert_close(&cached_logits_data, &full_last_logits_data, TEST_EPS);
+}
+
+#[test]
 fn test_sample_greedy() {
     let logits = vec![
         0.1, 0.5, 0.3, 0.2, // max at index 1

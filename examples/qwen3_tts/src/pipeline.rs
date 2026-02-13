@@ -50,6 +50,7 @@ pub fn generate_frames(
     weights: &HashMap<String, Vec<f32>>,
 ) -> Vec<Vec<u32>> {
     let hidden = talker_config.hidden;
+    let n_layers = talker_config.layers;
     assert_eq!(
         tts_pad_embed.len(),
         hidden,
@@ -60,71 +61,180 @@ pub fn generate_frames(
         prompt_len * hidden,
         "initial_embeds length must equal prompt_len * hidden"
     );
+    if num_frames == 0 {
+        return Vec::new();
+    }
 
-    let mut embeddings = initial_embeds.to_vec();
     let mut all_frames = Vec::with_capacity(num_frames);
 
-    for frame in 0..num_frames {
-        let seq_len = prompt_len + frame;
+    // ===== PREFILL PHASE =====
+    let mut prefill_cx = Graph::new();
+    let prefill_pipeline = TtsPipeline::new(
+        &mut prefill_cx,
+        talker_config.clone(),
+        predictor_config.clone(),
+    );
+    let prompt_input = prefill_cx.tensor((1, prompt_len, hidden));
 
-        let mut cx = Graph::new();
-        let pipeline = TtsPipeline::new(&mut cx, talker_config.clone(), predictor_config.clone());
-        let prompt = cx.tensor((1, seq_len, hidden));
+    let (prefill_logits, prefill_normed, kv_caches) = prefill_pipeline.talker.prefill(prompt_input);
+    let prefill_last_logits = prefill_logits.slice((.., (prompt_len - 1).., ..));
+    let prefill_code_0 = prefill_last_logits.argmax(2);
+    let prefill_code_0_embed = prefill_pipeline.talker.embed_codec(prefill_code_0);
+    let prefill_last_hidden = prefill_normed.slice((.., (prompt_len - 1).., ..));
+    let prefill_pred_out = prefill_pipeline
+        .code_predictor
+        .generate_codes(prefill_last_hidden, prefill_code_0_embed);
 
-        let (logits, normed) = pipeline.talker.decode_step(prompt);
-        let last_logits = logits.slice((.., (seq_len - 1).., ..));
-        let code_0 = last_logits.argmax(2);
-        let code_0_embed = pipeline.talker.embed_codec(code_0);
-        let last_hidden = normed.slice((.., (seq_len - 1).., ..));
-        let pred_out = pipeline
+    let mut prefill_codec_sum = prefill_code_0_embed;
+    for embed in &prefill_pred_out.embeds {
+        prefill_codec_sum += *embed;
+    }
+
+    let prefill_code_0_out = prefill_code_0.cast(DType::F32).output();
+    let prefill_code_outs: Vec<_> = prefill_pred_out
+        .codes
+        .iter()
+        .map(|code| code.cast(DType::F32).output())
+        .collect();
+    let prefill_codec_sum_out = prefill_codec_sum.output();
+    let kv_cache_outs: Vec<_> = kv_caches
+        .iter()
+        .map(|(k, v)| (k.output(), v.output()))
+        .collect();
+
+    prefill_cx.build_search_space::<NativeRuntime>();
+    let mut prefill_rt = prefill_cx.search(NativeRuntime::default(), 1);
+    load_weights_from_map(&mut prefill_rt, &prefill_cx, weights);
+    prefill_rt.set_data(prompt_input.id, initial_embeds.to_vec());
+    prefill_rt.execute(&prefill_cx.dyn_map);
+
+    let code_0_val = prefill_rt.get_f32(prefill_code_0_out.id)[0] as u32;
+    if code_0_val == CODEC_EOS_ID as u32 {
+        return all_frames;
+    }
+
+    let pred_codes: Vec<u32> = prefill_code_outs
+        .iter()
+        .map(|code| prefill_rt.get_f32(code.id)[0] as u32)
+        .collect();
+    let mut frame_codes = vec![code_0_val];
+    frame_codes.extend(pred_codes);
+    all_frames.push(frame_codes);
+
+    if num_frames <= 1 {
+        return all_frames;
+    }
+
+    let prefill_codec_sum_data = prefill_rt.get_f32(prefill_codec_sum_out.id);
+    assert_eq!(
+        prefill_codec_sum_data.len(),
+        hidden,
+        "codec_sum output length must equal hidden"
+    );
+    let mut next_embed: Vec<f32> = prefill_codec_sum_data
+        .iter()
+        .zip(tts_pad_embed.iter())
+        .map(|(codec, tts)| codec + tts)
+        .collect();
+
+    let mut cached_k: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
+    let mut cached_v: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
+    for (k_out, v_out) in &kv_cache_outs {
+        cached_k.push(prefill_rt.get_f32(k_out.id).to_vec());
+        cached_v.push(prefill_rt.get_f32(v_out.id).to_vec());
+    }
+
+    // ===== DECODE PHASE =====
+    // NativeRuntime dynamic re-execution with symbolic cache dims can be unstable for this graph,
+    // so decode uses concrete per-step cache shapes while keeping KV-cache math.
+    for frame in 1..num_frames {
+        let p = prompt_len + frame - 1;
+        let mut decode_cx = Graph::new();
+        let decode_pipeline = TtsPipeline::new(
+            &mut decode_cx,
+            talker_config.clone(),
+            predictor_config.clone(),
+        );
+        let new_embed_input = decode_cx.tensor((1, 1, hidden));
+        let pos_input = decode_cx.tensor(1);
+        let kv_inputs: Vec<(GraphTensor, GraphTensor)> = (0..n_layers)
+            .map(|_| {
+                (
+                    decode_cx.tensor((1, talker_config.n_kv_heads, p, talker_config.head_dim)),
+                    decode_cx.tensor((1, talker_config.n_kv_heads, p, talker_config.head_dim)),
+                )
+            })
+            .collect();
+
+        let (decode_logits, decode_normed, decode_kv_outs) =
+            decode_pipeline
+                .talker
+                .decode_cached(new_embed_input, &kv_inputs, pos_input);
+
+        let decode_code_0 = decode_logits.argmax(2);
+        let decode_code_0_embed = decode_pipeline.talker.embed_codec(decode_code_0);
+        let decode_pred_out = decode_pipeline
             .code_predictor
-            .generate_codes(last_hidden, code_0_embed);
+            .generate_codes(decode_normed, decode_code_0_embed);
 
-        let mut codec_sum = code_0_embed;
-        for embed in &pred_out.embeds {
-            codec_sum = codec_sum + *embed;
+        let mut decode_codec_sum = decode_code_0_embed;
+        for embed in &decode_pred_out.embeds {
+            decode_codec_sum += *embed;
         }
 
-        let code_0_out = code_0.cast(DType::F32).output();
-        let code_outs: Vec<_> = pred_out
+        let decode_code_0_out = decode_code_0.cast(DType::F32).output();
+        let decode_code_outs: Vec<_> = decode_pred_out
             .codes
             .iter()
             .map(|code| code.cast(DType::F32).output())
             .collect();
-        let codec_sum_out = codec_sum.output();
+        let decode_codec_sum_out = decode_codec_sum.output();
+        let decode_kv_cache_outs: Vec<_> = decode_kv_outs
+            .iter()
+            .map(|(k, v)| (k.output(), v.output()))
+            .collect();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
-        load_weights_from_map(&mut rt, &cx, weights);
-        rt.set_data(prompt.id, embeddings.clone());
-        rt.execute(&cx.dyn_map);
+        decode_cx.build_search_space::<NativeRuntime>();
+        let mut decode_rt = decode_cx.search(NativeRuntime::default(), 1);
+        load_weights_from_map(&mut decode_rt, &decode_cx, weights);
+        decode_rt.set_data(new_embed_input.id, next_embed.clone());
+        decode_rt.set_data(pos_input.id, vec![p as f32]);
+        for (i, (k_in, v_in)) in kv_inputs.iter().enumerate() {
+            decode_rt.set_data(k_in.id, cached_k[i].clone());
+            decode_rt.set_data(v_in.id, cached_v[i].clone());
+        }
 
-        let code_0_val = rt.get_f32(code_0_out.id)[0] as u32;
+        decode_rt.execute(&decode_cx.dyn_map);
+
+        let code_0_val = decode_rt.get_f32(decode_code_0_out.id)[0] as u32;
         if code_0_val == CODEC_EOS_ID as u32 {
             break;
         }
 
-        let pred_codes: Vec<u32> = code_outs
+        let pred_codes: Vec<u32> = decode_code_outs
             .iter()
-            .map(|code| rt.get_f32(code.id)[0] as u32)
+            .map(|code| decode_rt.get_f32(code.id)[0] as u32)
             .collect();
-
         let mut frame_codes = vec![code_0_val];
         frame_codes.extend(pred_codes);
         all_frames.push(frame_codes);
 
-        let codec_sum_data = rt.get_f32(codec_sum_out.id);
+        for (i, (k_out, v_out)) in decode_kv_cache_outs.iter().enumerate() {
+            cached_k[i] = decode_rt.get_f32(k_out.id).to_vec();
+            cached_v[i] = decode_rt.get_f32(v_out.id).to_vec();
+        }
+
+        let codec_sum_data = decode_rt.get_f32(decode_codec_sum_out.id);
         assert_eq!(
             codec_sum_data.len(),
             hidden,
             "codec_sum output length must equal hidden"
         );
-        let combined: Vec<f32> = codec_sum_data
+        next_embed = codec_sum_data
             .iter()
             .zip(tts_pad_embed.iter())
             .map(|(codec, tts)| codec + tts)
             .collect();
-        embeddings.extend_from_slice(&combined);
     }
 
     all_frames
