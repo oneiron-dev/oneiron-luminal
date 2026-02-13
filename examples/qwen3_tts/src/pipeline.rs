@@ -51,6 +51,8 @@ pub fn generate_frames(
 ) -> Vec<Vec<u32>> {
     let hidden = talker_config.hidden;
     let n_layers = talker_config.layers;
+    let n_kv_heads = talker_config.n_kv_heads;
+    let head_dim = talker_config.head_dim;
     assert_eq!(
         tts_pad_embed.len(),
         hidden,
@@ -137,71 +139,105 @@ pub fn generate_frames(
         .map(|(codec, tts)| codec + tts)
         .collect();
 
-    let mut cached_k: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
-    let mut cached_v: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
+    let mut prefill_k: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
+    let mut prefill_v: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
     for (k_out, v_out) in &kv_cache_outs {
-        cached_k.push(prefill_rt.get_f32(k_out.id).to_vec());
-        cached_v.push(prefill_rt.get_f32(v_out.id).to_vec());
+        prefill_k.push(prefill_rt.get_f32(k_out.id).to_vec());
+        prefill_v.push(prefill_rt.get_f32(v_out.id).to_vec());
     }
 
     // ===== DECODE PHASE =====
-    // NativeRuntime dynamic re-execution with symbolic cache dims can be unstable for this graph,
-    // so decode uses concrete per-step cache shapes while keeping KV-cache math.
+    let max_seq = prompt_len + num_frames;
+    let kv_buf_size = n_kv_heads * max_seq * head_dim;
+    let prompt_kv_size = n_kv_heads * prompt_len * head_dim;
+    let mut k_bufs: Vec<Vec<f32>> = vec![vec![0.0; kv_buf_size]; n_layers];
+    let mut v_bufs: Vec<Vec<f32>> = vec![vec![0.0; kv_buf_size]; n_layers];
+    for (layer_idx, (k_src, v_src)) in prefill_k.iter().zip(prefill_v.iter()).enumerate() {
+        assert_eq!(
+            k_src.len(),
+            prompt_kv_size,
+            "prefill K cache size must equal n_kv_heads * prompt_len * head_dim"
+        );
+        assert_eq!(
+            v_src.len(),
+            prompt_kv_size,
+            "prefill V cache size must equal n_kv_heads * prompt_len * head_dim"
+        );
+        for head in 0..n_kv_heads {
+            let src_offset = head * prompt_len * head_dim;
+            let dst_offset = head * max_seq * head_dim;
+            let src_end = src_offset + prompt_len * head_dim;
+            let dst_end = dst_offset + prompt_len * head_dim;
+            k_bufs[layer_idx][dst_offset..dst_end].copy_from_slice(&k_src[src_offset..src_end]);
+            v_bufs[layer_idx][dst_offset..dst_end].copy_from_slice(&v_src[src_offset..src_end]);
+        }
+    }
+
+    let mut attn_mask = vec![-1e9f32; max_seq + 1];
+    for v in attn_mask.iter_mut().take(prompt_len) {
+        *v = 0.0;
+    }
+    // Last position is always the concat slot for the current token's K/V.
+    attn_mask[max_seq] = 0.0;
+
+    let mut decode_cx = Graph::new();
+    let decode_pipeline = TtsPipeline::new(
+        &mut decode_cx,
+        talker_config.clone(),
+        predictor_config.clone(),
+    );
+    let new_embed_input = decode_cx.tensor((1, 1, hidden));
+    let pos_input = decode_cx.tensor(1);
+    let mask_input = decode_cx.tensor((1, 1, 1, max_seq + 1));
+    let kv_inputs: Vec<(GraphTensor, GraphTensor)> = (0..n_layers)
+        .map(|_| {
+            (
+                decode_cx.tensor((1, n_kv_heads, max_seq, head_dim)),
+                decode_cx.tensor((1, n_kv_heads, max_seq, head_dim)),
+            )
+        })
+        .collect();
+
+    let (decode_logits, decode_normed, decode_new_kv_outs) =
+        decode_pipeline
+            .talker
+            .decode_fixed(new_embed_input, &kv_inputs, mask_input, pos_input);
+
+    let decode_code_0 = decode_logits.argmax(2);
+    let decode_code_0_embed = decode_pipeline.talker.embed_codec(decode_code_0);
+    let decode_pred_out = decode_pipeline
+        .code_predictor
+        .generate_codes(decode_normed, decode_code_0_embed);
+
+    let mut decode_codec_sum = decode_code_0_embed;
+    for embed in &decode_pred_out.embeds {
+        decode_codec_sum += *embed;
+    }
+
+    let decode_code_0_out = decode_code_0.cast(DType::F32).output();
+    let decode_code_outs: Vec<_> = decode_pred_out
+        .codes
+        .iter()
+        .map(|code| code.cast(DType::F32).output())
+        .collect();
+    let decode_codec_sum_out = decode_codec_sum.output();
+    let decode_new_kv_cache_outs: Vec<_> = decode_new_kv_outs
+        .iter()
+        .map(|(k, v)| (k.output(), v.output()))
+        .collect();
+
+    decode_cx.build_search_space::<NativeRuntime>();
+    let mut decode_rt = decode_cx.search(NativeRuntime::default(), 1);
+    load_weights_from_map(&mut decode_rt, &decode_cx, weights);
+
     for frame in 1..num_frames {
         let p = prompt_len + frame - 1;
-        let mut decode_cx = Graph::new();
-        let decode_pipeline = TtsPipeline::new(
-            &mut decode_cx,
-            talker_config.clone(),
-            predictor_config.clone(),
-        );
-        let new_embed_input = decode_cx.tensor((1, 1, hidden));
-        let pos_input = decode_cx.tensor(1);
-        let kv_inputs: Vec<(GraphTensor, GraphTensor)> = (0..n_layers)
-            .map(|_| {
-                (
-                    decode_cx.tensor((1, talker_config.n_kv_heads, p, talker_config.head_dim)),
-                    decode_cx.tensor((1, talker_config.n_kv_heads, p, talker_config.head_dim)),
-                )
-            })
-            .collect();
-
-        let (decode_logits, decode_normed, decode_kv_outs) =
-            decode_pipeline
-                .talker
-                .decode_cached(new_embed_input, &kv_inputs, pos_input);
-
-        let decode_code_0 = decode_logits.argmax(2);
-        let decode_code_0_embed = decode_pipeline.talker.embed_codec(decode_code_0);
-        let decode_pred_out = decode_pipeline
-            .code_predictor
-            .generate_codes(decode_normed, decode_code_0_embed);
-
-        let mut decode_codec_sum = decode_code_0_embed;
-        for embed in &decode_pred_out.embeds {
-            decode_codec_sum += *embed;
-        }
-
-        let decode_code_0_out = decode_code_0.cast(DType::F32).output();
-        let decode_code_outs: Vec<_> = decode_pred_out
-            .codes
-            .iter()
-            .map(|code| code.cast(DType::F32).output())
-            .collect();
-        let decode_codec_sum_out = decode_codec_sum.output();
-        let decode_kv_cache_outs: Vec<_> = decode_kv_outs
-            .iter()
-            .map(|(k, v)| (k.output(), v.output()))
-            .collect();
-
-        decode_cx.build_search_space::<NativeRuntime>();
-        let mut decode_rt = decode_cx.search(NativeRuntime::default(), 1);
-        load_weights_from_map(&mut decode_rt, &decode_cx, weights);
         decode_rt.set_data(new_embed_input.id, next_embed.clone());
         decode_rt.set_data(pos_input.id, vec![p as f32]);
+        decode_rt.set_data(mask_input.id, attn_mask.clone());
         for (i, (k_in, v_in)) in kv_inputs.iter().enumerate() {
-            decode_rt.set_data(k_in.id, cached_k[i].clone());
-            decode_rt.set_data(v_in.id, cached_v[i].clone());
+            decode_rt.set_data(k_in.id, k_bufs[i].clone());
+            decode_rt.set_data(v_in.id, v_bufs[i].clone());
         }
 
         decode_rt.execute(&decode_cx.dyn_map);
@@ -219,10 +255,29 @@ pub fn generate_frames(
         frame_codes.extend(pred_codes);
         all_frames.push(frame_codes);
 
-        for (i, (k_out, v_out)) in decode_kv_cache_outs.iter().enumerate() {
-            cached_k[i] = decode_rt.get_f32(k_out.id).to_vec();
-            cached_v[i] = decode_rt.get_f32(v_out.id).to_vec();
+        for (i, (k_out, v_out)) in decode_new_kv_cache_outs.iter().enumerate() {
+            let new_k = decode_rt.get_f32(k_out.id);
+            let new_v = decode_rt.get_f32(v_out.id);
+            assert_eq!(
+                new_k.len(),
+                n_kv_heads * head_dim,
+                "new K shape must be n_kv_heads * head_dim"
+            );
+            assert_eq!(
+                new_v.len(),
+                n_kv_heads * head_dim,
+                "new V shape must be n_kv_heads * head_dim"
+            );
+            for head in 0..n_kv_heads {
+                let src_start = head * head_dim;
+                let src_end = src_start + head_dim;
+                let dst_start = head * max_seq * head_dim + p * head_dim;
+                let dst_end = dst_start + head_dim;
+                k_bufs[i][dst_start..dst_end].copy_from_slice(&new_k[src_start..src_end]);
+                v_bufs[i][dst_start..dst_end].copy_from_slice(&new_v[src_start..src_end]);
+            }
         }
+        attn_mask[p] = 0.0;
 
         let codec_sum_data = decode_rt.get_f32(decode_codec_sum_out.id);
         assert_eq!(
