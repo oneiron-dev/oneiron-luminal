@@ -8,6 +8,11 @@ luminal = { path = "../.." }
 luminal_nn = { path = "../../crates/luminal_nn" }
 safetensors = "0.7.0"
 half = "2.7.1"
+hound = "3.5"
+
+[[bin]]
+name = "qwen3_tts_infer"
+path = "src/main.rs"
 
 [dev-dependencies]
 candle-core = "0.9.1"
