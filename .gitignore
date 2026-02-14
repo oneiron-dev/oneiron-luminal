@@ -21,3 +21,7 @@ Cargo.lock
 tokenizer.json
 **/.cache
 **/proptest-regressions
+
+# Model weight directories
+Qwen3-TTS-12Hz-1.7B-VoiceDesign/
+Qwen3-TTS-Tokenizer-12Hz/
