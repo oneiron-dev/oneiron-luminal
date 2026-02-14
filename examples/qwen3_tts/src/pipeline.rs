@@ -70,6 +70,7 @@ pub fn generate_frames(
     let mut all_frames = Vec::with_capacity(num_frames);
 
     // ===== PREFILL PHASE =====
+    let t0 = std::time::Instant::now();
     let mut prefill_cx = Graph::new();
     let prefill_pipeline = TtsPipeline::new(
         &mut prefill_cx,
@@ -104,11 +105,15 @@ pub fn generate_frames(
         .map(|(k, v)| (k.output(), v.output()))
         .collect();
 
+    eprintln!("  [prefill] graph built in {:.1}s", t0.elapsed().as_secs_f32());
     prefill_cx.build_search_space::<NativeRuntime>();
     let mut prefill_rt = prefill_cx.search(NativeRuntime::default(), 1);
+    eprintln!("  [prefill] compiled in {:.1}s", t0.elapsed().as_secs_f32());
     load_weights_from_map(&mut prefill_rt, &prefill_cx, weights);
+    eprintln!("  [prefill] weights loaded in {:.1}s", t0.elapsed().as_secs_f32());
     prefill_rt.set_data(prompt_input.id, initial_embeds.to_vec());
     prefill_rt.execute(&prefill_cx.dyn_map);
+    eprintln!("  [prefill] executed in {:.1}s", t0.elapsed().as_secs_f32());
 
     let code_0_val = prefill_rt.get_f32(prefill_code_0_out.id)[0] as u32;
     if code_0_val == CODEC_EOS_ID as u32 {
@@ -226,9 +231,12 @@ pub fn generate_frames(
         .map(|(k, v)| (k.output(), v.output()))
         .collect();
 
+    eprintln!("  [decode] graph built in {:.1}s", t0.elapsed().as_secs_f32());
     decode_cx.build_search_space::<NativeRuntime>();
     let mut decode_rt = decode_cx.search(NativeRuntime::default(), 1);
+    eprintln!("  [decode] compiled in {:.1}s", t0.elapsed().as_secs_f32());
     load_weights_from_map(&mut decode_rt, &decode_cx, weights);
+    eprintln!("  [decode] weights loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     for frame in 1..num_frames {
         let p = prompt_len + frame - 1;
@@ -241,9 +249,11 @@ pub fn generate_frames(
         }
 
         decode_rt.execute(&decode_cx.dyn_map);
+        eprintln!("  [decode] frame {} done at {:.1}s", frame, t0.elapsed().as_secs_f32());
 
         let code_0_val = decode_rt.get_f32(decode_code_0_out.id)[0] as u32;
         if code_0_val == CODEC_EOS_ID as u32 {
+            eprintln!("  [decode] EOS at frame {}", frame);
             break;
         }
 

@@ -23,20 +23,21 @@ const INSTRUCT_IDS: &[i32] = &[
 ];
 
 fn main() {
-    let main_model_path = Path::new(
-        "/home/ubuntu/projects/luminal-qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/model.safetensors",
-    );
-    let decoder_model_path =
-        Path::new("/home/ubuntu/projects/luminal-qwen/Qwen3-TTS-Tokenizer-12Hz/model.safetensors");
+    let model_dir = std::env::var("QWEN3_TTS_MODEL_DIR")
+        .unwrap_or_else(|_| "./Qwen3-TTS-12Hz-1.7B-VoiceDesign".to_string());
+    let tokenizer_dir = std::env::var("QWEN3_TTS_TOKENIZER_DIR")
+        .unwrap_or_else(|_| "./Qwen3-TTS-Tokenizer-12Hz".to_string());
+    let main_model_path = Path::new(&model_dir).join("model.safetensors");
+    let decoder_model_path = Path::new(&tokenizer_dir).join("model.safetensors");
     let output_path = Path::new("output.wav");
 
     eprintln!("Loading main model weights...");
-    let main_weights = load_safetensors_to_map(main_model_path).expect("Failed to load main model");
+    let main_weights = load_safetensors_to_map(&main_model_path).expect("Failed to load main model");
     eprintln!("  Loaded {} tensors", main_weights.len());
 
     eprintln!("Loading speech decoder weights...");
     let decoder_weights =
-        load_safetensors_to_map(decoder_model_path).expect("Failed to load decoder");
+        load_safetensors_to_map(&decoder_model_path).expect("Failed to load decoder");
     eprintln!("  Loaded {} tensors", decoder_weights.len());
 
     let talker_config = TalkerConfig::default();
