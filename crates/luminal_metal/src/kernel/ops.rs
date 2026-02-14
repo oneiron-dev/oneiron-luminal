@@ -1297,6 +1297,7 @@ impl MetalKernelOp for MetalIota {
 pub struct MetalGather {
     out_shape: Vec<Expression>,
     index_stride: Vec<Expression>,
+    data_shape: Vec<Expression>,
     data_stride: Vec<Expression>,
     out_stride: Vec<Expression>,
 }
@@ -1305,7 +1306,7 @@ impl EgglogOp for MetalGather {
     fn term(&self) -> (String, Vec<OpParam>) {
         (
             "MetalGather".to_string(),
-            vec![EList, Input, EList, Input, EList, EList],
+            vec![EList, Input, EList, Input, EList, EList, EList],
         )
     }
 
@@ -1314,7 +1315,7 @@ impl EgglogOp for MetalGather {
             ((= ?a (Gather ?indexes ?out_shape ?index_strides ?data ?data_shape ?data_strides))
              (= ?dty (dtype ?data)))
             ((let ?out_strides (RowMajor ?out_shape))
-             (let ?me (MetalGather ?out_shape ?indexes ?index_strides ?data ?data_strides ?out_strides))
+             (let ?me (MetalGather ?out_shape ?indexes ?index_strides ?data ?data_shape ?data_strides ?out_strides))
              (union ?a ?me)
              (set (dtype ?me) ?dty))
             :name "metal MetalGather"
@@ -1334,14 +1335,16 @@ impl EgglogOp for MetalGather {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         use luminal::egglog_utils::extract_expr_list;
+        // Children: 0=out_shape, 1=indexes, 2=index_strides, 3=data, 4=data_shape, 5=data_strides, 6=out_strides
         (
             LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
                 out_shape: extract_expr_list(egraph, children[0], list_cache, expr_cache).unwrap(),
                 index_stride: extract_expr_list(egraph, children[2], list_cache, expr_cache)
                     .unwrap(),
-                data_stride: extract_expr_list(egraph, children[4], list_cache, expr_cache)
+                data_shape: extract_expr_list(egraph, children[4], list_cache, expr_cache).unwrap(),
+                data_stride: extract_expr_list(egraph, children[5], list_cache, expr_cache)
                     .unwrap(),
-                out_stride: extract_expr_list(egraph, children[5], list_cache, expr_cache).unwrap(),
+                out_stride: extract_expr_list(egraph, children[6], list_cache, expr_cache).unwrap(),
             })),
             vec![children[1], children[3]],
         )
@@ -1359,7 +1362,7 @@ impl MetalKernelOp for MetalGather {
             "idx",
         );
         let data_idx = lower_expression_for_metal(
-            &flatten_mul_strides(&self.out_shape, &self.data_stride),
+            &flatten_mul_strides(&self.data_shape, &self.data_stride),
             "gathered_index",
         );
 
