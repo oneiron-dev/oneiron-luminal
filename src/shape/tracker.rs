@@ -244,7 +244,7 @@ impl ShapeTracker {
                 if let Term::Var(v) = *t
                     && let Some(val) = dyn_dim_map.get(&v)
                 {
-                    *t = Term::Num(*val as i32);
+                    *t = Term::Num(*val as i64);
                 }
             }
             d.resolve_vars(dyn_dim_map);

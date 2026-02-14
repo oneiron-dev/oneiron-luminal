@@ -130,7 +130,7 @@ impl Default for Expression {
 /// A single term of a symbolic expression such as a variable, number or operation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Term {
-    Num(i32),
+    Num(i64),
     Var(char),
     Add,
     Sub,
@@ -371,7 +371,7 @@ impl Expression {
 
         egglog_simplify(self)
     }
-    pub fn as_num(&self) -> Option<i32> {
+    pub fn as_num(&self) -> Option<i64> {
         if let Term::Num(n) = self.terms.read()[0] {
             if self.terms.read().len() == 1 {
                 return Some(n);
@@ -591,7 +591,7 @@ impl Expression {
             if let Term::Var(v) = *term
                 && let Some(val) = dyn_map.get(&v)
             {
-                *term = Term::Num(*val as i32);
+                *term = Term::Num(*val as i64);
             }
         }
     }
@@ -656,37 +656,49 @@ impl From<&char> for Expression {
 
 impl From<usize> for Expression {
     fn from(value: usize) -> Self {
-        Expression::new(vec![Term::Num(value as i32)])
+        Expression::new(vec![Term::Num(value as i64)])
     }
 }
 
 impl From<&usize> for Expression {
     fn from(value: &usize) -> Self {
-        Expression::new(vec![Term::Num(*value as i32)])
+        Expression::new(vec![Term::Num(*value as i64)])
     }
 }
 
 impl From<i32> for Expression {
     fn from(value: i32) -> Self {
-        Expression::new(vec![Term::Num(value)])
+        Expression::new(vec![Term::Num(value as i64)])
     }
 }
 
 impl From<&i32> for Expression {
     fn from(value: &i32) -> Self {
+        Expression::new(vec![Term::Num(*value as i64)])
+    }
+}
+
+impl From<i64> for Expression {
+    fn from(value: i64) -> Self {
+        Expression::new(vec![Term::Num(value)])
+    }
+}
+
+impl From<&i64> for Expression {
+    fn from(value: &i64) -> Self {
         Expression::new(vec![Term::Num(*value)])
     }
 }
 
 impl From<bool> for Expression {
     fn from(value: bool) -> Self {
-        Expression::new(vec![Term::Num(value as i32)])
+        Expression::new(vec![Term::Num(value as i64)])
     }
 }
 
 impl From<&bool> for Expression {
     fn from(value: &bool) -> Self {
-        Expression::new(vec![Term::Num(*value as i32)])
+        Expression::new(vec![Term::Num(*value as i64)])
     }
 }
 
