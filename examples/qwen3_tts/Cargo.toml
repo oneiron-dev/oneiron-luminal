@@ -6,11 +6,13 @@ edition = "2021"
 [features]
 default = []
 metal = ["luminal_metal"]
+cuda = ["luminal_cuda"]
 
 [dependencies]
 luminal = { path = "../.." }
 luminal_nn = { path = "../../crates/luminal_nn" }
 luminal_metal = { path = "../../crates/luminal_metal", optional = true }
+luminal_cuda = { path = "../../crates/luminal_cuda", optional = true }
 safetensors = "0.7.0"
 half = "2.7.1"
 hound = "3.5"
