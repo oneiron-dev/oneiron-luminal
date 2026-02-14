@@ -729,6 +729,13 @@ impl Runtime for CudaRuntime {
                         && let Some(CudaInput::Buffer(buf)) = self.hlir_buffers.get(hlir_node)
                     {
                         e.insert(buf);
+                    } else {
+                        panic!(
+                            "Missing buffer for extra_buffer_node {:?}. has_llir_to_hlir={}, node_in_llir={}",
+                            extra_node,
+                            self.llir_to_hlir.contains_key(&extra_node),
+                            self.llir_graph.node_weight(extra_node).is_some()
+                        );
                     }
                 }
             }
@@ -747,7 +754,13 @@ impl Runtime for CudaRuntime {
                     &buffer_map,
                     dyn_map,
                 )
-                .unwrap();
+                .unwrap_or_else(|e| {
+                    let op_name = exec_op.internal.stats_name().unwrap_or("unknown");
+                    panic!(
+                        "HostOp failed: {e:#}\n  Op: {op_name}\n  Output: {:?}\n  Inputs: {:?}\n  Buffers: {}",
+                        exec_op.output, exec_op.inputs, buffer_map.len()
+                    );
+                });
             self.cuda_stream.synchronize().unwrap();
         }
         self.last_total_time_us = total_start.elapsed().as_secs_f64() * 1_000_000.0;

@@ -418,6 +418,10 @@ impl TaskQueue {
     pub fn len(&self) -> usize {
         self.num_tasks
     }
+
+    pub fn stride(&self) -> usize {
+        self.task_stride
+    }
 }
 
 struct ManualTrackBuilder {
@@ -1058,6 +1062,79 @@ impl crate::kernel::KernelOp for MegakernelOp {
         all_buffer_ptrs: &FxHashMap<NodeIndex, u64>,
         dyn_map: &FxHashMap<char, usize>,
     ) {
+        // Diagnostic: dump Megakernel buffer info when LUMINAL_NO_CUDA_GRAPH=1
+        if std::env::var("LUMINAL_NO_CUDA_GRAPH").map_or(false, |v| v == "1") {
+            let buffer_count = self.buffer_count();
+            eprintln!(
+                "[MEGA_DIAG] MegakernelOp pre_execute: buffer_count={}, n_tasks={}, n_barriers={:?}, node_to_buffer_index={{{}}}",
+                buffer_count,
+                self.work_queue.len(),
+                self.n_barriers,
+                self.node_to_buffer_index.iter()
+                    .map(|(n, i)| format!("{:?}->{}", n, i))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            // Dump ALL task fields from the raw work_queue data
+            let task_stride = self.work_queue.stride();
+            let data = self.work_queue.as_slice();
+            eprintln!("[MEGA_DIAG]   task_stride={} bytes, total_data={} bytes", task_stride, data.len());
+            for t in 0..self.work_queue.len() {
+                let offset = t * task_stride;
+                if offset + 72 <= data.len() {
+                    let i32_at = |off: usize| -> i32 {
+                        i32::from_ne_bytes(data[offset+off..offset+off+4].try_into().unwrap())
+                    };
+                    let op = i32_at(0);
+                    let range = i32_at(4);
+                    let remaining = i32_at(8);
+                    let in_dep_a_stride = i32_at(12);
+                    let in_dep_a_base = i32_at(16);
+                    let in_dep_b_stride = i32_at(20);
+                    let in_dep_b_base = i32_at(24);
+                    let in_dep_c_stride = i32_at(28);
+                    let in_dep_c_base = i32_at(32);
+                    let out_dep_stride = i32_at(36);
+                    let out_dep_base = i32_at(40);
+                    let src_indices: Vec<i32> = (0..6).map(|i| i32_at(44 + i * 4)).collect();
+                    let out_index = i32_at(68);
+                    eprintln!(
+                        "[MEGA_DIAG]   task[{}]: op={} range={} remaining={} src={:?} out={}",
+                        t, op, range, remaining, src_indices, out_index
+                    );
+                    eprintln!(
+                        "[MEGA_DIAG]     dep_a: stride={} base={}", in_dep_a_stride, in_dep_a_base
+                    );
+                    eprintln!(
+                        "[MEGA_DIAG]     dep_b: stride={} base={}", in_dep_b_stride, in_dep_b_base
+                    );
+                    eprintln!(
+                        "[MEGA_DIAG]     dep_c: stride={} base={}", in_dep_c_stride, in_dep_c_base
+                    );
+                    eprintln!(
+                        "[MEGA_DIAG]     out_dep: stride={} base={}", out_dep_stride, out_dep_base
+                    );
+                    // Dump payload bytes (after the 72-byte base)
+                    let payload_start = offset + 72;
+                    let payload_end = (offset + task_stride).min(data.len());
+                    if payload_start < payload_end {
+                        let payload_bytes = &data[payload_start..payload_end];
+                        let hex: String = payload_bytes.iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<Vec<_>>().join(" ");
+                        // Also interpret payload as i32 values
+                        let payload_ints: Vec<i32> = payload_bytes.chunks_exact(4)
+                            .map(|c| i32::from_ne_bytes(c.try_into().unwrap()))
+                            .collect();
+                        eprintln!(
+                            "[MEGA_DIAG]     payload ({} bytes): hex=[{}] ints={:?}",
+                            payload_bytes.len(), hex, payload_ints
+                        );
+                    }
+                }
+            }
+        }
+
         // Update dyn dims in interpreter constants by getting fresh handles from the module.
         // We do NOT use the `_constants` parameter because CudaSlice.clone() creates copies,
         // not references to the original __constant__ memory.
@@ -1123,6 +1200,17 @@ impl crate::kernel::KernelOp for MegakernelOp {
         for (node, &buffer_idx) in &self.node_to_buffer_index {
             if let Some(&ptr) = all_buffer_ptrs.get(node) {
                 buffer_array[buffer_idx as usize] = ptr;
+            }
+        }
+
+        // Validate no null buffer pointers remain
+        for (node, &buffer_idx) in &self.node_to_buffer_index {
+            if buffer_array[buffer_idx as usize] == 0 {
+                panic!(
+                    "MegakernelOp: null buffer at idx {} for node {:?}. \
+                     all_buffer_ptrs has {} entries, buffer_count={}",
+                    buffer_idx, node, all_buffer_ptrs.len(), buffer_count
+                );
             }
         }
 

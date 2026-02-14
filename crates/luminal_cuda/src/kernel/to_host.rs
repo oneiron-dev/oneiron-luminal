@@ -314,7 +314,12 @@ impl CudaGraphOp {
             let values: Vec<i32> = self
                 .dyn_dims_order
                 .iter()
-                .map(|d| dyn_map.get(d).copied().unwrap_or(0) as i32)
+                .map(|d| {
+                    dyn_map.get(d).copied().unwrap_or_else(|| {
+                        eprintln!("WARNING: dyn dim '{}' missing from dyn_map, defaulting to 0", d);
+                        0
+                    }) as i32
+                })
                 .collect();
             if let Some(buf) = state.dyn_dims_buffer.as_mut() {
                 stream.memcpy_htod(&values, buf)?;
@@ -334,23 +339,44 @@ impl CudaGraphOp {
             }
         }
 
+        // Verify all buffer_nodes that should have buffers actually do.
+        // Nodes with zero output size (e.g., Megakernels) won't have allocated buffers.
+        let missing: Vec<_> = self.buffer_nodes.iter()
+            .filter(|n| !current_buffer_ptrs.contains_key(n))
+            .filter(|n| {
+                // Only flag as missing if this node is expected to have a buffer
+                match self.buffer_sizes.get(n) {
+                    Some(size) => size.exec(&FxHashMap::default()).unwrap_or(1) != 0,
+                    None => true, // External input — should always have a buffer
+                }
+            })
+            .collect();
+        if !missing.is_empty() {
+            panic!(
+                "CudaGraphOp: {} buffer_nodes missing from buffers map: {:?}",
+                missing.len(), missing
+            );
+        }
+
         // Check if we need to update the graph
         let buffer_ptrs_changed = current_buffer_ptrs != state.last_buffer_ptrs;
         let needs_update = dyn_map_changed || buffer_ptrs_changed;
 
-        if needs_update {
-            // Call pre_execute for each kernel
-            for idx in 0..state.kernels.len() {
-                let kernel = &mut state.kernels[idx];
-                kernel.kernel_op.pre_execute(
-                    stream,
-                    &mut kernel.internal_bufs,
-                    &mut kernel.constants,
-                    &current_buffer_ptrs,
-                    dyn_map,
-                );
-            }
+        // Always call pre_execute for each kernel, even when needs_update is false.
+        // Megakernels modify internal state (head counter, barriers, task queue remaining)
+        // during execution, and these must be reset before every re-launch.
+        for idx in 0..state.kernels.len() {
+            let kernel = &mut state.kernels[idx];
+            kernel.kernel_op.pre_execute(
+                stream,
+                &mut kernel.internal_bufs,
+                &mut kernel.constants,
+                &current_buffer_ptrs,
+                dyn_map,
+            );
+        }
 
+        if needs_update {
             // Update kernel params
             let dyn_dims_ptr = state
                 .dyn_dims_buffer
@@ -362,11 +388,34 @@ impl CudaGraphOp {
             let num_kernels = state.kernels.len();
             for idx in 0..num_kernels {
                 let kernel = &state.kernels[idx];
-                let output_ptr = current_buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
+                let has_output = kernel.kernel_op.output_size()
+                    .exec(&FxHashMap::default()).unwrap_or(1) != 0;
+                let output_ptr = current_buffer_ptrs.get(&kernel.node).copied().unwrap_or_else(|| {
+                    if has_output {
+                        panic!(
+                            "CudaGraphOp::execute_internal: missing output buffer for node {:?} (kernel '{}', idx {}). \
+                             buffer_nodes: {}, provided buffers: {}",
+                            kernel.node, kernel.kernel_name, idx,
+                            self.buffer_nodes.len(), buffers.len()
+                        )
+                    }
+                    0
+                });
                 let input_ptrs: Vec<u64> = kernel
                     .inputs
                     .iter()
-                    .map(|inp| current_buffer_ptrs.get(inp).copied().unwrap_or(0))
+                    .enumerate()
+                    .map(|(inp_idx, inp)| {
+                        current_buffer_ptrs.get(inp).copied().unwrap_or_else(|| {
+                            panic!(
+                                "CudaGraphOp::execute_internal: missing input buffer for node {:?} \
+                                 (kernel '{}', idx {}, input_idx {}). \
+                                 buffer_nodes: {}, provided buffers: {}",
+                                inp, kernel.kernel_name, idx, inp_idx,
+                                self.buffer_nodes.len(), buffers.len()
+                            )
+                        })
+                    })
                     .collect();
 
                 let param_values = kernel.kernel_op.build_params(
@@ -415,14 +464,172 @@ impl CudaGraphOp {
             }
 
             state.last_dyn_values = dyn_map.clone();
-            state.last_buffer_ptrs = current_buffer_ptrs;
+            state.last_buffer_ptrs = current_buffer_ptrs.clone();
         }
 
         // Sync before launch
         stream.synchronize()?;
 
-        // Launch the graph
-        state.cuda_graph_exec.as_ref().unwrap().launch(stream)?;
+        // Check if we should bypass the CUDA graph and launch kernels individually
+        // for diagnostics (set LUMINAL_NO_CUDA_GRAPH=1 to enable)
+        let no_cuda_graph = std::env::var("LUMINAL_NO_CUDA_GRAPH").map_or(false, |v| v == "1");
+
+        if no_cuda_graph {
+            // Launch each kernel individually for fault isolation
+            eprintln!("[DIAG] Launching {} kernels individually (LUMINAL_NO_CUDA_GRAPH=1)", state.kernels.len());
+            let dyn_dims_ptr = state
+                .dyn_dims_buffer
+                .as_ref()
+                .map(|buf| buf.device_ptr(stream).0)
+                .unwrap_or(0);
+
+            for idx in 0..state.kernels.len() {
+                let kernel = &state.kernels[idx];
+                let has_output = kernel.kernel_op.output_size()
+                    .exec(&FxHashMap::default()).unwrap_or(1) != 0;
+                let output_ptr = current_buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
+                let input_ptrs: Vec<u64> = kernel
+                    .inputs
+                    .iter()
+                    .map(|inp| current_buffer_ptrs.get(inp).copied().unwrap_or(0))
+                    .collect();
+
+                let param_values = kernel.kernel_op.build_params(
+                    stream,
+                    output_ptr,
+                    &input_ptrs,
+                    &kernel.internal_bufs,
+                    dyn_dims_ptr,
+                );
+
+                let grid_dim = (
+                    kernel.grid.0.exec(dyn_map).unwrap() as u32,
+                    kernel.grid.1.exec(dyn_map).unwrap() as u32,
+                    kernel.grid.2.exec(dyn_map).unwrap() as u32,
+                );
+                let block_dim = (
+                    kernel.block.0.exec(dyn_map).unwrap() as u32,
+                    kernel.block.1.exec(dyn_map).unwrap() as u32,
+                    kernel.block.2.exec(dyn_map).unwrap() as u32,
+                );
+                let shared_mem = kernel.shared_mem.exec(dyn_map).unwrap() as u32;
+
+                eprintln!(
+                    "[DIAG] Kernel {}/{}: '{}' node={:?} grid=({},{},{}) block=({},{},{}) smem={} output=0x{:x} inputs={} has_output={}",
+                    idx + 1, state.kernels.len(), kernel.kernel_name, kernel.node,
+                    grid_dim.0, grid_dim.1, grid_dim.2,
+                    block_dim.0, block_dim.1, block_dim.2,
+                    shared_mem, output_ptr, input_ptrs.len(), has_output
+                );
+
+                // For Megakernels, print param_values (internal_buf ptrs) and buffer array contents
+                if kernel.kernel_name == "Megakernel" {
+                    eprintln!("[DIAG]   params ({} values): {:?}", param_values.len(),
+                        param_values.iter().enumerate()
+                            .map(|(i, v)| format!("[{}]=0x{:x}", i, v))
+                            .collect::<Vec<_>>().join(", "));
+                    // Read buffer_array back from GPU (internal_bufs[6])
+                    if kernel.internal_bufs.len() > 6 {
+                        let buf_array_size = kernel.internal_bufs[6].len() / std::mem::size_of::<u64>();
+                        if buf_array_size > 0 {
+                            let mut host_buf: Vec<u64> = vec![0u64; buf_array_size];
+                            let view = kernel.internal_bufs[6].as_view();
+                            let typed = unsafe { view.transmute::<u64>(buf_array_size).unwrap() };
+                            stream.memcpy_dtoh(&typed, &mut host_buf).unwrap();
+                            stream.synchronize().unwrap();
+                            eprintln!("[DIAG]   buffer_array ({} entries):", buf_array_size);
+                            for (i, ptr) in host_buf.iter().enumerate() {
+                                let status = if *ptr == 0 { " *** NULL ***" } else { "" };
+                                eprintln!("[DIAG]     [{}] = 0x{:x}{}", i, ptr, status);
+                            }
+
+                            // Probe each buffer pointer for accessibility
+                            eprintln!("[DIAG]   Buffer pointer accessibility probe:");
+                            for (i, &ptr) in host_buf.iter().enumerate() {
+                                if ptr == 0 {
+                                    eprintln!("[DIAG]     [{}] = NULL - skipping", i);
+                                    continue;
+                                }
+                                unsafe {
+                                    let mut probe_data = [0u8; 8];
+                                    let res = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                                        probe_data.as_mut_ptr() as *mut std::ffi::c_void,
+                                        ptr,
+                                        8,
+                                    );
+                                    if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                                        eprintln!("[DIAG]     [{}] = 0x{:x} *** INACCESSIBLE: {:?} ***", i, ptr, res);
+                                    } else {
+                                        let first_f32 = f32::from_ne_bytes(probe_data[..4].try_into().unwrap());
+                                        eprintln!("[DIAG]     [{}] = 0x{:x} OK (first f32: {})", i, ptr, first_f32);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Print work queue info
+                    if !kernel.internal_bufs.is_empty() {
+                        let task_buf_bytes = kernel.internal_bufs[0].len();
+                        eprintln!("[DIAG]   task_buffer_size={} bytes, internal_bufs_count={}",
+                            task_buf_bytes, kernel.internal_bufs.len());
+                    }
+
+                    // Print buffer sizes for all external buffers used by this CudaGraphOp
+                    eprintln!("[DIAG]   External buffer sizes (buffer_nodes):");
+                    for &node in &self.buffer_nodes {
+                        if let Some(buf) = buffers.get(&node) {
+                            let ptr = buf.device_ptr(stream).0;
+                            eprintln!("[DIAG]     {:?}: {} bytes ({} f32 elements) ptr=0x{:x}",
+                                node, buf.len(), buf.len() / 4, ptr);
+                        } else {
+                            eprintln!("[DIAG]     {:?}: NOT IN BUFFERS MAP", node);
+                        }
+                    }
+                }
+
+                // Launch kernel directly via CUfunction
+                unsafe {
+                    let mut params_storage: Vec<*mut std::ffi::c_void> = param_values
+                        .iter()
+                        .map(|v| v as *const u64 as *mut std::ffi::c_void)
+                        .collect();
+
+                    use cudarc::driver::sys::*;
+                    let result = cuLaunchKernel(
+                        kernel.function.raw_function(),
+                        grid_dim.0, grid_dim.1, grid_dim.2,
+                        block_dim.0, block_dim.1, block_dim.2,
+                        shared_mem,
+                        stream.cu_stream(),
+                        params_storage.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    );
+                    if result != CUresult::CUDA_SUCCESS {
+                        panic!(
+                            "[DIAG] cuLaunchKernel FAILED for kernel {}/{} '{}' node={:?}: {:?}",
+                            idx + 1, state.kernels.len(), kernel.kernel_name, kernel.node, result
+                        );
+                    }
+                }
+
+                // Sync after each kernel to catch errors immediately
+                if let Err(e) = stream.synchronize() {
+                    panic!(
+                        "[DIAG] CUDA ERROR after kernel {}/{} '{}' node={:?}: {:#}\n  \
+                         grid=({},{},{}) block=({},{},{}) smem={}\n  \
+                         output_ptr=0x{:x} input_ptrs={:?} has_output={}",
+                        idx + 1, state.kernels.len(), kernel.kernel_name, kernel.node, e,
+                        grid_dim.0, grid_dim.1, grid_dim.2,
+                        block_dim.0, block_dim.1, block_dim.2,
+                        shared_mem, output_ptr, input_ptrs, has_output
+                    );
+                }
+            }
+            eprintln!("[DIAG] All {} kernels completed successfully!", state.kernels.len());
+        } else {
+            // Launch the CUDA graph normally
+            state.cuda_graph_exec.as_ref().unwrap().launch(stream)?;
+        }
 
         // Sync after launch
         stream.synchronize()?;
@@ -506,11 +713,36 @@ impl CudaGraphOp {
             );
             let shared_mem = kernel.shared_mem.exec(dyn_map).unwrap() as u32;
 
-            let output_ptr = buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
+            // Kernels with zero output size (e.g., Megakernels) don't have output buffers —
+            // they write to internal buffer arrays instead. Allow null (0) for those.
+            let has_output = kernel.kernel_op.output_size()
+                .exec(&FxHashMap::default()).unwrap_or(1) != 0;
+            let output_ptr = buffer_ptrs.get(&kernel.node).copied().unwrap_or_else(|| {
+                if has_output {
+                    panic!(
+                        "CudaGraphOp::build_graph: missing output buffer for node {:?} (kernel '{}', idx {}). \
+                         buffer_nodes: {}, provided buffers: {}",
+                        kernel.node, kernel.kernel_name, idx,
+                        self.buffer_nodes.len(), buffers.len()
+                    )
+                }
+                0
+            });
             let input_ptrs: Vec<u64> = kernel
                 .inputs
                 .iter()
-                .map(|inp| buffer_ptrs.get(inp).copied().unwrap_or(0))
+                .enumerate()
+                .map(|(inp_idx, inp)| {
+                    buffer_ptrs.get(inp).copied().unwrap_or_else(|| {
+                        panic!(
+                            "CudaGraphOp::build_graph: missing input buffer for node {:?} \
+                             (kernel '{}', idx {}, input_idx {}). \
+                             buffer_nodes: {}, provided buffers: {}",
+                            inp, kernel.kernel_name, idx, inp_idx,
+                            self.buffer_nodes.len(), buffers.len()
+                        )
+                    })
+                })
                 .collect();
 
             let param_values = kernel.kernel_op.build_params(

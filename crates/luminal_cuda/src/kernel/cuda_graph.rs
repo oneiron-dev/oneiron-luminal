@@ -368,6 +368,12 @@ pub fn event_elapsed_ms(
     ctx.bind_to_thread()?;
     let mut ms: f32 = 0.0;
     unsafe {
+        // cudarc 0.18.2 generates different bindings depending on the installed CUDA toolkit:
+        // - CUDA 12.4 on Linux: cuEventElapsedTime (no _v2 suffix)
+        // - macOS (bundled headers): cuEventElapsedTime_v2
+        #[cfg(target_os = "macos")]
+        sys::cuEventElapsedTime_v2(&mut ms, start, end).result()?;
+        #[cfg(not(target_os = "macos"))]
         sys::cuEventElapsedTime(&mut ms, start, end).result()?;
     }
     Ok(ms)
