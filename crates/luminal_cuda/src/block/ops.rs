@@ -918,13 +918,13 @@ impl BlockOp for RowRope {
         "
         const float* inp = source_ptrs[0] + eval_expression(payload.inp, current);
         float*       out = out_ptr + eval_expression(payload.out, current);
-        const int* token_ids = (const int*)source_ptrs[1] + eval_expression(payload.token_ids, current);
+        // Position IDs arrive as f32 in the graph; convert to int properly
+        // (not via pointer cast, which reinterprets IEEE-754 bits as int).
+        const int pos = __float2int_rn(source_ptrs[1][eval_expression(payload.token_ids, current)]);
 
         const int D_total = eval_expression(payload.row_width, 0);    // = n_heads * d_head
         const int d_head  = 128;            // head_dim
         const int n_heads = D_total / d_head;
-
-        const int   pos  = token_ids[0];   // must match position_ids[batch, seq]
         const float base = 500000.0f;
 
         const int half = d_head / 2;            // 64 when d_head = 128
@@ -1925,13 +1925,13 @@ impl BlockOp for RowEmbed {
         int token_offset = eval_expression(payload.token_stride, current);
         int out_offset = eval_expression(payload.out_stride, current);
 
-        // Get pointers
-        const int* token_ids = (const int*)(source_ptrs[0]) + token_offset;
+        // Get pointers — token IDs arrive as f32 in the graph; convert to int properly
+        // (not via pointer cast, which reinterprets IEEE-754 bits as int).
         const float* embed_table = source_ptrs[1];
         float* out_row = out_ptr + out_offset;
 
-        // Read token ID (stored as int)
-        int token_id = token_ids[0];
+        // Read token ID: source data is f32, convert to int
+        int token_id = __float2int_rn(source_ptrs[0][token_offset]);
 
         // Lookup and copy embedding row
         const float* embed_row = embed_table + (long long)token_id * embed_dim;
