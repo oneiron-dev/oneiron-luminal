@@ -1,11 +1,11 @@
+use crate::backend;
 use crate::code_predictor::{CodePredictorConfig, CodePredictorModel};
 use crate::model::{TalkerConfig, TalkerModel};
 use crate::speech_decoder::{SpeechDecoder, SpeechDecoderConfig};
-use crate::weight_loader::load_weights_from_map;
 use luminal::{
     graph::Graph,
     op::{DType, Runtime},
-    prelude::{GraphTensor, NativeRuntime},
+    prelude::GraphTensor,
 };
 use std::collections::HashMap;
 
@@ -105,24 +105,24 @@ pub fn generate_frames(
         .map(|(k, v)| (k.output(), v.output()))
         .collect();
 
-    eprintln!("  [prefill] graph built in {:.1}s", t0.elapsed().as_secs_f32());
-    prefill_cx.build_search_space::<NativeRuntime>();
-    let mut prefill_rt = prefill_cx.search(NativeRuntime::default(), 1);
+    eprintln!(
+        "  [prefill] graph built in {:.1}s",
+        t0.elapsed().as_secs_f32()
+    );
+    let mut prefill_rt = backend::compile(&mut prefill_cx, weights);
     eprintln!("  [prefill] compiled in {:.1}s", t0.elapsed().as_secs_f32());
-    load_weights_from_map(&mut prefill_rt, &prefill_cx, weights);
-    eprintln!("  [prefill] weights loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    prefill_rt.set_data(prompt_input.id, initial_embeds.to_vec());
+    backend::set_data(&mut prefill_rt, prompt_input.id, initial_embeds.to_vec());
     prefill_rt.execute(&prefill_cx.dyn_map);
     eprintln!("  [prefill] executed in {:.1}s", t0.elapsed().as_secs_f32());
 
-    let code_0_val = prefill_rt.get_f32(prefill_code_0_out.id)[0] as u32;
+    let code_0_val = backend::get_f32(&prefill_rt, prefill_code_0_out.id)[0] as u32;
     if code_0_val == CODEC_EOS_ID as u32 {
         return all_frames;
     }
 
     let pred_codes: Vec<u32> = prefill_code_outs
         .iter()
-        .map(|code| prefill_rt.get_f32(code.id)[0] as u32)
+        .map(|code| backend::get_f32(&prefill_rt, code.id)[0] as u32)
         .collect();
     let mut frame_codes = vec![code_0_val];
     frame_codes.extend(pred_codes);
@@ -132,7 +132,7 @@ pub fn generate_frames(
         return all_frames;
     }
 
-    let prefill_codec_sum_data = prefill_rt.get_f32(prefill_codec_sum_out.id);
+    let prefill_codec_sum_data = backend::get_f32(&prefill_rt, prefill_codec_sum_out.id);
     assert_eq!(
         prefill_codec_sum_data.len(),
         hidden,
@@ -147,8 +147,8 @@ pub fn generate_frames(
     let mut prefill_k: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
     let mut prefill_v: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
     for (k_out, v_out) in &kv_cache_outs {
-        prefill_k.push(prefill_rt.get_f32(k_out.id).to_vec());
-        prefill_v.push(prefill_rt.get_f32(v_out.id).to_vec());
+        prefill_k.push(backend::get_f32(&prefill_rt, k_out.id));
+        prefill_v.push(backend::get_f32(&prefill_rt, v_out.id));
     }
 
     // ===== DECODE PHASE =====
@@ -231,27 +231,32 @@ pub fn generate_frames(
         .map(|(k, v)| (k.output(), v.output()))
         .collect();
 
-    eprintln!("  [decode] graph built in {:.1}s", t0.elapsed().as_secs_f32());
-    decode_cx.build_search_space::<NativeRuntime>();
-    let mut decode_rt = decode_cx.search(NativeRuntime::default(), 1);
+    eprintln!(
+        "  [decode] graph built in {:.1}s",
+        t0.elapsed().as_secs_f32()
+    );
+    let mut decode_rt = backend::compile(&mut decode_cx, weights);
     eprintln!("  [decode] compiled in {:.1}s", t0.elapsed().as_secs_f32());
-    load_weights_from_map(&mut decode_rt, &decode_cx, weights);
-    eprintln!("  [decode] weights loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     for frame in 1..num_frames {
         let p = prompt_len + frame - 1;
-        decode_rt.set_data(new_embed_input.id, next_embed.clone());
-        decode_rt.set_data(pos_input.id, vec![p as f32]);
-        decode_rt.set_data(mask_input.id, attn_mask.clone());
+        backend::set_data(&mut decode_rt, new_embed_input.id, next_embed.clone());
+        backend::set_data(&mut decode_rt, pos_input.id, vec![p as f32]);
+        backend::set_data(&mut decode_rt, mask_input.id, attn_mask.clone());
+        // Known optimization target: avoid full K/V re-upload each frame on Metal.
         for (i, (k_in, v_in)) in kv_inputs.iter().enumerate() {
-            decode_rt.set_data(k_in.id, k_bufs[i].clone());
-            decode_rt.set_data(v_in.id, v_bufs[i].clone());
+            backend::set_data(&mut decode_rt, k_in.id, k_bufs[i].clone());
+            backend::set_data(&mut decode_rt, v_in.id, v_bufs[i].clone());
         }
 
         decode_rt.execute(&decode_cx.dyn_map);
-        eprintln!("  [decode] frame {} done at {:.1}s", frame, t0.elapsed().as_secs_f32());
+        eprintln!(
+            "  [decode] frame {} done at {:.1}s",
+            frame,
+            t0.elapsed().as_secs_f32()
+        );
 
-        let code_0_val = decode_rt.get_f32(decode_code_0_out.id)[0] as u32;
+        let code_0_val = backend::get_f32(&decode_rt, decode_code_0_out.id)[0] as u32;
         if code_0_val == CODEC_EOS_ID as u32 {
             eprintln!("  [decode] EOS at frame {}", frame);
             break;
@@ -259,15 +264,15 @@ pub fn generate_frames(
 
         let pred_codes: Vec<u32> = decode_code_outs
             .iter()
-            .map(|code| decode_rt.get_f32(code.id)[0] as u32)
+            .map(|code| backend::get_f32(&decode_rt, code.id)[0] as u32)
             .collect();
         let mut frame_codes = vec![code_0_val];
         frame_codes.extend(pred_codes);
         all_frames.push(frame_codes);
 
         for (i, (k_out, v_out)) in decode_new_kv_cache_outs.iter().enumerate() {
-            let new_k = decode_rt.get_f32(k_out.id);
-            let new_v = decode_rt.get_f32(v_out.id);
+            let new_k = backend::get_f32(&decode_rt, k_out.id);
+            let new_v = backend::get_f32(&decode_rt, v_out.id);
             assert_eq!(
                 new_k.len(),
                 n_kv_heads * head_dim,
@@ -289,7 +294,7 @@ pub fn generate_frames(
         }
         attn_mask[p] = 0.0;
 
-        let codec_sum_data = decode_rt.get_f32(decode_codec_sum_out.id);
+        let codec_sum_data = backend::get_f32(&decode_rt, decode_codec_sum_out.id);
         assert_eq!(
             codec_sum_data.len(),
             hidden,
@@ -500,26 +505,44 @@ pub fn assemble_prompt_embeds(
     let initial_embeds_out = outputs.initial_embeds.output();
     let tts_pad_embed_out = outputs.tts_pad_embed.output();
 
-    cx.build_search_space::<NativeRuntime>();
-    let mut rt = cx.search(NativeRuntime::default(), 1);
-    load_weights_from_map(&mut rt, &cx, weights);
+    let mut rt = backend::compile(&mut cx, weights);
 
-    rt.set_data(role_ids_tensor.id, role_ids.to_vec());
-    rt.set_data(content_ids_tensor.id, content_ids.to_vec());
-    rt.set_data(overlay_text_ids_tensor.id, overlay_text_ids.to_vec());
-    rt.set_data(overlay_codec_ids_tensor.id, overlay_codec_ids.to_vec());
-    rt.set_data(content_codec_ids_tensor.id, content_codec_ids.to_vec());
-    rt.set_data(tts_eos_id_tensor.id, vec![tts_eos_id]);
-    rt.set_data(transition_text_id_tensor.id, vec![transition_text_id]);
-    rt.set_data(transition_codec_id_tensor.id, vec![transition_codec_id]);
+    backend::set_data(&mut rt, role_ids_tensor.id, role_ids.to_vec());
+    backend::set_data(&mut rt, content_ids_tensor.id, content_ids.to_vec());
+    backend::set_data(
+        &mut rt,
+        overlay_text_ids_tensor.id,
+        overlay_text_ids.to_vec(),
+    );
+    backend::set_data(
+        &mut rt,
+        overlay_codec_ids_tensor.id,
+        overlay_codec_ids.to_vec(),
+    );
+    backend::set_data(
+        &mut rt,
+        content_codec_ids_tensor.id,
+        content_codec_ids.to_vec(),
+    );
+    backend::set_data(&mut rt, tts_eos_id_tensor.id, vec![tts_eos_id]);
+    backend::set_data(
+        &mut rt,
+        transition_text_id_tensor.id,
+        vec![transition_text_id],
+    );
+    backend::set_data(
+        &mut rt,
+        transition_codec_id_tensor.id,
+        vec![transition_codec_id],
+    );
     if let (Some(ids), Some(tensor)) = (instruct_ids, instruct_ids_tensor) {
-        rt.set_data(tensor.id, ids.to_vec());
+        backend::set_data(&mut rt, tensor.id, ids.to_vec());
     }
 
     rt.execute(&cx.dyn_map);
     (
-        rt.get_f32(initial_embeds_out.id).to_vec(),
-        rt.get_f32(tts_pad_embed_out.id).to_vec(),
+        backend::get_f32(&rt, initial_embeds_out.id),
+        backend::get_f32(&rt, tts_pad_embed_out.id),
     )
 }
 
@@ -556,14 +579,12 @@ pub fn decode_speech(
     let audio = decoder.decode_codes(code_tensors.clone());
     let audio_out = audio.output();
 
-    cx.build_search_space::<NativeRuntime>();
-    let mut rt = cx.search(NativeRuntime::default(), 1);
-    load_weights_from_map(&mut rt, &cx, weights);
+    let mut rt = backend::compile(&mut cx, weights);
 
     for (i, tensor) in code_tensors.iter().enumerate() {
-        rt.set_data(tensor.id, codes_by_codebook[i].clone());
+        backend::set_data_i32(&mut rt, tensor.id, codes_by_codebook[i].clone());
     }
 
     rt.execute(&cx.dyn_map);
-    rt.get_f32(audio_out.id).to_vec()
+    backend::get_f32(&rt, audio_out.id)
 }

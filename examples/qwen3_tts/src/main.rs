@@ -32,7 +32,8 @@ fn main() {
     let output_path = Path::new("output.wav");
 
     eprintln!("Loading main model weights...");
-    let main_weights = load_safetensors_to_map(&main_model_path).expect("Failed to load main model");
+    let main_weights =
+        load_safetensors_to_map(&main_model_path).expect("Failed to load main model");
     eprintln!("  Loaded {} tensors", main_weights.len());
 
     eprintln!("Loading speech decoder weights...");

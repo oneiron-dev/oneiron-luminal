@@ -1,3 +1,4 @@
+use crate::backend;
 use luminal::hlir::Input;
 use luminal::prelude::petgraph::Direction;
 use luminal::prelude::{Graph, NativeRuntime};
@@ -61,7 +62,7 @@ pub fn expected_element_count(cx: &Graph, node: luminal::prelude::NodeIndex) -> 
 }
 
 pub fn load_weights_from_map(
-    rt: &mut NativeRuntime,
+    rt: &mut backend::Rt,
     cx: &Graph,
     weights: &HashMap<String, Vec<f32>>,
 ) -> usize {
@@ -73,7 +74,7 @@ pub fn load_weights_from_map(
         let Some(data) = weights.get(&input.label) else {
             continue;
         };
-        rt.set_data(node, data.clone());
+        backend::set_data(rt, node, data.clone());
         loaded += 1;
     }
     loaded
