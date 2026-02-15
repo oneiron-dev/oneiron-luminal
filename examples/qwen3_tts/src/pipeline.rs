@@ -675,8 +675,7 @@ pub fn decode_speech(
     weights: &HashMap<String, Vec<f32>>,
 ) -> Vec<f32> {
     use crate::speech_decoder::{
-        CausalConv1d, CausalTransConv1d, ConvNeXtBlock, DecoderResidualUnit, SnakeBeta,
-        SpeechDecoder,
+        CausalConv1d, CausalTransConv1d, ConvNeXtBlock, SnakeBeta, SpeechDecoder,
     };
 
     if frames.is_empty() {
@@ -984,37 +983,81 @@ pub fn decode_speech(
             );
         }
 
-        // --- Sub-stages: each DecoderResidualUnit ---
+        // --- Sub-stages: each DecoderResidualUnit (manual conv to avoid ConvND OOM) ---
+        // ConvND decomposes conv1d into unfold+matmul, creating 50+ GB intermediates
+        // that OOM during profiling. Instead we use:
+        //   - SnakeBeta in a small Graph (element-wise, ~100 MB intermediates)
+        //   - CausalConv1d via CPU-side matmul reuse (proven in Stage 2b/conv)
+        //   - Residual add on CPU
         for (j, dilation) in [1usize, 3, 9].iter().enumerate() {
-            let mut cx = Graph::new();
-            let input = cx.tensor((1, out_dim, hidden_len));
-            let unit = DecoderResidualUnit::new(
+            let prefix = format!("{block_prefix}.block.{}", j + 2);
+            let residual_data = hidden_data.clone();
+
+            // SnakeBeta 1
+            {
+                let mut cx = Graph::new();
+                let input = cx.tensor((1, out_dim, hidden_len));
+                let snake = SnakeBeta::new(
+                    out_dim,
+                    &format!("{prefix}.act1.alpha"),
+                    &format!("{prefix}.act1.beta"),
+                    &mut cx,
+                );
+                let out = snake.forward(input).output();
+                let mut rt = backend::compile(&mut cx, weights);
+                backend::set_data(&mut rt, input.id, hidden_data);
+                rt.execute(&cx.dyn_map);
+                hidden_data = backend::get_f32(&rt, out.id);
+            }
+
+            // CausalConv1d 1 (kernel=7, dilation=dilation)
+            pipeline_causal_conv1d_cpu(
+                &mut hidden_data,
                 out_dim,
+                out_dim,
+                hidden_len,
+                7,
                 *dilation,
-                format!("{block_prefix}.block.{}", j + 2),
-                &mut cx,
+                &format!("{prefix}.conv1.conv"),
+                weights,
             );
-            let h = unit.forward(input);
-            let out = h.output();
+
+            // SnakeBeta 2
+            {
+                let mut cx = Graph::new();
+                let input = cx.tensor((1, out_dim, hidden_len));
+                let snake = SnakeBeta::new(
+                    out_dim,
+                    &format!("{prefix}.act2.alpha"),
+                    &format!("{prefix}.act2.beta"),
+                    &mut cx,
+                );
+                let out = snake.forward(input).output();
+                let mut rt = backend::compile(&mut cx, weights);
+                backend::set_data(&mut rt, input.id, hidden_data);
+                rt.execute(&cx.dyn_map);
+                hidden_data = backend::get_f32(&rt, out.id);
+            }
+
+            // CausalConv1d 2 (kernel=1, dilation=1)
+            pipeline_causal_conv1d_cpu(
+                &mut hidden_data,
+                out_dim,
+                out_dim,
+                hidden_len,
+                1,
+                1,
+                &format!("{prefix}.conv2.conv"),
+                weights,
+            );
+
+            // Residual add (CPU)
+            for idx in 0..hidden_data.len() {
+                hidden_data[idx] += residual_data[idx];
+            }
 
             eprintln!(
-                "  [speech_decode/{}/res{}] graph built in {:.1}s",
-                stage_name,
-                j,
-                t0.elapsed().as_secs_f32()
-            );
-            let mut rt = backend::compile(&mut cx, weights);
-            eprintln!(
-                "  [speech_decode/{}/res{}] compiled in {:.1}s",
-                stage_name,
-                j,
-                t0.elapsed().as_secs_f32()
-            );
-            backend::set_data(&mut rt, input.id, hidden_data);
-            rt.execute(&cx.dyn_map);
-            hidden_data = backend::get_f32(&rt, out.id);
-            eprintln!(
-                "  [speech_decode/{}/res{}] executed in {:.1}s",
+                "  [speech_decode/{}/res{}] done at {:.1}s",
                 stage_name,
                 j,
                 t0.elapsed().as_secs_f32()
@@ -1071,4 +1114,89 @@ pub fn decode_speech(
     }
 
     hidden_data
+}
+
+/// CPU-side causal conv1d using compiled matmul reuse.
+///
+/// Avoids luminal's ConvND decomposition (unfold+matmul) which creates 50+ GB intermediates
+/// for large channel dims. Instead compiles ONE tiny matmul+accum graph (~20 MB intermediates)
+/// and reuses it for each kernel position with CPU-side slicing.
+///
+/// Weight layout: `[out_ch, in_ch, kernel]` (ConvND groups=1, row-major).
+fn pipeline_causal_conv1d_cpu(
+    hidden_data: &mut Vec<f32>,
+    in_ch: usize,
+    out_ch: usize,
+    seq_len: usize,
+    kernel: usize,
+    dilation: usize,
+    weight_prefix: &str,
+    weights: &HashMap<String, Vec<f32>>,
+) {
+    // 1. CPU-side causal padding (left only)
+    let left_pad = dilation * (kernel - 1);
+    let padded_len = seq_len + left_pad;
+    let mut padded_data = vec![0.0f32; in_ch * padded_len];
+    for c in 0..in_ch {
+        for t in 0..seq_len {
+            padded_data[c * padded_len + left_pad + t] = hidden_data[c * seq_len + t];
+        }
+    }
+
+    // 2. Compile matmul+accum graph (once, reused for all kernel positions)
+    let mut cx = luminal::graph::Graph::new();
+    let slice_input = cx.tensor((1, seq_len, in_ch));
+    let weight_input = cx.tensor((in_ch, out_ch));
+    let accum_input = cx.tensor((1, seq_len, out_ch));
+    let partial = slice_input.matmul(weight_input);
+    let result = accum_input + partial;
+    let out = result.output();
+    let mut rt = backend::compile(&mut cx, &HashMap::new());
+
+    // 3. Load weight + bias from weights map (CPU)
+    let weight_name = format!("{weight_prefix}.weight");
+    let weight_data = weights
+        .get(&weight_name)
+        .unwrap_or_else(|| panic!("missing weight: {weight_name}"));
+    let bias_name = format!("{weight_prefix}.bias");
+    let bias_data = weights.get(&bias_name);
+
+    // 4. Loop over kernel positions with CPU-side slicing
+    let mut accum_data = vec![0.0f32; seq_len * out_ch];
+    for k in 0..kernel {
+        // CPU: extract padded[:, :, k*d .. k*d + seq_len] and transpose to [1, seq_len, in_ch]
+        let mut slice_t_data = vec![0.0f32; seq_len * in_ch];
+        for c in 0..in_ch {
+            for t in 0..seq_len {
+                slice_t_data[t * in_ch + c] = padded_data[c * padded_len + k * dilation + t];
+            }
+        }
+
+        // CPU: extract weight[:, :, k] transposed to [in_ch, out_ch]
+        // weight layout: [out_ch, in_ch, kernel] row-major
+        let mut weight_k_data = vec![0.0f32; in_ch * out_ch];
+        for oc in 0..out_ch {
+            for ic in 0..in_ch {
+                weight_k_data[ic * out_ch + oc] =
+                    weight_data[oc * in_ch * kernel + ic * kernel + k];
+            }
+        }
+
+        backend::set_data(&mut rt, slice_input.id, slice_t_data);
+        backend::set_data(&mut rt, weight_input.id, weight_k_data);
+        backend::set_data(&mut rt, accum_input.id, accum_data);
+        rt.execute(&cx.dyn_map);
+        accum_data = backend::get_f32(&rt, out.id);
+    }
+
+    // 5. Transpose accum [1, seq_len, out_ch] → [1, out_ch, seq_len] and add bias
+    let mut result_data = vec![0.0f32; out_ch * seq_len];
+    for c in 0..out_ch {
+        let bias_val = bias_data.map_or(0.0, |b| b[c]);
+        for t in 0..seq_len {
+            result_data[c * seq_len + t] = accum_data[t * out_ch + c] + bias_val;
+        }
+    }
+
+    *hidden_data = result_data;
 }

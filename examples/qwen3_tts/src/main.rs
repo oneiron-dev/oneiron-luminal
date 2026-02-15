@@ -10,7 +10,7 @@ use qwen3_tts::weight_loader::load_safetensors_to_map;
 use std::path::Path;
 
 const SAMPLE_RATE: u32 = 24_000;
-const MAX_FRAMES: usize = 500;
+const DEFAULT_MAX_FRAMES: usize = 500;
 
 // Pre-tokenized: "<|im_start|>assistant\nHello world.<|im_end|>\n<|im_start|>assistant\n"
 const ASSISTANT_IDS: &[i32] = &[
@@ -88,14 +88,18 @@ fn main() {
     let prompt_len = initial_embeds.len() / talker_config.hidden;
     eprintln!("  Prompt length: {} positions", prompt_len);
 
-    eprintln!("Generating frames (max {MAX_FRAMES})...");
+    let max_frames: usize = std::env::var("QWEN3_TTS_MAX_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_FRAMES);
+    eprintln!("Generating frames (max {max_frames})...");
     let frames = generate_frames(
         &talker_config,
         &predictor_config,
         &initial_embeds,
         &tts_pad_embed,
         prompt_len,
-        MAX_FRAMES,
+        max_frames,
         &main_weights,
     );
     eprintln!("  Generated {} frames", frames.len());

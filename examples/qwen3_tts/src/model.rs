@@ -1,3 +1,4 @@
+use crate::maybe_graph_break;
 use luminal::{
     graph::Graph,
     op::DType,
@@ -99,6 +100,76 @@ pub struct TalkerLayer {
     pub down_proj: GraphTensor,
     pub input_norm: LayerNorm,
     pub post_attn_norm: LayerNorm,
+}
+
+impl TalkerLayer {
+    /// Create a single transformer layer with the correct weight names for layer `i`.
+    pub fn new(cx: &mut Graph, config: &TalkerConfig, i: usize) -> Self {
+        Self {
+            q_proj: cx.named_tensor(
+                format!("talker.model.layers.{i}.self_attn.q_proj.weight"),
+                (config.n_heads * config.head_dim, config.hidden),
+            ),
+            k_proj: cx.named_tensor(
+                format!("talker.model.layers.{i}.self_attn.k_proj.weight"),
+                (config.n_kv_heads * config.head_dim, config.hidden),
+            ),
+            v_proj: cx.named_tensor(
+                format!("talker.model.layers.{i}.self_attn.v_proj.weight"),
+                (config.n_kv_heads * config.head_dim, config.hidden),
+            ),
+            q_norm: LayerNorm::new(
+                config.head_dim,
+                Some(&format!("talker.model.layers.{i}.self_attn.q_norm.weight")),
+                None,
+                false,
+                config.rms_norm_eps,
+                cx,
+            ),
+            k_norm: LayerNorm::new(
+                config.head_dim,
+                Some(&format!("talker.model.layers.{i}.self_attn.k_norm.weight")),
+                None,
+                false,
+                config.rms_norm_eps,
+                cx,
+            ),
+            o_proj: cx.named_tensor(
+                format!("talker.model.layers.{i}.self_attn.o_proj.weight"),
+                (config.hidden, config.n_heads * config.head_dim),
+            ),
+            gate_proj: cx.named_tensor(
+                format!("talker.model.layers.{i}.mlp.gate_proj.weight"),
+                (config.intermediate, config.hidden),
+            ),
+            up_proj: cx.named_tensor(
+                format!("talker.model.layers.{i}.mlp.up_proj.weight"),
+                (config.intermediate, config.hidden),
+            ),
+            down_proj: cx.named_tensor(
+                format!("talker.model.layers.{i}.mlp.down_proj.weight"),
+                (config.hidden, config.intermediate),
+            ),
+            input_norm: LayerNorm::new(
+                config.hidden,
+                Some(&format!("talker.model.layers.{i}.input_layernorm.weight")),
+                None,
+                false,
+                config.rms_norm_eps,
+                cx,
+            ),
+            post_attn_norm: LayerNorm::new(
+                config.hidden,
+                Some(&format!(
+                    "talker.model.layers.{i}.post_attention_layernorm.weight"
+                )),
+                None,
+                false,
+                config.rms_norm_eps,
+                cx,
+            ),
+        }
+    }
 }
 
 impl TalkerModel {
@@ -247,6 +318,7 @@ impl TalkerModel {
         let mut x = embeds;
         for layer in &self.layers {
             x = layer.forward(x, &self.config);
+            x = maybe_graph_break(x);
         }
         x
     }
@@ -266,7 +338,7 @@ impl TalkerModel {
         for layer in &self.layers {
             let (out, k, v) = layer.forward_with_kv(x, &self.config);
             kv_caches.push((k, v));
-            x = out;
+            x = maybe_graph_break(out);
         }
         let normed = self.final_norm.forward(x);
         let logits = normed.matmul(self.codec_head.t());
@@ -292,7 +364,7 @@ impl TalkerModel {
         for (layer, (k_cache, v_cache)) in self.layers.iter().zip(kv_caches.iter()) {
             let (out, k, v) = layer.forward_decode(x, *k_cache, *v_cache, &self.config, pos_tensor);
             new_caches.push((k, v));
-            x = out;
+            x = maybe_graph_break(out);
         }
         let normed = self.final_norm.forward(x);
         let logits = normed.matmul(self.codec_head.t());
@@ -320,7 +392,7 @@ impl TalkerModel {
             let (out, k_new, v_new) =
                 layer.forward_decode_fixed(x, *k_buf, *v_buf, attn_mask, &self.config, pos_tensor);
             new_kvs.push((k_new, v_new));
-            x = out;
+            x = maybe_graph_break(out);
         }
         let normed = self.final_norm.forward(x);
         let logits = normed.matmul(self.codec_head.t());

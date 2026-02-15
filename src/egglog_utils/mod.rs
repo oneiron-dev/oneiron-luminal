@@ -690,10 +690,31 @@ pub fn run_egglog(
     egraph
         .node_to_class
         .retain(|n, _| egraph.enodes.contains_key(n));
-    assert!(
-        egraph.roots.iter().all(|c| egraph.eclasses.contains_key(c)),
-        "No valid graphs present in the e-graph!"
-    );
+    let missing_roots: Vec<_> = egraph
+        .roots
+        .iter()
+        .filter(|c| !egraph.eclasses.contains_key(c))
+        .collect();
+    if !missing_roots.is_empty() {
+        eprintln!(
+            "[egglog] {} total roots, {} missing from eclasses after cleanup",
+            egraph.roots.len(),
+            missing_roots.len()
+        );
+        eprintln!(
+            "[egglog] remaining eclasses: {}, enodes: {}",
+            egraph.eclasses.len(),
+            egraph.enodes.len()
+        );
+        for mr in &missing_roots {
+            eprintln!("[egglog] missing root eclass: {}", mr);
+        }
+        return Err(egglog::Error::ExtractError(format!(
+            "No valid graphs present in the e-graph! ({} of {} roots missing)",
+            missing_roots.len(),
+            egraph.roots.len()
+        )));
+    }
 
     Ok(egraph)
 }

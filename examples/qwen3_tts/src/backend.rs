@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::weight_loader::expected_element_count;
 
 #[cfg(any(feature = "metal", feature = "cuda"))]
-use luminal::{hlir::Input, op::Runtime};
+use luminal::hlir::Input;
 
 #[cfg(feature = "metal")]
 use luminal_metal::MetalRuntime;
@@ -109,6 +109,17 @@ pub fn set_data_i32(rt: &mut Rt, id: impl ToId, data: Vec<i32>) {
 
     #[cfg(not(any(feature = "metal", feature = "cuda")))]
     rt.set_data(id, data);
+}
+
+pub fn update_data_slice(rt: &mut Rt, id: impl ToId, byte_offset: usize, data: &[f32]) {
+    #[cfg(feature = "cuda")]
+    rt.update_buffer_slice(id, byte_offset, data);
+
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    { let _ = (rt, id, byte_offset, data); unimplemented!("Metal partial update not yet implemented"); }
+
+    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    { let _ = (rt, id, byte_offset, data); unimplemented!("Native partial update not yet implemented"); }
 }
 
 pub fn get_f32(rt: &Rt, id: impl ToId) -> Vec<f32> {

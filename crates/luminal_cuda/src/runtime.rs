@@ -176,6 +176,24 @@ impl CudaRuntime {
         self.changed_hlir.insert(id);
     }
 
+    /// Write partial data into an existing HLIR buffer at a byte offset.
+    /// The buffer must have been previously created via `set_data`.
+    /// Does NOT mark the buffer as changed (pointer is unchanged).
+    pub fn update_buffer_slice(&mut self, id: impl ToId, byte_offset: usize, data: &[f32]) {
+        let id = id.to_id();
+        let byte_data: &[u8] = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+        };
+        let byte_end = byte_offset + byte_data.len();
+        let buf = match self.hlir_buffers.get_mut(&id) {
+            Some(CudaInput::Buffer(buf)) => buf,
+            Some(CudaInput::Ptr(_)) => panic!("update_buffer_slice: {:?} is a Ptr, not a Buffer", id),
+            None => panic!("update_buffer_slice: no buffer for {:?}", id),
+        };
+        let mut view = buf.slice_mut(byte_offset..byte_end);
+        self.cuda_stream.memcpy_htod(byte_data, &mut view).unwrap();
+    }
+
     #[tracing::instrument(skip_all)]
     fn get_output_data(&self, id: impl ToId) -> Vec<u8> {
         let id = id.to_id();
@@ -224,7 +242,18 @@ impl CudaRuntime {
 
     #[tracing::instrument(skip_all)]
     fn allocate_intermediate_buffers(&mut self, dyn_dims: &FxHashMap<char, usize>) {
+        // Log GPU memory before allocation
+        if let Ok((free, total)) = cudarc::driver::result::mem_get_info() {
+            let used = total - free;
+            eprintln!(
+                "    [gpu_mem] before alloc: {:.1} GB used / {:.1} GB total ({:.1} GB free)",
+                used as f64 / 1e9,
+                total as f64 / 1e9,
+                free as f64 / 1e9,
+            );
+        }
         self.intermediate_buffer_dims.clear();
+        let mut total_alloc_bytes: usize = 0;
         for node in self.llir_graph.node_indices().collect_vec() {
             if self.llir_graph[node].to_op::<Input>().is_some() {
                 continue;
@@ -238,14 +267,18 @@ impl CudaRuntime {
                 }
                 self.intermediate_buffer_dims.extend(out_size.dyn_vars());
                 let alloc_bytes = exec_size * size_of::<f32>();
+                total_alloc_bytes += alloc_bytes;
                 self.buffers.insert(
                     node,
                     self.cuda_stream
                         .alloc_zeros(alloc_bytes)
                         .unwrap_or_else(|e| {
+                            let mem_info = cudarc::driver::result::mem_get_info()
+                                .map(|(f, t)| format!("{:.1} GB free / {:.1} GB total", f as f64 / 1e9, t as f64 / 1e9))
+                                .unwrap_or_else(|_| "unknown".to_string());
                             panic!(
-                                "Failed to alloc {} bytes for BlockOp node {:?}: {:?}",
-                                alloc_bytes, node, e
+                                "Failed to alloc {} bytes ({:.1} MB) for BlockOp node {:?} (total so far: {:.1} MB, gpu: {}): {:?}",
+                                alloc_bytes, alloc_bytes as f64 / 1e6, node, total_alloc_bytes as f64 / 1e6, mem_info, e
                             )
                         }),
                 );
@@ -261,11 +294,21 @@ impl CudaRuntime {
                     continue;
                 }
                 self.intermediate_buffer_dims.extend(out_size.dyn_vars());
+                let alloc_bytes = exec_size * size_of::<f32>();
+                total_alloc_bytes += alloc_bytes;
                 self.buffers.insert(
                     node,
                     self.cuda_stream
-                        .alloc_zeros(exec_size * size_of::<f32>())
-                        .unwrap(),
+                        .alloc_zeros(alloc_bytes)
+                        .unwrap_or_else(|e| {
+                            let mem_info = cudarc::driver::result::mem_get_info()
+                                .map(|(f, t)| format!("{:.1} GB free / {:.1} GB total", f as f64 / 1e9, t as f64 / 1e9))
+                                .unwrap_or_else(|_| "unknown".to_string());
+                            panic!(
+                                "Failed to alloc {} bytes ({:.1} MB) for KernelOp node {:?} (total so far: {:.1} MB, gpu: {}): {:?}",
+                                alloc_bytes, alloc_bytes as f64 / 1e6, node, total_alloc_bytes as f64 / 1e6, mem_info, e
+                            )
+                        }),
                 );
                 let ptr = self.buffers[&node].device_ptr(&self.cuda_stream).0;
                 self.cached_buffer_ptrs.insert(node, ptr);
@@ -273,17 +316,32 @@ impl CudaRuntime {
                 // Allocate output buffer for this HostOp if it has one
                 let exec_size = op.output_size().exec(dyn_dims).unwrap();
                 if exec_size > 0 {
+                    let alloc_bytes = exec_size * size_of::<f32>();
+                    total_alloc_bytes += alloc_bytes;
                     self.buffers.insert(
                         node,
                         self.cuda_stream
-                            .alloc_zeros(exec_size * size_of::<f32>())
-                            .unwrap(),
+                            .alloc_zeros(alloc_bytes)
+                            .unwrap_or_else(|e| {
+                                let mem_info = cudarc::driver::result::mem_get_info()
+                                    .map(|(f, t)| format!("{:.1} GB free / {:.1} GB total", f as f64 / 1e9, t as f64 / 1e9))
+                                    .unwrap_or_else(|_| "unknown".to_string());
+                                panic!(
+                                    "Failed to alloc {} bytes ({:.1} MB) for HostOp node {:?} (total so far: {:.1} MB, gpu: {}): {:?}",
+                                    alloc_bytes, alloc_bytes as f64 / 1e6, node, total_alloc_bytes as f64 / 1e6, mem_info, e
+                                )
+                            }),
                     );
                     let ptr = self.buffers[&node].device_ptr(&self.cuda_stream).0;
                     self.cached_buffer_ptrs.insert(node, ptr);
                 }
             }
         }
+        eprintln!(
+            "    [gpu_mem] allocated {:.1} MB for {} intermediate buffers",
+            total_alloc_bytes as f64 / 1e6,
+            self.buffers.len(),
+        );
     }
 
     /// Pre-allocate buffers with the given dynamic dimension values.

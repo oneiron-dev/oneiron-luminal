@@ -1,3 +1,4 @@
+use crate::maybe_graph_break;
 use luminal::{
     graph::Graph,
     op::DType,
@@ -268,10 +269,76 @@ impl CausalConv1d {
     }
 }
 
+/// Efficient depthwise causal conv1d that avoids luminal's grouped conv decomposition.
+///
+/// Standard ConvND with groups=channels creates N separate 1-channel convolutions,
+/// resulting in ~17k kernel ops for channels=1024. This implementation uses a manual
+/// slice-multiply-sum pattern (one op per kernel position), reducing to ~20 ops for k=7.
+pub struct DepthwiseCausalConv1d {
+    pub weight: GraphTensor, // (channels, kernel)
+    pub bias: Option<GraphTensor>,
+    pub channels: usize,
+    pub kernel: usize,
+    pub dilation: usize,
+    pub left_pad: usize,
+}
+
+impl DepthwiseCausalConv1d {
+    pub fn new(channels: usize, kernel: usize, dilation: usize, bias: bool, cx: &mut Graph) -> Self {
+        let left_pad = dilation * (kernel - 1);
+        Self {
+            weight: cx.named_tensor("DWConvWeight", (channels, kernel)),
+            bias: if bias {
+                Some(cx.named_tensor("DWConvBias", channels))
+            } else {
+                None
+            },
+            channels,
+            kernel,
+            dilation,
+            left_pad,
+        }
+    }
+
+    pub fn forward(&self, x: GraphTensor) -> GraphTensor {
+        use luminal::shape::Expression;
+
+        let (batch, _channels, seq_len) = x.dims3();
+        let padded = x.pad(((0, 0), (0, 0), (self.left_pad, 0)), 0.0);
+
+        // Manual depthwise conv: for each kernel position j, slice the padded input
+        // and multiply element-wise with weight[:, j], then accumulate.
+        // This produces ~3*kernel ops instead of ~17k for grouped conv.
+        let mut result: Option<GraphTensor> = None;
+        for j in 0..self.kernel {
+            let offset = Expression::from(j * self.dilation);
+            // slice: padded[:, :, offset .. offset+seq_len] → [batch, channels, seq_len]
+            let slice = padded.slice((.., .., offset.clone()..offset + seq_len));
+            // weight[:, j:j+1] → [channels, 1], merge_dims makes it contiguous [channels]
+            let w_j = self.weight.slice_along(j..j + 1, 1).merge_dims(0, 1);
+            // expand to [batch, channels, seq_len] for broadcasting
+            let w_j = w_j.expand_dim(0, batch).expand_dim(2, seq_len);
+            let term = slice * w_j;
+            result = Some(match result {
+                None => term,
+                Some(r) => r + term,
+            });
+        }
+
+        let mut out = result.unwrap();
+        if let Some(bias) = self.bias {
+            let bias_expanded = bias.expand_dim(0, batch).expand_dim(2, seq_len);
+            out = out + bias_expanded;
+        }
+        out
+    }
+}
+
 pub struct CausalTransConv1d {
     pub conv: ConvTranspose1d,
-    trim_right: usize,
+    kernel: usize,
     stride: usize,
+    trim_right: usize,
 }
 
 impl CausalTransConv1d {
@@ -290,25 +357,84 @@ impl CausalTransConv1d {
 
         Self {
             conv: ConvTranspose1d::new(ch_in, ch_out, kernel, stride, 0, bias, cx),
-            trim_right: kernel - stride,
+            kernel,
             stride,
+            trim_right: kernel - stride,
         }
     }
 
+    /// Memory-efficient forward using per-kernel-position matmuls with graph breaks.
+    ///
+    /// Loops over kernel positions, doing one small matmul per position.
+    /// Graph breaks between iterations prevent egglog from fusing all matmuls
+    /// into a single 242+ GB kernel operation.
     pub fn forward(&self, x: GraphTensor) -> GraphTensor {
-        let (_, _, input_len) = x.dims3();
-        let out = self.conv.forward(x);
+        use luminal::shape::Expression;
+
+        let (_batch, _ch_in, input_len) = x.dims3();
+
+        // 1. Upsample: interleave zeros between input samples
+        let upsampled_len = (input_len - 1) * self.stride + 1;
+        let upsampled = x
+            .expand_dim(3, 1)
+            .pad_along(0, self.stride - 1, 3, 0.0)
+            .merge_dims(2, 3)
+            .slice_along(..upsampled_len, 2);
+
+        // 2. Pad for full convolution
+        let conv_padding = self.kernel - 1;
+        let padded = upsampled.pad(((0, 0), (0, 0), (conv_padding, conv_padding)), 0.0);
+        let padded = maybe_graph_break(padded);
+
+        // 3. Compute output length
+        let out_len = upsampled_len + conv_padding; // upsampled_len + 2*padding - kernel + 1
+
+        // 4. Loop over kernel positions with graph breaks between iterations.
+        //    Weight is (ch_in, ch_out, kernel). We reverse the kernel index for
+        //    convolution (cross-correlation with flipped kernel).
+        let mut accum: Option<GraphTensor> = None;
+        for k in 0..self.kernel {
+            let reversed_k = self.kernel - 1 - k;
+            let offset = Expression::from(k);
+            // slice: padded[:, :, k .. k+out_len] → [batch, ch_in, out_len]
+            let slice = padded.slice((.., .., offset.clone()..offset + out_len));
+            // transpose for matmul: [batch, out_len, ch_in]
+            let slice_t = slice.transpose(1, 2);
+            // weight_k: [ch_in, ch_out, 1] → [ch_in, ch_out]
+            let weight_k = self
+                .conv
+                .weight
+                .slice_along(reversed_k..reversed_k + 1, 2)
+                .merge_dims(1, 2);
+            // matmul: [batch, out_len, ch_in] × [ch_in, ch_out] → [batch, out_len, ch_out]
+            let partial = slice_t.matmul(weight_k);
+            accum = Some(match accum {
+                None => partial,
+                Some(a) => maybe_graph_break(a + partial),
+            });
+        }
+
+        // 6. Transpose to [batch, ch_out, out_len]
+        let mut out = accum.unwrap().transpose(1, 2);
+
+        // 7. Add bias
+        if let Some(bias) = self.conv.bias {
+            let out_dims = out.dims();
+            out = out + bias.expand_lhs(&out_dims[..1]).expand_dim(2, out_dims[2]);
+        }
+
+        // 8. Trim right for causal padding
         if self.trim_right > 0 {
             let target_len = input_len * self.stride;
-            out.slice((.., .., ..target_len))
-        } else {
-            out
+            out = out.slice((.., .., ..target_len));
         }
+
+        out
     }
 }
 
 pub struct ConvNeXtBlock {
-    pub dwconv: CausalConv1d,
+    pub dwconv: DepthwiseCausalConv1d,
     pub norm: LayerNorm,
     pub pwconv1_weight: GraphTensor,
     pub pwconv1_bias: GraphTensor,
@@ -321,12 +447,11 @@ impl ConvNeXtBlock {
     pub fn new(dim: usize, prefix: impl AsRef<str>, cx: &mut Graph) -> Self {
         let prefix = prefix.as_ref();
 
-        let dwconv = CausalConv1d::new(dim, dim, 7, 1, true, cx, dim);
+        let dwconv = DepthwiseCausalConv1d::new(dim, 7, 1, true, cx);
         dwconv
-            .conv
             .weight
             .set_name(&format!("{prefix}.dwconv.conv.weight"));
-        if let Some(bias) = dwconv.conv.bias {
+        if let Some(bias) = dwconv.bias {
             bias.set_name(&format!("{prefix}.dwconv.conv.bias"));
         }
 
@@ -477,8 +602,10 @@ impl DecoderBlock {
     pub fn forward(&self, x: GraphTensor) -> GraphTensor {
         let mut hidden = self.snake.forward(x);
         hidden = self.trans_conv.forward(hidden);
+        hidden = maybe_graph_break(hidden);
         for residual_unit in &self.residual_units {
             hidden = residual_unit.forward(hidden);
+            hidden = maybe_graph_break(hidden);
         }
         hidden
     }
@@ -576,12 +703,16 @@ impl WaveformDecoder {
         let mut hidden = x;
         for (trans_conv, convnext) in &self.initial_upsample {
             hidden = trans_conv.forward(hidden);
+            hidden = maybe_graph_break(hidden);
             hidden = convnext.forward(hidden);
+            hidden = maybe_graph_break(hidden);
         }
 
         hidden = self.initial_conv.forward(hidden);
+        hidden = maybe_graph_break(hidden);
         for block in &self.blocks {
             hidden = block.forward(hidden);
+            hidden = maybe_graph_break(hidden);
         }
         hidden = self.final_snake.forward(hidden);
         hidden = self.final_conv.forward(hidden);
@@ -813,6 +944,7 @@ impl PreTransformer {
 
         for layer in &self.layers {
             hidden = layer.forward(hidden, config);
+            hidden = maybe_graph_break(hidden);
         }
 
         hidden = self.norm.forward(hidden);
@@ -869,10 +1001,13 @@ impl SpeechDecoder {
 
     pub fn decode_codes(&self, codes: Vec<GraphTensor>) -> GraphTensor {
         let quantized = self.quantizer.decode(codes);
+        let quantized = maybe_graph_break(quantized);
         let latent = self.pre_conv.forward(quantized);
         let hidden = latent.transpose(1, 2);
+        let hidden = maybe_graph_break(hidden);
         let transformed = self.pre_transformer.forward(hidden, &self.config);
         let latent = transformed.transpose(1, 2);
+        let latent = maybe_graph_break(latent);
         self.waveform_decoder.forward(latent)
     }
 }

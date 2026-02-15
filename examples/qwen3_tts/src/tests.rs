@@ -2723,13 +2723,12 @@ fn set_random_waveform_decoder_params(
         );
 
         rt.set_data(
-            convnext.dwconv.conv.weight.id,
+            convnext.dwconv.weight.id,
             random_vec(&mut *rng, config.latent_dim * 7),
         );
         rt.set_data(
             convnext
                 .dwconv
-                .conv
                 .bias
                 .expect("convnext depthwise conv bias")
                 .id,
@@ -3148,9 +3147,9 @@ fn test_convnext_block_shape() {
     let mut rng = StdRng::seed_from_u64(1606);
 
     rt.set_data(x.id, random_vec(&mut rng, 8 * 10));
-    rt.set_data(block.dwconv.conv.weight.id, random_vec(&mut rng, 8 * 7));
+    rt.set_data(block.dwconv.weight.id, random_vec(&mut rng, 8 * 7));
     rt.set_data(
-        block.dwconv.conv.bias.expect("convnext dwconv bias").id,
+        block.dwconv.bias.expect("convnext dwconv bias").id,
         random_vec(&mut rng, 8),
     );
     rt.set_data(

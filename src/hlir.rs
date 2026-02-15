@@ -889,7 +889,7 @@ impl EgglogOp for Mul {
     fn rewrites(&self) -> Vec<String> {
         vec![
             "(rule
-           ((= ?e (Mul ?shape ?inp_a ?a ?inp_b ?b ?o)) (= ?dty (dtype ?inp_a)) (= ?dty (dtype ?inp_b)))
+           ((= ?e (Mul ?shape ?inp_a ?a ?inp_b ?b ?o)) (= ?dty (dtype ?inp_a)))
            ((set (dtype ?e) ?dty))
         )"
             .to_string(),

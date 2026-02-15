@@ -258,9 +258,32 @@ impl Graph {
         // Build e-graphs only for representative chunks
         self.egraphs = groups
             .iter()
-            .map(|g| {
+            .enumerate()
+            .map(|(group_idx, g)| {
                 let (ref program, ref root) = egglog_texts[g.representative];
-                run_egglog(program, root, ops, cleanup_hlir).unwrap()
+                let program_lines = program.lines().count();
+                match run_egglog(program, root, ops, cleanup_hlir) {
+                    Ok(egraph) => egraph,
+                    Err(e) => {
+                        eprintln!(
+                            "\n[egglog FAILED] group {}/{} (representative chunk {}, {} members, {} egglog lines)",
+                            group_idx,
+                            groups.len(),
+                            g.representative,
+                            g.members.len(),
+                            program_lines,
+                        );
+                        eprintln!("[egglog FAILED] root: {}", root);
+                        eprintln!("[egglog FAILED] error: {}", e);
+                        // Print the full egglog program for diagnostics
+                        eprintln!("[egglog FAILED] --- full program ---");
+                        for (i, line) in program.lines().enumerate() {
+                            eprintln!("  {:>4} | {}", i + 1, line);
+                        }
+                        eprintln!("[egglog FAILED] --- end program ---");
+                        panic!("egglog failed on group {group_idx} (chunk {}): {e}", g.representative);
+                    }
+                }
             })
             .collect();
 
@@ -893,7 +916,46 @@ fn build_chunk_remaps(
         node_remap.insert(*r, *t);
     }
 
-    // 4. CustomOpHLIR ID remapping: match positionally by sorted HLIR node index
+    // 4. Real Output node remapping: match positionally by sorted HLIR index.
+    // Each chunk may have real Output ops (from .output() calls). The Output.node
+    // field references the HLIR index of the wrapped tensor. When re-extracting
+    // from the representative's egraph, these values must be remapped.
+    let rep_output_nodes: Vec<usize> = rep_desc
+        .nodes
+        .iter()
+        .filter_map(|n| {
+            hlir_graph
+                .node_weight(*n)
+                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::Output>())
+                .map(|op| op.node)
+        })
+        .sorted()
+        .collect();
+    let target_output_nodes: Vec<usize> = target_desc
+        .nodes
+        .iter()
+        .filter_map(|n| {
+            hlir_graph
+                .node_weight(*n)
+                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::Output>())
+                .map(|op| op.node)
+        })
+        .sorted()
+        .collect();
+    assert_eq!(
+        rep_output_nodes.len(),
+        target_output_nodes.len(),
+        "Real Output node count mismatch: rep has {}, target has {}",
+        rep_output_nodes.len(),
+        target_output_nodes.len()
+    );
+    for (r, t) in rep_output_nodes.iter().zip(&target_output_nodes) {
+        if r != t {
+            node_remap.insert(*r, *t);
+        }
+    }
+
+    // 5. CustomOpHLIR ID remapping: match positionally by sorted HLIR node index
     let mut custom_op_id_remap: FxHashMap<usize, usize> = FxHashMap::default();
     let rep_custom_ops: Vec<usize> = rep_desc
         .nodes
