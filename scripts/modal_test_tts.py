@@ -8,6 +8,7 @@ This script:
 1. Builds the qwen3_tts binary with --features cuda on an A100 GPU
 2. Downloads Qwen3-TTS model weights from HuggingFace
 3. Runs inference with RUST_BACKTRACE=1 for diagnostics
+4. Persists .luminal_cache/ between runs to skip egglog compilation
 """
 
 import modal
@@ -15,8 +16,14 @@ import modal
 # Persistent volume for model weights (survives across runs)
 model_volume = modal.Volume.from_name("qwen3-tts-weights", create_if_missing=True)
 
+# Persistent volume for e-graph compilation cache
+cache_volume = modal.Volume.from_name("luminal-egraph-cache", create_if_missing=True)
+
 LOCAL_REPO = "/Users/olety/Desktop/code/oneiron-luminal"
 MOUNT_PATH = "/root/luminal"
+
+# Cache directory on the volume
+CACHE_DIR = "/cache/luminal_cache"
 
 # Two HF repos needed by the binary (configured via env vars)
 MAIN_MODEL_REPO = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
@@ -104,7 +111,10 @@ def run_streaming(cmd, env=None, cwd=None):
 @app.function(
     gpu="A100-80GB:1",
     timeout=3600,  # 60 minutes
-    volumes={"/models": model_volume},
+    volumes={
+        "/models": model_volume,
+        "/cache": cache_volume,
+    },
 )
 def test_cuda_inference():
     import subprocess
@@ -113,6 +123,17 @@ def test_cuda_inference():
     # Print GPU info
     run_streaming("nvidia-smi")
     run_streaming("nvcc --version")
+
+    # Show cache status
+    if os.path.exists(CACHE_DIR):
+        cache_files = os.listdir(CACHE_DIR)
+        total_size = sum(os.path.getsize(os.path.join(CACHE_DIR, f)) for f in cache_files)
+        print(f"\nCache: {len(cache_files)} files ({total_size / 1024 / 1024:.1f} MB)", flush=True)
+        for f in sorted(cache_files):
+            size = os.path.getsize(os.path.join(CACHE_DIR, f))
+            print(f"  {f} ({size / 1024:.1f} KB)", flush=True)
+    else:
+        print("\nCache: empty (first run)", flush=True)
 
     # Download model weights using Python API
     print("\nDownloading model weights...", flush=True)
@@ -150,8 +171,16 @@ def test_cuda_inference():
             "QWEN3_TTS_TOKENIZER_DIR": TOKENIZER_DIR,
             "RUST_BACKTRACE": "1",
             "QWEN3_TTS_MAX_FRAMES": "100",
+            "LUMINAL_CACHE_DIR": CACHE_DIR,
         },
     )
+
+    # Commit cache so it persists for next run
+    if os.path.exists(CACHE_DIR):
+        cache_files = os.listdir(CACHE_DIR)
+        total_size = sum(os.path.getsize(os.path.join(CACHE_DIR, f)) for f in cache_files)
+        print(f"\nCommitting {len(cache_files)} cache files ({total_size / 1024 / 1024:.1f} MB)...", flush=True)
+    cache_volume.commit()
 
     status = "success" if rc == 0 else "failed"
     print(f"\nInference {status} (exit code: {rc})", flush=True)
