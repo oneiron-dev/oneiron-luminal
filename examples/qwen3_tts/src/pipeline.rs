@@ -41,6 +41,266 @@ pub fn sample_greedy(logits: &[f32], vocab_size: usize) -> Vec<u32> {
         .collect()
 }
 
+// ===== Helper structs for compiled graph reuse =====
+
+struct MatmulIds {
+    slice_input: GraphTensor,
+    weight_input: GraphTensor,
+    accum_input: GraphTensor,
+    output: GraphTensor,
+}
+
+struct SnakeBetaIds {
+    input: GraphTensor,
+    alpha: GraphTensor,
+    beta: GraphTensor,
+    output: GraphTensor,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct BlockShapes {
+    in_dim: usize,
+    out_dim: usize,
+    hidden_len: usize,
+    rate: usize,
+    kernel_size: usize,
+    upsampled_len: usize,
+    padded_len: usize,
+    out_len: usize,
+    target_len: usize,
+}
+
+struct BlockGraphs {
+    // Snake + upsample sub-stage (named tensors, compiled with weights)
+    snake_up_cx: Graph,
+    snake_up_rt: backend::Rt,
+    snake_up_input: GraphTensor,
+    snake_up_output: GraphTensor,
+
+    // Upsample conv matmul (unnamed tensors)
+    up_conv_cx: Graph,
+    up_conv_rt: backend::Rt,
+    up_conv_ids: MatmulIds,
+
+    // Residual SnakeBeta (unnamed tensors, reused for all 6 calls)
+    res_snake_cx: Graph,
+    res_snake_rt: backend::Rt,
+    res_snake_ids: SnakeBetaIds,
+
+    // Residual conv matmul (unnamed tensors, reused for all 6 calls)
+    res_conv_cx: Graph,
+    res_conv_rt: backend::Rt,
+    res_conv_ids: MatmulIds,
+}
+
+fn compute_block_shapes(
+    num_frames: usize,
+    config: &SpeechDecoderConfig,
+) -> (usize, Vec<BlockShapes>) {
+    // Stage 2a: upsample by upsampling_ratios, then initial_conv (preserves length)
+    let mut s2a_len = num_frames;
+    for ratio in &config.upsampling_ratios {
+        s2a_len *= ratio;
+    }
+
+    // Decoder blocks
+    let mut hidden_len = s2a_len;
+    let mut in_dim = config.decoder_dim;
+    let mut block_shapes = Vec::new();
+
+    for (i, &rate) in config.upsample_rates.iter().enumerate() {
+        let out_dim = config.decoder_dim / (1 << (i + 1));
+        let kernel_size = 2 * rate;
+        let upsampled_len = (hidden_len - 1) * rate + 1;
+        let conv_padding = kernel_size - 1;
+        let padded_len = upsampled_len + 2 * conv_padding;
+        let out_len = upsampled_len + conv_padding;
+        let target_len = hidden_len * rate;
+
+        block_shapes.push(BlockShapes {
+            in_dim,
+            out_dim,
+            hidden_len,
+            rate,
+            kernel_size,
+            upsampled_len,
+            padded_len,
+            out_len,
+            target_len,
+        });
+
+        hidden_len = target_len;
+        in_dim = out_dim;
+    }
+
+    (s2a_len, block_shapes)
+}
+
+/// Build and compile a reusable matmul+accumulate graph with unnamed tensors.
+fn compile_matmul_graph(
+    seq_len: usize,
+    in_ch: usize,
+    out_ch: usize,
+) -> (Graph, backend::Rt, MatmulIds) {
+    let mut cx = Graph::new();
+    let slice_input = cx.tensor((1, seq_len, in_ch));
+    let weight_input = cx.tensor((in_ch, out_ch));
+    let accum_input = cx.tensor((1, seq_len, out_ch));
+    let partial = slice_input.matmul(weight_input);
+    let result = accum_input + partial;
+    let output = result.output();
+    let rt = backend::compile(&mut cx, &HashMap::new());
+    (
+        cx,
+        rt,
+        MatmulIds {
+            slice_input,
+            weight_input,
+            accum_input,
+            output,
+        },
+    )
+}
+
+/// Build and compile a reusable SnakeBeta graph with unnamed tensors.
+fn compile_snake_beta_graph(
+    channels: usize,
+    seq_len: usize,
+) -> (Graph, backend::Rt, SnakeBetaIds) {
+    let mut cx = Graph::new();
+    let input = cx.tensor((1, channels, seq_len));
+    let alpha = cx.tensor(channels);
+    let beta_t = cx.tensor(channels);
+
+    // Inline SnakeBeta::forward with unnamed tensors
+    let (batch, _, time) = input.dims3();
+    let alpha_exp = alpha.exp().expand_dim(0, batch).expand_dim(2, time);
+    let beta_exp = beta_t.exp().expand_dim(0, batch).expand_dim(2, time);
+    let sin_val = (input * alpha_exp).sin();
+    let out = input + (sin_val * sin_val) / (beta_exp + 1e-9);
+    let output = out.output();
+
+    let rt = backend::compile(&mut cx, &HashMap::new());
+    (
+        cx,
+        rt,
+        SnakeBetaIds {
+            input,
+            alpha,
+            beta: beta_t,
+            output,
+        },
+    )
+}
+
+/// Execute SnakeBeta using a pre-compiled graph with weights from the map.
+fn execute_snake_beta(
+    hidden_data: &mut Vec<f32>,
+    snake_cx: &Graph,
+    snake_rt: &mut backend::Rt,
+    snake_ids: &SnakeBetaIds,
+    alpha_name: &str,
+    beta_name: &str,
+    weights: &HashMap<String, Vec<f32>>,
+) {
+    backend::set_data(snake_rt, snake_ids.input.id, std::mem::take(hidden_data));
+    backend::set_data(
+        snake_rt,
+        snake_ids.alpha.id,
+        weights
+            .get(alpha_name)
+            .unwrap_or_else(|| panic!("missing: {alpha_name}"))
+            .clone(),
+    );
+    backend::set_data(
+        snake_rt,
+        snake_ids.beta.id,
+        weights
+            .get(beta_name)
+            .unwrap_or_else(|| panic!("missing: {beta_name}"))
+            .clone(),
+    );
+    snake_rt.execute(&snake_cx.dyn_map);
+    *hidden_data = backend::get_f32(snake_rt, snake_ids.output.id);
+}
+
+/// Execute causal conv1d using a pre-compiled matmul graph.
+///
+/// Weight layout: `[out_ch, in_ch, kernel]` (ConvND groups=1, row-major).
+fn causal_conv1d_with_matmul(
+    hidden_data: &mut Vec<f32>,
+    matmul_cx: &Graph,
+    matmul_rt: &mut backend::Rt,
+    matmul_ids: &MatmulIds,
+    in_ch: usize,
+    out_ch: usize,
+    seq_len: usize,
+    kernel: usize,
+    dilation: usize,
+    weight_prefix: &str,
+    weights: &HashMap<String, Vec<f32>>,
+) {
+    // 1. CPU-side causal padding (left only)
+    let left_pad = dilation * (kernel - 1);
+    let padded_len = seq_len + left_pad;
+    let mut padded_data = vec![0.0f32; in_ch * padded_len];
+    for c in 0..in_ch {
+        for t in 0..seq_len {
+            padded_data[c * padded_len + left_pad + t] = hidden_data[c * seq_len + t];
+        }
+    }
+
+    // 2. Load weight + bias from weights map (CPU)
+    let weight_name = format!("{weight_prefix}.weight");
+    let weight_data = weights
+        .get(&weight_name)
+        .unwrap_or_else(|| panic!("missing weight: {weight_name}"));
+    let bias_name = format!("{weight_prefix}.bias");
+    let bias_data = weights.get(&bias_name);
+
+    // 3. Loop over kernel positions with CPU-side slicing
+    let mut accum_data = vec![0.0f32; seq_len * out_ch];
+    for k in 0..kernel {
+        // CPU: extract padded[:, :, k*d .. k*d + seq_len] and transpose to [1, seq_len, in_ch]
+        let mut slice_t_data = vec![0.0f32; seq_len * in_ch];
+        for c in 0..in_ch {
+            for t in 0..seq_len {
+                slice_t_data[t * in_ch + c] = padded_data[c * padded_len + k * dilation + t];
+            }
+        }
+
+        // CPU: extract weight[:, :, k] transposed to [in_ch, out_ch]
+        // weight layout: [out_ch, in_ch, kernel] row-major
+        let mut weight_k_data = vec![0.0f32; in_ch * out_ch];
+        for oc in 0..out_ch {
+            for ic in 0..in_ch {
+                weight_k_data[ic * out_ch + oc] =
+                    weight_data[oc * in_ch * kernel + ic * kernel + k];
+            }
+        }
+
+        backend::set_data(matmul_rt, matmul_ids.slice_input.id, slice_t_data);
+        backend::set_data(matmul_rt, matmul_ids.weight_input.id, weight_k_data);
+        backend::set_data(matmul_rt, matmul_ids.accum_input.id, accum_data);
+        matmul_rt.execute(&matmul_cx.dyn_map);
+        accum_data = backend::get_f32(matmul_rt, matmul_ids.output.id);
+    }
+
+    // 4. Transpose accum [1, seq_len, out_ch] → [1, out_ch, seq_len] and add bias
+    let mut result_data = vec![0.0f32; out_ch * seq_len];
+    for c in 0..out_ch {
+        let bias_val = bias_data.map_or(0.0, |b| b[c]);
+        for t in 0..seq_len {
+            result_data[c * seq_len + t] = accum_data[t * out_ch + c] + bias_val;
+        }
+    }
+
+    *hidden_data = result_data;
+}
+
+// ===== generate_frames (Steps 1-3: hoisted compilation) =====
+
 pub fn generate_frames(
     talker_config: &TalkerConfig,
     predictor_config: &CodePredictorConfig,
@@ -69,42 +329,47 @@ pub fn generate_frames(
     }
 
     let mut all_frames = Vec::with_capacity(num_frames);
-
-    // ===== PREFILL PHASE (Talker) =====
-    // Process per-layer to keep peak GPU memory low — each layer gets its own
-    // Graph/compile/execute/drop cycle so intermediate buffers are freed between layers.
     let t0 = std::time::Instant::now();
 
-    // --- Per-layer transformer pass ---
-    let mut hidden_data = initial_embeds.to_vec();
-    let mut prefill_k: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
-    let mut prefill_v: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
+    // ===== COMPILE PHASE =====
+    // All graph constructions and compilations happen upfront.
+    // This separates compile time from execution time and enables graph dedup.
 
+    // --- 1. Prefill: single graph with all layers + graph breaks ---
+    // luminal's build_grouped_egraphs hashes each chunk after normalizing
+    // Input labels — all layer chunks are structurally identical, so egglog
+    // runs once and re-extracts LLIR with remapped node IDs.
+    let mut prefill_cx = Graph::new();
+    let prefill_input = prefill_cx.tensor((1, prompt_len, hidden));
+    let mut h = prefill_input;
+    let mut prefill_k_outs = Vec::new();
+    let mut prefill_v_outs = Vec::new();
+    let mut prefill_hidden_outs = Vec::new();
     for layer_idx in 0..n_layers {
-        let mut cx = Graph::new();
-        let input = cx.tensor((1, prompt_len, hidden));
-        let layer = TalkerLayer::new(&mut cx, talker_config, layer_idx);
-        let (out, k_cache, v_cache) = layer.forward_with_kv(input, talker_config);
-        let out_t = out.output();
-        let k_t = k_cache.output();
-        let v_t = v_cache.output();
-
-        let mut rt = backend::compile(&mut cx, weights);
-        backend::set_data(&mut rt, input.id, hidden_data);
-        rt.execute(&cx.dyn_map);
-
-        hidden_data = backend::get_f32(&rt, out_t.id);
-        prefill_k.push(backend::get_f32(&rt, k_t.id));
-        prefill_v.push(backend::get_f32(&rt, v_t.id));
-        // rt dropped here, freeing GPU memory
+        let layer = TalkerLayer::new(&mut prefill_cx, talker_config, layer_idx);
+        let (out, k_cache, v_cache) = layer.forward_with_kv(h, talker_config);
+        prefill_k_outs.push(k_cache.output());
+        prefill_v_outs.push(v_cache.output());
+        // Mark hidden output on ALL layers so every chunk has the same number
+        // of Output nodes (3: k, v, hidden). This ensures egglog dedup groups
+        // them correctly — mismatched Output counts trigger an assertion.
+        // We only read the last layer's hidden output, but the others are cheap.
+        prefill_hidden_outs.push(out.output());
+        if layer_idx < n_layers - 1 {
+            h = crate::maybe_graph_break(out);
+        } else {
+            h = out;
+        }
     }
+    let prefill_hidden_out = *prefill_hidden_outs.last().unwrap();
+    let mut prefill_rt = backend::compile(&mut prefill_cx, weights);
     eprintln!(
-        "  [prefill/talker] {} layers done in {:.1}s",
+        "  [compile] prefill ({} layers, 1 graph) in {:.1}s",
         n_layers,
         t0.elapsed().as_secs_f32()
     );
 
-    // --- Final stage: norm + logits + argmax + embed ---
+    // --- 2. Final stage: norm + logits + argmax + embed ---
     let mut final_cx = Graph::new();
     let final_input = final_cx.tensor((1, prompt_len, hidden));
     let final_norm = LayerNorm::new(
@@ -123,12 +388,10 @@ pub fn generate_frames(
         "talker.model.codec_embedding.weight",
         (talker_config.vocab_size, hidden),
     );
-
     let normed = final_norm.forward(final_input);
     let logits = normed.matmul(codec_head.t());
     let last_logits = logits.slice((.., (prompt_len - 1).., ..));
     let code_0 = last_logits.argmax(2);
-    // embed_codec: gather from codec_embedding using code_0
     let (batch, seq) = code_0.dims2();
     let code_0_embed = codec_embedding.gather(
         (code_0 * hidden).expand_dim(2, hidden)
@@ -138,65 +401,117 @@ pub fn generate_frames(
                 .expand_lhs([batch, seq]),
     );
     let last_hidden = normed.slice((.., (prompt_len - 1).., ..));
-
     let code_0_out = code_0.cast(DType::F32).output();
     let code_0_embed_out = code_0_embed.output();
     let last_hidden_out = last_hidden.output();
-
     let mut final_rt = backend::compile(&mut final_cx, weights);
-    backend::set_data(&mut final_rt, final_input.id, hidden_data);
-    final_rt.execute(&final_cx.dyn_map);
-
-    let code_0_val = backend::get_f32(&final_rt, code_0_out.id)[0] as u32;
-    if code_0_val == CODEC_EOS_ID as u32 {
-        return all_frames;
-    }
-    let code_0_embed_data = backend::get_f32(&final_rt, code_0_embed_out.id);
-    let last_hidden_data = backend::get_f32(&final_rt, last_hidden_out.id);
-
-    drop(final_rt);
     eprintln!(
-        "  [prefill/talker] complete in {:.1}s",
+        "  [compile] final stage in {:.1}s",
         t0.elapsed().as_secs_f32()
     );
 
-    // --- Graph 2: Code predictor (15 autoregressive codebook steps) ---
+    // --- 3. Code predictor (single instance, reused for prefill + decode) ---
     let mut pred_cx = Graph::new();
     let code_predictor = CodePredictorModel::new(&mut pred_cx, predictor_config.clone());
     let pred_hidden_input = pred_cx.tensor((1, 1, hidden));
     let pred_code0_embed_input = pred_cx.tensor((1, 1, hidden));
-
     let pred_out =
         code_predictor.generate_codes(pred_hidden_input, pred_code0_embed_input);
-
     let mut pred_codec_sum = pred_code0_embed_input;
     for embed in &pred_out.embeds {
         pred_codec_sum = pred_codec_sum + *embed;
     }
-
     let pred_code_outs: Vec<_> = pred_out
         .codes
         .iter()
         .map(|code| code.cast(DType::F32).output())
         .collect();
     let pred_codec_sum_out = pred_codec_sum.output();
-
-    eprintln!(
-        "  [prefill/predictor] graph built in {:.1}s",
-        t0.elapsed().as_secs_f32()
-    );
     let mut pred_rt = backend::compile(&mut pred_cx, weights);
     eprintln!(
-        "  [prefill/predictor] compiled in {:.1}s",
+        "  [compile] code predictor in {:.1}s",
         t0.elapsed().as_secs_f32()
     );
+
+    // --- 4. Decode talker ---
+    let max_seq = prompt_len + num_frames;
+    let mut decode_cx = Graph::new();
+    let decode_talker = TalkerModel::new(&mut decode_cx, talker_config.clone());
+    let new_embed_input = decode_cx.tensor((1, 1, hidden));
+    let pos_input = decode_cx.tensor(1);
+    let mask_input = decode_cx.tensor((1, 1, 1, max_seq + 1));
+    let kv_inputs: Vec<(GraphTensor, GraphTensor)> = (0..n_layers)
+        .map(|_| {
+            (
+                decode_cx.tensor((1, n_kv_heads, max_seq, head_dim)),
+                decode_cx.tensor((1, n_kv_heads, max_seq, head_dim)),
+            )
+        })
+        .collect();
+    let (decode_logits, decode_normed, decode_new_kv_outs) =
+        decode_talker.decode_fixed(new_embed_input, &kv_inputs, mask_input, pos_input);
+    let decode_code_0 = decode_logits.argmax(2);
+    let decode_code_0_embed = decode_talker.embed_codec(decode_code_0);
+    let decode_code_0_out = decode_code_0.cast(DType::F32).output();
+    let decode_code_0_embed_out = decode_code_0_embed.output();
+    let decode_normed_out = decode_normed.output();
+    let decode_new_kv_cache_outs: Vec<_> = decode_new_kv_outs
+        .iter()
+        .map(|(k, v)| (k.output(), v.output()))
+        .collect();
+    let mut decode_rt = backend::compile(&mut decode_cx, weights);
+    eprintln!(
+        "  [compile] decode talker in {:.1}s",
+        t0.elapsed().as_secs_f32()
+    );
+
+    let compile_time = t0.elapsed();
+    eprintln!(
+        "  [generate_frames] all compiled in {:.1}s",
+        compile_time.as_secs_f32()
+    );
+
+    // ===== EXECUTE PHASE =====
+    let t1 = std::time::Instant::now();
+
+    // --- Execute prefill ---
+    backend::set_data(&mut prefill_rt, prefill_input.id, initial_embeds.to_vec());
+    prefill_rt.execute(&prefill_cx.dyn_map);
+    let hidden_data = backend::get_f32(&prefill_rt, prefill_hidden_out.id);
+    let prefill_k: Vec<Vec<f32>> = prefill_k_outs
+        .iter()
+        .map(|k| backend::get_f32(&prefill_rt, k.id))
+        .collect();
+    let prefill_v: Vec<Vec<f32>> = prefill_v_outs
+        .iter()
+        .map(|v| backend::get_f32(&prefill_rt, v.id))
+        .collect();
+    drop(prefill_rt);
+    eprintln!(
+        "  [execute] prefill ({} layers) in {:.1}s",
+        n_layers,
+        t1.elapsed().as_secs_f32()
+    );
+
+    // --- Execute final stage ---
+    backend::set_data(&mut final_rt, final_input.id, hidden_data);
+    final_rt.execute(&final_cx.dyn_map);
+    let code_0_val = backend::get_f32(&final_rt, code_0_out.id)[0] as u32;
+    if code_0_val == CODEC_EOS_ID as u32 {
+        return all_frames;
+    }
+    let code_0_embed_data = backend::get_f32(&final_rt, code_0_embed_out.id);
+    let last_hidden_data = backend::get_f32(&final_rt, last_hidden_out.id);
+    drop(final_rt);
+    eprintln!(
+        "  [execute] final stage in {:.1}s",
+        t1.elapsed().as_secs_f32()
+    );
+
+    // --- Execute code predictor (prefill frame 0) ---
     backend::set_data(&mut pred_rt, pred_hidden_input.id, last_hidden_data);
     backend::set_data(&mut pred_rt, pred_code0_embed_input.id, code_0_embed_data);
     pred_rt.execute(&pred_cx.dyn_map);
-    eprintln!(
-        "  [prefill/predictor] executed in {:.1}s",
-        t0.elapsed().as_secs_f32()
-    );
 
     let pred_codes: Vec<u32> = pred_code_outs
         .iter()
@@ -221,15 +536,13 @@ pub fn generate_frames(
         .zip(tts_pad_embed.iter())
         .map(|(codec, tts)| codec + tts)
         .collect();
+    eprintln!(
+        "  [execute] predictor (frame 0) in {:.1}s",
+        t1.elapsed().as_secs_f32()
+    );
 
-    drop(pred_rt);
-    eprintln!("  [prefill/predictor] runtime dropped, freeing GPU memory");
-
-    // ===== DECODE PHASE =====
-    // Split into separate talker decode and code predictor graphs (same
-    // rationale as prefill). The code predictor graph is reused from prefill
-    // since its inputs (hidden [1,1,H] + code_0_embed [1,1,H]) are identical.
-    let max_seq = prompt_len + num_frames;
+    // --- Decode loop ---
+    // Set up KV buffers from prefill caches
     let kv_buf_size = n_kv_heads * max_seq * head_dim;
     let prompt_kv_size = n_kv_heads * prompt_len * head_dim;
     let mut k_bufs: Vec<Vec<f32>> = vec![vec![0.0; kv_buf_size]; n_layers];
@@ -259,76 +572,11 @@ pub fn generate_frames(
     for v in attn_mask.iter_mut().take(prompt_len) {
         *v = 0.0;
     }
-    // Last position is always the concat slot for the current token's K/V.
     attn_mask[max_seq] = 0.0;
-
-    // --- Decode talker graph (28 layers + argmax + embed_codec) ---
-    let mut decode_cx = Graph::new();
-    let decode_talker = TalkerModel::new(&mut decode_cx, talker_config.clone());
-    let new_embed_input = decode_cx.tensor((1, 1, hidden));
-    let pos_input = decode_cx.tensor(1);
-    let mask_input = decode_cx.tensor((1, 1, 1, max_seq + 1));
-    let kv_inputs: Vec<(GraphTensor, GraphTensor)> = (0..n_layers)
-        .map(|_| {
-            (
-                decode_cx.tensor((1, n_kv_heads, max_seq, head_dim)),
-                decode_cx.tensor((1, n_kv_heads, max_seq, head_dim)),
-            )
-        })
-        .collect();
-
-    let (decode_logits, decode_normed, decode_new_kv_outs) =
-        decode_talker.decode_fixed(new_embed_input, &kv_inputs, mask_input, pos_input);
-
-    let decode_code_0 = decode_logits.argmax(2);
-    let decode_code_0_embed = decode_talker.embed_codec(decode_code_0);
-
-    let decode_code_0_out = decode_code_0.cast(DType::F32).output();
-    let decode_code_0_embed_out = decode_code_0_embed.output();
-    let decode_normed_out = decode_normed.output();
-    let decode_new_kv_cache_outs: Vec<_> = decode_new_kv_outs
-        .iter()
-        .map(|(k, v)| (k.output(), v.output()))
-        .collect();
-
-    eprintln!(
-        "  [decode/talker] graph built in {:.1}s",
-        t0.elapsed().as_secs_f32()
-    );
-    let mut decode_rt = backend::compile(&mut decode_cx, weights);
-    eprintln!(
-        "  [decode/talker] compiled in {:.1}s",
-        t0.elapsed().as_secs_f32()
-    );
-
-    // Reuse code predictor from prefill (already compiled as pred_rt)
-    // Reconstruct it since it was dropped — same graph structure, same weights
-    let mut pred_cx2 = Graph::new();
-    let code_predictor2 = CodePredictorModel::new(&mut pred_cx2, predictor_config.clone());
-    let pred_hidden_input2 = pred_cx2.tensor((1, 1, hidden));
-    let pred_code0_embed_input2 = pred_cx2.tensor((1, 1, hidden));
-    let pred_out2 =
-        code_predictor2.generate_codes(pred_hidden_input2, pred_code0_embed_input2);
-    let mut pred_codec_sum2 = pred_code0_embed_input2;
-    for embed in &pred_out2.embeds {
-        pred_codec_sum2 = pred_codec_sum2 + *embed;
-    }
-    let pred_code_outs2: Vec<_> = pred_out2
-        .codes
-        .iter()
-        .map(|code| code.cast(DType::F32).output())
-        .collect();
-    let pred_codec_sum_out2 = pred_codec_sum2.output();
-    let mut pred_rt2 = backend::compile(&mut pred_cx2, weights);
-    eprintln!(
-        "  [decode/predictor] compiled in {:.1}s",
-        t0.elapsed().as_secs_f32()
-    );
 
     for frame in 1..num_frames {
         let p = prompt_len + frame - 1;
 
-        // Small inputs: always full-upload (tiny data ~10 KB)
         backend::set_data(&mut decode_rt, new_embed_input.id, next_embed.clone());
         backend::set_data(&mut decode_rt, pos_input.id, vec![p as f32]);
         backend::set_data(&mut decode_rt, mask_input.id, attn_mask.clone());
@@ -354,14 +602,14 @@ pub fn generate_frames(
         let code_0_embed_data = backend::get_f32(&decode_rt, decode_code_0_embed_out.id);
         let normed_data = backend::get_f32(&decode_rt, decode_normed_out.id);
 
-        // Run code predictor
-        backend::set_data(&mut pred_rt2, pred_hidden_input2.id, normed_data);
-        backend::set_data(&mut pred_rt2, pred_code0_embed_input2.id, code_0_embed_data);
-        pred_rt2.execute(&pred_cx2.dyn_map);
+        // Reuse same pred_rt for code predictor (no rebuild needed)
+        backend::set_data(&mut pred_rt, pred_hidden_input.id, normed_data);
+        backend::set_data(&mut pred_rt, pred_code0_embed_input.id, code_0_embed_data);
+        pred_rt.execute(&pred_cx.dyn_map);
 
-        let pred_codes: Vec<u32> = pred_code_outs2
+        let pred_codes: Vec<u32> = pred_code_outs
             .iter()
-            .map(|code| backend::get_f32(&pred_rt2, code.id)[0] as u32)
+            .map(|code| backend::get_f32(&pred_rt, code.id)[0] as u32)
             .collect();
         let mut frame_codes = vec![code_0_val];
         frame_codes.extend(pred_codes);
@@ -370,7 +618,7 @@ pub fn generate_frames(
         eprintln!(
             "  [decode] frame {} done at {:.1}s",
             frame,
-            t0.elapsed().as_secs_f32()
+            t1.elapsed().as_secs_f32()
         );
 
         // Scatter new K/V into CPU buffers AND do partial GPU updates for next frame
@@ -393,11 +641,9 @@ pub fn generate_frames(
                 let dst_start = head * max_seq * head_dim + p * head_dim;
                 let dst_end = dst_start + head_dim;
 
-                // Update CPU buffer (keep for correctness)
                 k_bufs[i][dst_start..dst_end].copy_from_slice(&new_k[src_start..src_end]);
                 v_bufs[i][dst_start..dst_end].copy_from_slice(&new_v[src_start..src_end]);
 
-                // CUDA: partial GPU update - write only head_dim floats at byte offset
                 if cfg!(feature = "cuda") {
                     let byte_offset = dst_start * 4;
                     backend::update_data_slice(
@@ -417,7 +663,7 @@ pub fn generate_frames(
         }
         attn_mask[p] = 0.0;
 
-        let codec_sum_data = backend::get_f32(&pred_rt2, pred_codec_sum_out2.id);
+        let codec_sum_data = backend::get_f32(&pred_rt, pred_codec_sum_out.id);
         assert_eq!(
             codec_sum_data.len(),
             hidden,
@@ -429,6 +675,14 @@ pub fn generate_frames(
             .map(|(codec, tts)| codec + tts)
             .collect();
     }
+
+    let exec_time = t1.elapsed();
+    eprintln!(
+        "  [generate_frames] compile: {:.1}s, execute: {:.1}s, total: {:.1}s",
+        compile_time.as_secs_f32(),
+        exec_time.as_secs_f32(),
+        t0.elapsed().as_secs_f32()
+    );
 
     all_frames
 }
@@ -669,6 +923,8 @@ pub fn assemble_prompt_embeds(
     )
 }
 
+// ===== decode_speech (Step 4: hoisted compilation + SnakeBeta/matmul reuse) =====
+
 pub fn decode_speech(
     frames: &[Vec<u32>],
     speech_config: &SpeechDecoderConfig,
@@ -700,7 +956,15 @@ pub fn decode_speech(
         }
     }
 
-    // ===== Stage 1: Quantizer + pre_conv + pre_transformer → latent =====
+    // Pre-calculate all shapes for deterministic compilation
+    let (s2a_hidden_len, block_shapes) = compute_block_shapes(num_frames, speech_config);
+    let latent_dim = speech_config.latent_dim;
+    let num_blocks = speech_config.upsample_rates.len();
+
+    // ===== COMPILE PHASE =====
+    // All graphs are built and compiled before any execution.
+
+    // --- Stage 1: quantizer + pre_conv + pre_transformer ---
     let mut cx1 = Graph::new();
     let decoder = SpeechDecoder::new(&mut cx1, speech_config.clone());
     let code_tensors: Vec<GraphTensor> = (0..num_codebooks)
@@ -709,198 +973,222 @@ pub fn decode_speech(
     let quantized = decoder.quantizer.decode(code_tensors.clone());
     let quantized = crate::maybe_graph_break(quantized);
     let latent = decoder.pre_conv.forward(quantized);
-    let hidden = latent.transpose(1, 2);
-    let hidden = crate::maybe_graph_break(hidden);
-    let transformed = decoder.pre_transformer.forward(hidden, speech_config);
+    let s1_hidden = latent.transpose(1, 2);
+    let s1_hidden = crate::maybe_graph_break(s1_hidden);
+    let transformed = decoder.pre_transformer.forward(s1_hidden, speech_config);
     let latent_out_tensor = transformed.transpose(1, 2);
     let latent_out = latent_out_tensor.output();
-
-    eprintln!(
-        "  [speech_decode/stage1] graph built in {:.1}s",
-        t0.elapsed().as_secs_f32()
-    );
     let mut rt1 = backend::compile(&mut cx1, weights);
     eprintln!(
-        "  [speech_decode/stage1] compiled in {:.1}s",
+        "  [compile] speech stage1 in {:.1}s",
         t0.elapsed().as_secs_f32()
     );
+
+    // --- Stage 2a: initial_upsample + initial_conv ---
+    let latent_len = num_frames;
+    let mut s2a_cx = Graph::new();
+    let s2a_input = s2a_cx.tensor((1, latent_dim, latent_len));
+    let mut s2a_h = s2a_input;
+    for (i, ratio) in speech_config.upsampling_ratios.iter().copied().enumerate() {
+        let trans_conv =
+            CausalTransConv1d::new(latent_dim, latent_dim, ratio, ratio, true, &mut s2a_cx);
+        trans_conv
+            .conv
+            .weight
+            .set_name(&format!("decoder.upsample.{i}.0.conv.weight"));
+        if let Some(bias) = trans_conv.conv.bias {
+            bias.set_name(&format!("decoder.upsample.{i}.0.conv.bias"));
+        }
+        let convnext =
+            ConvNeXtBlock::new(latent_dim, format!("decoder.upsample.{i}.1"), &mut s2a_cx);
+        s2a_h = trans_conv.forward(s2a_h);
+        s2a_h = crate::maybe_graph_break(s2a_h);
+        s2a_h = convnext.forward(s2a_h);
+        s2a_h = crate::maybe_graph_break(s2a_h);
+    }
+    let initial_conv =
+        CausalConv1d::new(latent_dim, speech_config.decoder_dim, 7, 1, true, &mut s2a_cx, 1);
+    initial_conv
+        .conv
+        .weight
+        .set_name("decoder.decoder.0.conv.weight");
+    if let Some(bias) = initial_conv.conv.bias {
+        bias.set_name("decoder.decoder.0.conv.bias");
+    }
+    s2a_h = initial_conv.forward(s2a_h);
+    let s2a_output = s2a_h.output();
+    let mut s2a_rt = backend::compile(&mut s2a_cx, weights);
+    eprintln!(
+        "  [compile] speech stage2a in {:.1}s",
+        t0.elapsed().as_secs_f32()
+    );
+
+    // --- Per-block graphs (4 graphs per block, compiled upfront) ---
+    let mut compiled_blocks: Vec<BlockGraphs> = Vec::with_capacity(num_blocks);
+    for (i, shapes) in block_shapes.iter().enumerate() {
+        let block_prefix = format!("decoder.decoder.{}", i + 1);
+        let stage_name = format!("stage2{}", (b'b' + i as u8) as char);
+
+        // 1. Snake + upsample + pad graph (named tensors)
+        let mut su_cx = Graph::new();
+        let su_input = su_cx.tensor((1, shapes.in_dim, shapes.hidden_len));
+        let snake = SnakeBeta::new(
+            shapes.in_dim,
+            &format!("{block_prefix}.block.0.alpha"),
+            &format!("{block_prefix}.block.0.beta"),
+            &mut su_cx,
+        );
+        let su_h = snake.forward(su_input);
+        let upsampled = su_h
+            .expand_dim(3, 1)
+            .pad_along(0, shapes.rate - 1, 3, 0.0)
+            .merge_dims(2, 3)
+            .slice_along(..shapes.upsampled_len, 2);
+        let conv_padding = shapes.kernel_size - 1;
+        let padded = upsampled.pad(((0, 0), (0, 0), (conv_padding, conv_padding)), 0.0);
+        let su_output = padded.output();
+        let su_rt = backend::compile(&mut su_cx, weights);
+
+        // 2. Upsample conv matmul graph (unnamed tensors)
+        let (uc_cx, uc_rt, uc_ids) =
+            compile_matmul_graph(shapes.out_len, shapes.in_dim, shapes.out_dim);
+
+        // 3. Residual SnakeBeta graph (unnamed tensors, reused for all 6 calls)
+        let (rs_cx, rs_rt, rs_ids) =
+            compile_snake_beta_graph(shapes.out_dim, shapes.target_len);
+
+        // 4. Residual conv matmul graph (unnamed tensors, reused for all 6 calls)
+        let (rc_cx, rc_rt, rc_ids) =
+            compile_matmul_graph(shapes.target_len, shapes.out_dim, shapes.out_dim);
+
+        compiled_blocks.push(BlockGraphs {
+            snake_up_cx: su_cx,
+            snake_up_rt: su_rt,
+            snake_up_input: su_input,
+            snake_up_output: su_output,
+            up_conv_cx: uc_cx,
+            up_conv_rt: uc_rt,
+            up_conv_ids: uc_ids,
+            res_snake_cx: rs_cx,
+            res_snake_rt: rs_rt,
+            res_snake_ids: rs_ids,
+            res_conv_cx: rc_cx,
+            res_conv_rt: rc_rt,
+            res_conv_ids: rc_ids,
+        });
+
+        eprintln!(
+            "  [compile] speech {} (4 graphs) in {:.1}s",
+            stage_name,
+            t0.elapsed().as_secs_f32()
+        );
+    }
+
+    // --- Final stage: final_snake + final_conv + clip ---
+    let final_dim = block_shapes
+        .last()
+        .map_or(speech_config.decoder_dim, |s| s.out_dim);
+    let final_hidden_len = block_shapes
+        .last()
+        .map_or(s2a_hidden_len, |s| s.target_len);
+    let final_snake_idx = num_blocks + 1;
+    let final_conv_idx = final_snake_idx + 1;
+
+    let mut fin_cx = Graph::new();
+    let fin_input = fin_cx.tensor((1, final_dim, final_hidden_len));
+    let final_snake = SnakeBeta::new(
+        final_dim,
+        &format!("decoder.decoder.{final_snake_idx}.alpha"),
+        &format!("decoder.decoder.{final_snake_idx}.beta"),
+        &mut fin_cx,
+    );
+    let final_conv = CausalConv1d::new(final_dim, 1, 7, 1, true, &mut fin_cx, 1);
+    final_conv
+        .conv
+        .weight
+        .set_name(&format!("decoder.decoder.{final_conv_idx}.conv.weight"));
+    if let Some(bias) = final_conv.conv.bias {
+        bias.set_name(&format!("decoder.decoder.{final_conv_idx}.conv.bias"));
+    }
+    let mut fin_h = final_snake.forward(fin_input);
+    fin_h = final_conv.forward(fin_h);
+    fin_h = fin_h.clip(-1.0, 1.0);
+    let fin_output = fin_h.output();
+    let mut fin_rt = backend::compile(&mut fin_cx, weights);
+    eprintln!(
+        "  [compile] speech final in {:.1}s",
+        t0.elapsed().as_secs_f32()
+    );
+
+    let compile_time = t0.elapsed();
+    eprintln!(
+        "  [decode_speech] all compiled in {:.1}s",
+        compile_time.as_secs_f32()
+    );
+
+    // ===== EXECUTE PHASE =====
+    let t1 = std::time::Instant::now();
+
+    // --- Execute stage 1 ---
     for (i, tensor) in code_tensors.iter().enumerate() {
         backend::set_data_i32(&mut rt1, tensor.id, codes_by_codebook[i].clone());
     }
     rt1.execute(&cx1.dyn_map);
     let latent_data = backend::get_f32(&rt1, latent_out.id);
     eprintln!(
-        "  [speech_decode/stage1] executed in {:.1}s, latent size {}",
-        t0.elapsed().as_secs_f32(),
+        "  [execute] speech stage1 in {:.1}s, latent size {}",
+        t1.elapsed().as_secs_f32(),
         latent_data.len(),
     );
     drop(rt1);
 
-    // ===== Stage 2a: initial_upsample + initial_conv =====
-    let latent_dim = speech_config.latent_dim;
-    let latent_len = latent_data.len() / latent_dim;
-    assert_eq!(
-        latent_data.len(),
-        latent_dim * latent_len,
-        "latent data size must be divisible by latent_dim"
+    // --- Execute stage 2a ---
+    backend::set_data(&mut s2a_rt, s2a_input.id, latent_data);
+    s2a_rt.execute(&s2a_cx.dyn_map);
+    let mut hidden_data = backend::get_f32(&s2a_rt, s2a_output.id);
+    let mut hidden_ch = speech_config.decoder_dim;
+    let mut hidden_len = hidden_data.len() / hidden_ch;
+    eprintln!(
+        "  [execute] speech stage2a in {:.1}s, hidden [{}, {}, {}]",
+        t1.elapsed().as_secs_f32(),
+        1,
+        hidden_ch,
+        hidden_len,
     );
+    drop(s2a_rt);
 
-    let mut hidden_data = latent_data;
-    let mut hidden_ch = latent_dim;
-    let mut hidden_len = latent_len;
-
+    // --- Execute decoder blocks ---
+    for (i, (block, shapes)) in compiled_blocks
+        .iter_mut()
+        .zip(block_shapes.iter())
+        .enumerate()
     {
-        let mut cx = Graph::new();
-        let input = cx.tensor((1, hidden_ch, hidden_len));
-        let mut hidden = input;
-
-        for (i, ratio) in speech_config.upsampling_ratios.iter().copied().enumerate() {
-            let trans_conv =
-                CausalTransConv1d::new(latent_dim, latent_dim, ratio, ratio, true, &mut cx);
-            trans_conv
-                .conv
-                .weight
-                .set_name(&format!("decoder.upsample.{i}.0.conv.weight"));
-            if let Some(bias) = trans_conv.conv.bias {
-                bias.set_name(&format!("decoder.upsample.{i}.0.conv.bias"));
-            }
-            let convnext =
-                ConvNeXtBlock::new(latent_dim, format!("decoder.upsample.{i}.1"), &mut cx);
-            hidden = trans_conv.forward(hidden);
-            hidden = crate::maybe_graph_break(hidden);
-            hidden = convnext.forward(hidden);
-            hidden = crate::maybe_graph_break(hidden);
-        }
-
-        let initial_conv =
-            CausalConv1d::new(latent_dim, speech_config.decoder_dim, 7, 1, true, &mut cx, 1);
-        initial_conv
-            .conv
-            .weight
-            .set_name("decoder.decoder.0.conv.weight");
-        if let Some(bias) = initial_conv.conv.bias {
-            bias.set_name("decoder.decoder.0.conv.bias");
-        }
-        hidden = initial_conv.forward(hidden);
-        let out = hidden.output();
-
-        eprintln!(
-            "  [speech_decode/stage2a] graph built in {:.1}s",
-            t0.elapsed().as_secs_f32()
-        );
-        let mut rt = backend::compile(&mut cx, weights);
-        eprintln!(
-            "  [speech_decode/stage2a] compiled in {:.1}s",
-            t0.elapsed().as_secs_f32()
-        );
-        backend::set_data(&mut rt, input.id, hidden_data);
-        rt.execute(&cx.dyn_map);
-        hidden_data = backend::get_f32(&rt, out.id);
-        hidden_ch = speech_config.decoder_dim;
-        hidden_len = hidden_data.len() / hidden_ch;
-        eprintln!(
-            "  [speech_decode/stage2a] executed in {:.1}s, hidden [{}, {}, {}]",
-            t0.elapsed().as_secs_f32(),
-            1,
-            hidden_ch,
-            hidden_len,
-        );
-    }
-
-    // ===== Stages 2b+: DecoderBlock sub-stages =====
-    // Each DecoderBlock is split into separate Graph/compile/execute/drop cycles:
-    //   1. SnakeBeta + CausalTransConv1d (upsample, changes shape)
-    //   2-4. Each DecoderResidualUnit (preserves shape)
-    // This prevents the 98+ GB combined intermediate allocation that OOMs on A100-80GB.
-    let mut in_dim = speech_config.decoder_dim;
-    let num_blocks = speech_config.upsample_rates.len();
-    for (i, rate) in speech_config.upsample_rates.iter().copied().enumerate() {
-        let out_dim = speech_config.decoder_dim / (1 << (i + 1));
         let block_prefix = format!("decoder.decoder.{}", i + 1);
         let stage_name = format!("stage2{}", (b'b' + i as u8) as char);
 
-        // --- Sub-stage A: SnakeBeta + upsample + pad ---
-        // Separate from matmuls so egglog doesn't fuse them into 79+ GB kernels
-        let kernel_size = 2 * rate;
-        let padded_ch = in_dim;
-        let padded_len;
+        // Sub-stage A: snake + upsample + pad
+        backend::set_data(
+            &mut block.snake_up_rt,
+            block.snake_up_input.id,
+            hidden_data,
+        );
+        block.snake_up_rt.execute(&block.snake_up_cx.dyn_map);
+        hidden_data = backend::get_f32(&block.snake_up_rt, block.snake_up_output.id);
+        let padded_ch = shapes.in_dim;
+        let padded_len = hidden_data.len() / padded_ch;
+        eprintln!(
+            "  [execute] speech {}/snake+upsample in {:.1}s, padded [{}, {}, {}]",
+            stage_name,
+            t1.elapsed().as_secs_f32(),
+            1,
+            padded_ch,
+            padded_len,
+        );
+
+        // Sub-stage B: per-kernel-position matmul (upsample conv)
         {
-            let mut cx = Graph::new();
-            let input = cx.tensor((1, in_dim, hidden_len));
-            let snake = SnakeBeta::new(
-                in_dim,
-                &format!("{block_prefix}.block.0.alpha"),
-                &format!("{block_prefix}.block.0.beta"),
-                &mut cx,
-            );
-            let h = snake.forward(input);
-            // Upsample: zero-interleave by stride
-            let upsampled_len = (hidden_len - 1) * rate + 1;
-            let upsampled = h
-                .expand_dim(3, 1)
-                .pad_along(0, rate - 1, 3, 0.0)
-                .merge_dims(2, 3)
-                .slice_along(..upsampled_len, 2);
-            // Pad for full convolution
-            let conv_padding = kernel_size - 1;
-            let padded = upsampled.pad(((0, 0), (0, 0), (conv_padding, conv_padding)), 0.0);
-            let out = padded.output();
-
-            eprintln!(
-                "  [speech_decode/{}/snake+upsample] graph built in {:.1}s",
-                stage_name,
-                t0.elapsed().as_secs_f32()
-            );
-            let mut rt = backend::compile(&mut cx, weights);
-            eprintln!(
-                "  [speech_decode/{}/snake+upsample] compiled in {:.1}s",
-                stage_name,
-                t0.elapsed().as_secs_f32()
-            );
-            backend::set_data(&mut rt, input.id, hidden_data);
-            rt.execute(&cx.dyn_map);
-            hidden_data = backend::get_f32(&rt, out.id);
-            padded_len = hidden_data.len() / padded_ch;
-            eprintln!(
-                "  [speech_decode/{}/snake+upsample] executed in {:.1}s, padded [{}, {}, {}]",
-                stage_name,
-                t0.elapsed().as_secs_f32(),
-                1,
-                padded_ch,
-                padded_len,
-            );
-        }
-
-        // --- Sub-stage B: Per-kernel-position matmul (single compiled graph, reused) ---
-        // Compiles ONE matmul+accum graph and reuses it for each kernel position.
-        // CPU handles slicing the padded tensor and weight per position, GPU does matmul.
-        // This avoids egglog fusing all positions into a single 242+ GB kernel.
-        {
-            let upsampled_len = (hidden_len - 1) * rate + 1;
-            let conv_padding = kernel_size - 1;
-            let out_len = upsampled_len + conv_padding;
-
-            // Build a reusable matmul+accum graph (unnamed tensors, no weights)
-            let mut cx = Graph::new();
-            let slice_input = cx.tensor((1, out_len, in_dim)); // [1, out_len, ch_in]
-            let weight_input = cx.tensor((in_dim, out_dim)); // [ch_in, ch_out]
-            let accum_input = cx.tensor((1, out_len, out_dim)); // [1, out_len, ch_out]
-            let partial = slice_input.matmul(weight_input);
-            let result = accum_input + partial;
-            let out = result.output();
-
-            eprintln!(
-                "  [speech_decode/{}/conv] matmul graph built ({} kernel positions) in {:.1}s",
-                stage_name,
-                kernel_size,
-                t0.elapsed().as_secs_f32()
-            );
-            let mut rt = backend::compile(&mut cx, &HashMap::new());
-            eprintln!(
-                "  [speech_decode/{}/conv] compiled in {:.1}s",
-                stage_name,
-                t0.elapsed().as_secs_f32()
-            );
+            let padded_data = &hidden_data;
+            let mut accum_data = vec![0.0f32; shapes.out_len * shapes.out_dim];
 
             // Load weight + bias from weights map (CPU-side)
             let weight_name = format!("{block_prefix}.block.1.conv.weight");
@@ -913,109 +1201,112 @@ pub fn decode_speech(
                 .get(&bias_name)
                 .unwrap_or_else(|| panic!("missing bias: {bias_name}"));
 
-            // hidden_data from Sub-stage A is [1, ch_in, padded_len] row-major
-            let padded_data = &hidden_data;
-            let mut accum_data = vec![0.0f32; out_len * out_dim];
-
-            for k in 0..kernel_size {
-                let reversed_k = kernel_size - 1 - k;
+            for k in 0..shapes.kernel_size {
+                let reversed_k = shapes.kernel_size - 1 - k;
 
                 // CPU: slice padded[:, :, k..k+out_len] and transpose to [1, out_len, ch_in]
-                let mut slice_t_data = vec![0.0f32; out_len * in_dim];
-                for c in 0..in_dim {
-                    for t in 0..out_len {
-                        slice_t_data[t * in_dim + c] = padded_data[c * padded_len + k + t];
+                let mut slice_t_data = vec![0.0f32; shapes.out_len * shapes.in_dim];
+                for c in 0..shapes.in_dim {
+                    for t in 0..shapes.out_len {
+                        slice_t_data[t * shapes.in_dim + c] =
+                            padded_data[c * padded_len + k + t];
                     }
                 }
 
                 // CPU: slice weight[:, :, reversed_k] → [ch_in, ch_out]
-                let mut weight_k_data = vec![0.0f32; in_dim * out_dim];
-                for ci in 0..in_dim {
-                    for co in 0..out_dim {
-                        weight_k_data[ci * out_dim + co] = weight_data
-                            [ci * out_dim * kernel_size + co * kernel_size + reversed_k];
+                let mut weight_k_data = vec![0.0f32; shapes.in_dim * shapes.out_dim];
+                for ci in 0..shapes.in_dim {
+                    for co in 0..shapes.out_dim {
+                        weight_k_data[ci * shapes.out_dim + co] = weight_data[ci
+                            * shapes.out_dim
+                            * shapes.kernel_size
+                            + co * shapes.kernel_size
+                            + reversed_k];
                     }
                 }
 
-                backend::set_data(&mut rt, slice_input.id, slice_t_data);
-                backend::set_data(&mut rt, weight_input.id, weight_k_data);
-                backend::set_data(&mut rt, accum_input.id, accum_data);
-                rt.execute(&cx.dyn_map);
-                accum_data = backend::get_f32(&rt, out.id);
+                backend::set_data(
+                    &mut block.up_conv_rt,
+                    block.up_conv_ids.slice_input.id,
+                    slice_t_data,
+                );
+                backend::set_data(
+                    &mut block.up_conv_rt,
+                    block.up_conv_ids.weight_input.id,
+                    weight_k_data,
+                );
+                backend::set_data(
+                    &mut block.up_conv_rt,
+                    block.up_conv_ids.accum_input.id,
+                    accum_data,
+                );
+                block.up_conv_rt.execute(&block.up_conv_cx.dyn_map);
+                accum_data = backend::get_f32(&block.up_conv_rt, block.up_conv_ids.output.id);
             }
 
-            // accum_data is [1, out_len, ch_out] row-major → transpose to [1, ch_out, out_len]
-            let mut transposed = vec![0.0f32; out_len * out_dim];
-            for c in 0..out_dim {
-                for t in 0..out_len {
-                    transposed[c * out_len + t] = accum_data[t * out_dim + c];
+            // Transpose [1, out_len, ch_out] → [1, ch_out, out_len]
+            let mut transposed = vec![0.0f32; shapes.out_len * shapes.out_dim];
+            for c in 0..shapes.out_dim {
+                for t in 0..shapes.out_len {
+                    transposed[c * shapes.out_len + t] = accum_data[t * shapes.out_dim + c];
                 }
             }
 
-            // Add bias: each channel gets bias[c] added to all timesteps
-            for c in 0..out_dim {
+            // Add bias
+            for c in 0..shapes.out_dim {
                 let b = bias_data[c];
-                for t in 0..out_len {
-                    transposed[c * out_len + t] += b;
+                for t in 0..shapes.out_len {
+                    transposed[c * shapes.out_len + t] += b;
                 }
             }
 
-            // Trim for causal: keep first hidden_len * stride samples
-            let target_len = hidden_len * rate;
-            let mut trimmed = vec![0.0f32; out_dim * target_len];
-            for c in 0..out_dim {
-                for t in 0..target_len {
-                    trimmed[c * target_len + t] = transposed[c * out_len + t];
+            // Trim for causal: keep first target_len samples
+            let mut trimmed = vec![0.0f32; shapes.out_dim * shapes.target_len];
+            for c in 0..shapes.out_dim {
+                for t in 0..shapes.target_len {
+                    trimmed[c * shapes.target_len + t] = transposed[c * shapes.out_len + t];
                 }
             }
 
             hidden_data = trimmed;
-            hidden_ch = out_dim;
-            hidden_len = target_len;
+            hidden_ch = shapes.out_dim;
+            hidden_len = shapes.target_len;
             eprintln!(
-                "  [speech_decode/{}/conv] executed ({} matmuls) in {:.1}s, hidden [{}, {}, {}]",
+                "  [execute] speech {}/conv ({} matmuls) in {:.1}s, hidden [{}, {}, {}]",
                 stage_name,
-                kernel_size,
-                t0.elapsed().as_secs_f32(),
+                shapes.kernel_size,
+                t1.elapsed().as_secs_f32(),
                 1,
                 hidden_ch,
                 hidden_len,
             );
         }
 
-        // --- Sub-stages: each DecoderResidualUnit (manual conv to avoid ConvND OOM) ---
-        // ConvND decomposes conv1d into unfold+matmul, creating 50+ GB intermediates
-        // that OOM during profiling. Instead we use:
-        //   - SnakeBeta in a small Graph (element-wise, ~100 MB intermediates)
-        //   - CausalConv1d via CPU-side matmul reuse (proven in Stage 2b/conv)
-        //   - Residual add on CPU
+        // Sub-stages: each DecoderResidualUnit (reusing SnakeBeta + conv matmul graphs)
         for (j, dilation) in [1usize, 3, 9].iter().enumerate() {
             let prefix = format!("{block_prefix}.block.{}", j + 2);
             let residual_data = hidden_data.clone();
 
             // SnakeBeta 1
-            {
-                let mut cx = Graph::new();
-                let input = cx.tensor((1, out_dim, hidden_len));
-                let snake = SnakeBeta::new(
-                    out_dim,
-                    &format!("{prefix}.act1.alpha"),
-                    &format!("{prefix}.act1.beta"),
-                    &mut cx,
-                );
-                let out = snake.forward(input).output();
-                let mut rt = backend::compile(&mut cx, weights);
-                backend::set_data(&mut rt, input.id, hidden_data);
-                rt.execute(&cx.dyn_map);
-                hidden_data = backend::get_f32(&rt, out.id);
-            }
+            execute_snake_beta(
+                &mut hidden_data,
+                &block.res_snake_cx,
+                &mut block.res_snake_rt,
+                &block.res_snake_ids,
+                &format!("{prefix}.act1.alpha"),
+                &format!("{prefix}.act1.beta"),
+                weights,
+            );
 
             // CausalConv1d 1 (kernel=7, dilation=dilation)
-            pipeline_causal_conv1d_cpu(
+            causal_conv1d_with_matmul(
                 &mut hidden_data,
-                out_dim,
-                out_dim,
-                hidden_len,
+                &block.res_conv_cx,
+                &mut block.res_conv_rt,
+                &block.res_conv_ids,
+                shapes.out_dim,
+                shapes.out_dim,
+                shapes.target_len,
                 7,
                 *dilation,
                 &format!("{prefix}.conv1.conv"),
@@ -1023,28 +1314,25 @@ pub fn decode_speech(
             );
 
             // SnakeBeta 2
-            {
-                let mut cx = Graph::new();
-                let input = cx.tensor((1, out_dim, hidden_len));
-                let snake = SnakeBeta::new(
-                    out_dim,
-                    &format!("{prefix}.act2.alpha"),
-                    &format!("{prefix}.act2.beta"),
-                    &mut cx,
-                );
-                let out = snake.forward(input).output();
-                let mut rt = backend::compile(&mut cx, weights);
-                backend::set_data(&mut rt, input.id, hidden_data);
-                rt.execute(&cx.dyn_map);
-                hidden_data = backend::get_f32(&rt, out.id);
-            }
+            execute_snake_beta(
+                &mut hidden_data,
+                &block.res_snake_cx,
+                &mut block.res_snake_rt,
+                &block.res_snake_ids,
+                &format!("{prefix}.act2.alpha"),
+                &format!("{prefix}.act2.beta"),
+                weights,
+            );
 
             // CausalConv1d 2 (kernel=1, dilation=1)
-            pipeline_causal_conv1d_cpu(
+            causal_conv1d_with_matmul(
                 &mut hidden_data,
-                out_dim,
-                out_dim,
-                hidden_len,
+                &block.res_conv_cx,
+                &mut block.res_conv_rt,
+                &block.res_conv_ids,
+                shapes.out_dim,
+                shapes.out_dim,
+                shapes.target_len,
                 1,
                 1,
                 &format!("{prefix}.conv2.conv"),
@@ -1057,146 +1345,32 @@ pub fn decode_speech(
             }
 
             eprintln!(
-                "  [speech_decode/{}/res{}] done at {:.1}s",
+                "  [execute] speech {}/res{} done at {:.1}s",
                 stage_name,
                 j,
-                t0.elapsed().as_secs_f32()
+                t1.elapsed().as_secs_f32()
             );
         }
-
-        in_dim = out_dim;
     }
 
-    // ===== Final stage: final_snake + final_conv + clip =====
-    {
-        let final_dim = in_dim; // channel dim after last block (or decoder_dim if no blocks)
-        let final_snake_idx = num_blocks + 1;
-        let final_conv_idx = final_snake_idx + 1;
+    // --- Execute final stage ---
+    backend::set_data(&mut fin_rt, fin_input.id, hidden_data);
+    fin_rt.execute(&fin_cx.dyn_map);
+    hidden_data = backend::get_f32(&fin_rt, fin_output.id);
+    eprintln!(
+        "  [execute] speech final in {:.1}s, {} audio samples",
+        t1.elapsed().as_secs_f32(),
+        hidden_data.len(),
+    );
+    drop(fin_rt);
 
-        let mut cx = Graph::new();
-        let input = cx.tensor((1, final_dim, hidden_len));
-        let final_snake = SnakeBeta::new(
-            final_dim,
-            &format!("decoder.decoder.{final_snake_idx}.alpha"),
-            &format!("decoder.decoder.{final_snake_idx}.beta"),
-            &mut cx,
-        );
-        let final_conv = CausalConv1d::new(final_dim, 1, 7, 1, true, &mut cx, 1);
-        final_conv
-            .conv
-            .weight
-            .set_name(&format!("decoder.decoder.{final_conv_idx}.conv.weight"));
-        if let Some(bias) = final_conv.conv.bias {
-            bias.set_name(&format!("decoder.decoder.{final_conv_idx}.conv.bias"));
-        }
-        let mut hidden = final_snake.forward(input);
-        hidden = final_conv.forward(hidden);
-        hidden = hidden.clip(-1.0, 1.0);
-        let out = hidden.output();
-
-        eprintln!(
-            "  [speech_decode/final] graph built in {:.1}s",
-            t0.elapsed().as_secs_f32()
-        );
-        let mut rt = backend::compile(&mut cx, weights);
-        eprintln!(
-            "  [speech_decode/final] compiled in {:.1}s",
-            t0.elapsed().as_secs_f32()
-        );
-        backend::set_data(&mut rt, input.id, hidden_data);
-        rt.execute(&cx.dyn_map);
-        hidden_data = backend::get_f32(&rt, out.id);
-        eprintln!(
-            "  [speech_decode/final] executed in {:.1}s, {} audio samples",
-            t0.elapsed().as_secs_f32(),
-            hidden_data.len(),
-        );
-    }
+    let exec_time = t1.elapsed();
+    eprintln!(
+        "  [decode_speech] compile: {:.1}s, execute: {:.1}s, total: {:.1}s",
+        compile_time.as_secs_f32(),
+        exec_time.as_secs_f32(),
+        t0.elapsed().as_secs_f32()
+    );
 
     hidden_data
-}
-
-/// CPU-side causal conv1d using compiled matmul reuse.
-///
-/// Avoids luminal's ConvND decomposition (unfold+matmul) which creates 50+ GB intermediates
-/// for large channel dims. Instead compiles ONE tiny matmul+accum graph (~20 MB intermediates)
-/// and reuses it for each kernel position with CPU-side slicing.
-///
-/// Weight layout: `[out_ch, in_ch, kernel]` (ConvND groups=1, row-major).
-fn pipeline_causal_conv1d_cpu(
-    hidden_data: &mut Vec<f32>,
-    in_ch: usize,
-    out_ch: usize,
-    seq_len: usize,
-    kernel: usize,
-    dilation: usize,
-    weight_prefix: &str,
-    weights: &HashMap<String, Vec<f32>>,
-) {
-    // 1. CPU-side causal padding (left only)
-    let left_pad = dilation * (kernel - 1);
-    let padded_len = seq_len + left_pad;
-    let mut padded_data = vec![0.0f32; in_ch * padded_len];
-    for c in 0..in_ch {
-        for t in 0..seq_len {
-            padded_data[c * padded_len + left_pad + t] = hidden_data[c * seq_len + t];
-        }
-    }
-
-    // 2. Compile matmul+accum graph (once, reused for all kernel positions)
-    let mut cx = luminal::graph::Graph::new();
-    let slice_input = cx.tensor((1, seq_len, in_ch));
-    let weight_input = cx.tensor((in_ch, out_ch));
-    let accum_input = cx.tensor((1, seq_len, out_ch));
-    let partial = slice_input.matmul(weight_input);
-    let result = accum_input + partial;
-    let out = result.output();
-    let mut rt = backend::compile(&mut cx, &HashMap::new());
-
-    // 3. Load weight + bias from weights map (CPU)
-    let weight_name = format!("{weight_prefix}.weight");
-    let weight_data = weights
-        .get(&weight_name)
-        .unwrap_or_else(|| panic!("missing weight: {weight_name}"));
-    let bias_name = format!("{weight_prefix}.bias");
-    let bias_data = weights.get(&bias_name);
-
-    // 4. Loop over kernel positions with CPU-side slicing
-    let mut accum_data = vec![0.0f32; seq_len * out_ch];
-    for k in 0..kernel {
-        // CPU: extract padded[:, :, k*d .. k*d + seq_len] and transpose to [1, seq_len, in_ch]
-        let mut slice_t_data = vec![0.0f32; seq_len * in_ch];
-        for c in 0..in_ch {
-            for t in 0..seq_len {
-                slice_t_data[t * in_ch + c] = padded_data[c * padded_len + k * dilation + t];
-            }
-        }
-
-        // CPU: extract weight[:, :, k] transposed to [in_ch, out_ch]
-        // weight layout: [out_ch, in_ch, kernel] row-major
-        let mut weight_k_data = vec![0.0f32; in_ch * out_ch];
-        for oc in 0..out_ch {
-            for ic in 0..in_ch {
-                weight_k_data[ic * out_ch + oc] =
-                    weight_data[oc * in_ch * kernel + ic * kernel + k];
-            }
-        }
-
-        backend::set_data(&mut rt, slice_input.id, slice_t_data);
-        backend::set_data(&mut rt, weight_input.id, weight_k_data);
-        backend::set_data(&mut rt, accum_input.id, accum_data);
-        rt.execute(&cx.dyn_map);
-        accum_data = backend::get_f32(&rt, out.id);
-    }
-
-    // 5. Transpose accum [1, seq_len, out_ch] → [1, out_ch, seq_len] and add bias
-    let mut result_data = vec![0.0f32; out_ch * seq_len];
-    for c in 0..out_ch {
-        let bias_val = bias_data.map_or(0.0, |b| b[c]);
-        for t in 0..seq_len {
-            result_data[c * seq_len + t] = accum_data[t * out_ch + c] + bias_val;
-        }
-    }
-
-    *hidden_data = result_data;
 }
