@@ -36,6 +36,9 @@ pub fn build_search_space(cx: &mut Graph) {
 }
 
 pub fn compile(cx: &mut Graph, weights: &HashMap<String, Vec<f32>>) -> Rt {
+    // Enable e-graph caching to skip egglog on subsequent runs
+    cx.cache_dir = Some(std::path::PathBuf::from(".luminal_cache"));
+
     build_search_space(cx);
 
     #[cfg(feature = "cuda")]

@@ -4,6 +4,7 @@ use itertools::Itertools;
 use petgraph::{Direction, graph::NodeIndex, visit::EdgeRef};
 use rand::{Rng, rngs::ThreadRng};
 use rustc_hash::FxHashSet;
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::{str, sync::Arc};
@@ -120,7 +121,7 @@ use crate::{
 use egglog::{ArcSort, CommandOutput, EGraph, Value};
 use egraph_serialize::{ClassId, NodeId};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 ///  This is snapshot of an EGraph with Rust native hash maps and sets for enabling more native traversal / algorithm writing.
 ///  The name comes from the serialize egraph crates, which returns a ETermDAG, which caused issues, so this is a homebrew semi-static egraph
 pub struct SerializedEGraph {

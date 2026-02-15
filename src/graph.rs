@@ -8,14 +8,17 @@ use crate::{
 };
 use crate::{hlir::CustomOpHLIR, op::*, prelude::*};
 use colored::Colorize;
+use egraph_serialize::{ClassId, NodeId};
 use itertools::Itertools;
 use petgraph::{Direction, algo::toposort, stable_graph::StableGraph, visit::EdgeRef};
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
 use std::{
     any::TypeId,
     fmt::Debug,
     io::Write,
     ops::{Deref, DerefMut},
+    path::Path,
     sync::Arc,
 };
 use tracing;
@@ -30,6 +33,8 @@ struct ChunkGroup {
     representative: usize,
     /// All chunk indices in this group (including the representative)
     members: Vec<usize>,
+    /// Normalized egglog hash for this group (used for cache key computation)
+    hash: u64,
 }
 
 /// A Luminal compute graph.
@@ -37,6 +42,8 @@ struct ChunkGroup {
 /// All computation is represented as a directed acyclic graph.
 #[derive(Debug, Default)]
 pub struct Graph {
+    /// Directory to cache e-graph results (skips egglog on subsequent runs)
+    pub cache_dir: Option<std::path::PathBuf>,
     /// A map of dynamic dimensions to concrete dimension sizes
     pub dyn_map: FxHashMap<char, usize>,
     /// Edge weights: (Input index, Output index, Input shape)
@@ -51,6 +58,48 @@ pub struct Graph {
     pub ops: Option<Vec<Arc<Box<dyn EgglogOp>>>>,
     /// Custom ops
     pub custom_ops: Vec<Box<dyn CustomOp>>,
+}
+
+/// Cached e-graph optimization results for skipping egglog on subsequent runs.
+#[derive(Serialize, Deserialize)]
+pub struct EGraphCache {
+    /// Cache format version (bump on breaking changes)
+    pub version: u32,
+    /// Hash of all group hashes (validates cache matches current graph structure)
+    pub cache_key: u64,
+    /// One SerializedEGraph per unique group
+    pub egraphs: Vec<SerializedEGraph>,
+    /// Best genome per group: maps ClassId → NodeId (the winning extraction choice).
+    /// None on first save (populated after search completes).
+    pub best_genomes: Option<Vec<FxHashMap<ClassId, NodeId>>>,
+}
+
+impl EGraphCache {
+    const CURRENT_VERSION: u32 = 1;
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_vec(self).map_err(|e| std::io::Error::other(e))?;
+        std::fs::write(path, data)
+    }
+
+    pub fn load(path: &Path, expected_key: u64) -> Option<Self> {
+        let data = std::fs::read(path).ok()?;
+        let cache: Self = serde_json::from_slice(&data).ok()?;
+        if cache.version != Self::CURRENT_VERSION || cache.cache_key != expected_key {
+            return None;
+        }
+        Some(cache)
+    }
+}
+
+fn compute_cache_key(group_hashes: &[u64]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    group_hashes.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl Graph {
@@ -176,10 +225,39 @@ impl Graph {
 
         if subgraphs.len() <= 1 {
             let (program, root) = hlir_to_egglog(self);
-            self.egraphs = vec![run_egglog(&program, &root, &ops, cleanup_hlir).unwrap()];
+            let h = hash_egglog_normalized(&program);
+            let cache_key = compute_cache_key(&[h]);
+
+            let egraph = if let Some(ref cache_dir) = self.cache_dir {
+                let cache_path = cache_dir.join(format!("{:016x}.json", cache_key));
+                if let Some(cached) = EGraphCache::load(&cache_path, cache_key) {
+                    println!(
+                        "   {:>6}  loaded from cache",
+                        "Cache".green().bold()
+                    );
+                    cached.egraphs.into_iter().next().unwrap()
+                } else {
+                    let eg = run_egglog(&program, &root, &ops, cleanup_hlir).unwrap();
+                    let cache = EGraphCache {
+                        version: EGraphCache::CURRENT_VERSION,
+                        cache_key,
+                        egraphs: vec![eg.clone()],
+                        best_genomes: None,
+                    };
+                    if let Err(e) = cache.save(&cache_path) {
+                        eprintln!("   Warning: failed to save e-graph cache: {e}");
+                    }
+                    eg
+                }
+            } else {
+                run_egglog(&program, &root, &ops, cleanup_hlir).unwrap()
+            };
+
+            self.egraphs = vec![egraph];
             self.chunk_groups = vec![ChunkGroup {
                 representative: 0,
                 members: vec![0],
+                hash: h,
             }];
         } else {
             println!(
@@ -207,10 +285,12 @@ impl Graph {
         let subgraphs = split_at_graph_breaks(self);
         if subgraphs.len() <= 1 {
             let (program, root) = hlir_to_egglog(self);
+            let h = hash_egglog_normalized(&program);
             self.egraphs = vec![run_egglog(&program, &root, &ops, cleanup_hlir).unwrap()];
             self.chunk_groups = vec![ChunkGroup {
                 representative: 0,
                 members: vec![0],
+                hash: h,
             }];
         } else {
             self.build_grouped_egraphs(&subgraphs, &ops, cleanup_hlir);
@@ -240,10 +320,11 @@ impl Graph {
             hash_to_chunks.entry(h).or_default().push(i);
         }
         let mut groups: Vec<ChunkGroup> = hash_to_chunks
-            .into_values()
-            .map(|members| ChunkGroup {
+            .into_iter()
+            .map(|(hash, members)| ChunkGroup {
                 representative: members[0],
                 members,
+                hash,
             })
             .collect();
         groups.sort_by_key(|g| g.representative);
@@ -254,6 +335,26 @@ impl Graph {
             groups.len(),
             subgraphs.len()
         );
+
+        // Check cache
+        let group_hashes: Vec<u64> = groups.iter().map(|g| g.hash).collect();
+        let cache_key = compute_cache_key(&group_hashes);
+
+        if let Some(ref cache_dir) = self.cache_dir {
+            let cache_path = cache_dir.join(format!("{:016x}.json", cache_key));
+            if let Some(cached) = EGraphCache::load(&cache_path, cache_key) {
+                if cached.egraphs.len() == groups.len() {
+                    println!(
+                        "   {:>6}  {} groups loaded from cache",
+                        "Cache".green().bold(),
+                        groups.len()
+                    );
+                    self.egraphs = cached.egraphs;
+                    self.chunk_groups = groups;
+                    return;
+                }
+            }
+        }
 
         // Build e-graphs only for representative chunks
         self.egraphs = groups
@@ -286,6 +387,20 @@ impl Graph {
                 }
             })
             .collect();
+
+        // Save to cache
+        if let Some(ref cache_dir) = self.cache_dir {
+            let cache = EGraphCache {
+                version: EGraphCache::CURRENT_VERSION,
+                cache_key,
+                egraphs: self.egraphs.clone(),
+                best_genomes: None,
+            };
+            let cache_path = cache_dir.join(format!("{:016x}.json", cache_key));
+            if let Err(e) = cache.save(&cache_path) {
+                eprintln!("   Warning: failed to save e-graph cache: {e}");
+            }
+        }
 
         self.chunk_groups = groups;
     }
@@ -349,8 +464,58 @@ impl Graph {
             }
         }
 
+        // Check for cached genomes
+        let cached_genomes: Option<Vec<FxHashMap<ClassId, NodeId>>> =
+            self.cache_dir.as_ref().and_then(|cache_dir| {
+                let group_hashes: Vec<u64> = self.chunk_groups.iter().map(|g| g.hash).collect();
+                let cache_key = compute_cache_key(&group_hashes);
+                let cache_path = cache_dir.join(format!("{:016x}.json", cache_key));
+                let cached = EGraphCache::load(&cache_path, cache_key)?;
+                cached.best_genomes
+            });
+
         for (group_idx, group) in self.chunk_groups.iter().enumerate() {
             let egraph = &self.egraphs[group_idx];
+
+            // If we have a cached genome for this group, use it directly (skip profiling)
+            if let Some(ref genomes) = cached_genomes {
+                if let Some(genome) = genomes.get(group_idx) {
+                    // Convert owned genome -> borrowed genome by looking up in egraph
+                    let borrowed: crate::egglog_utils::EGraphChoiceSet = genome
+                        .iter()
+                        .filter_map(|(class_id, node_id)| {
+                            let class_ref =
+                                egraph.eclasses.get_key_value(class_id).map(|(k, _)| k)?;
+                            let node_ref =
+                                egraph.enodes.get_key_value(node_id).map(|(k, _)| k)?;
+                            Some((class_ref, node_ref))
+                        })
+                        .collect();
+                    let mut list_cache = FxHashMap::default();
+                    let mut expr_cache = FxHashMap::default();
+                    let llir = egglog_to_llir(
+                        egraph,
+                        borrowed.clone(),
+                        ops,
+                        &self.custom_ops,
+                        &mut list_cache,
+                        &mut expr_cache,
+                        None,
+                    );
+                    group_best_llirs[group_idx] = Some(llir);
+                    group_best_genomes[group_idx] = Some(borrowed);
+                    let multiplier = if group.members.len() > 1 {
+                        format!(" ({}x)", group.members.len())
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "   {:>8} (cached genome){multiplier}",
+                        format!("Group {group_idx}").cyan().bold(),
+                    );
+                    continue;
+                }
+            }
 
             let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
             let mut list_cache = FxHashMap::default();
@@ -528,6 +693,36 @@ impl Graph {
                 print!("\r\x1b[2K");
             }
             std::io::stdout().flush().unwrap();
+        }
+
+        // Save genomes to cache (only if we actually ran search, not loaded from cache)
+        if cached_genomes.is_none() {
+            if let Some(ref cache_dir) = self.cache_dir {
+                let group_hashes: Vec<u64> = self.chunk_groups.iter().map(|g| g.hash).collect();
+                let cache_key = compute_cache_key(&group_hashes);
+                let cache_path = cache_dir.join(format!("{:016x}.json", cache_key));
+
+                let owned_genomes: Vec<FxHashMap<ClassId, NodeId>> = group_best_genomes
+                    .iter()
+                    .map(|opt| {
+                        opt.as_ref()
+                            .unwrap()
+                            .iter()
+                            .map(|(k, v)| ((*k).clone(), (*v).clone()))
+                            .collect()
+                    })
+                    .collect();
+
+                let cache = EGraphCache {
+                    version: EGraphCache::CURRENT_VERSION,
+                    cache_key,
+                    egraphs: self.egraphs.clone(),
+                    best_genomes: Some(owned_genomes),
+                };
+                if let Err(e) = cache.save(&cache_path) {
+                    eprintln!("   Warning: failed to save genome cache: {e}");
+                }
+            }
         }
 
         // Build per-chunk LLIRs: representative uses searched LLIR,
