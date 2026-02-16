@@ -1248,6 +1248,22 @@ impl CudaRuntime {
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<cudarc::driver::sys::CUgraph> {
         capture_stream.context().bind_to_thread()?;
+        // Warm up the op on the capture stream outside stream-capture.
+        // cuBLAS/cuBLASLt may JIT kernels and allocate internal resources on first execute.
+        exec_op
+            .internal
+            .execute(
+                capture_stream,
+                exec_op.output,
+                &exec_op.inputs,
+                buffers,
+                dyn_map,
+            )
+            .map_err(|err| anyhow::anyhow!("Mini-capture warmup host op execute failed: {err:#}"))?;
+        capture_stream
+            .synchronize()
+            .map_err(|err| anyhow::anyhow!("Mini-capture warmup sync failed: {err:#}"))?;
+
         let prev_capture_flag = crate::CUDA_STREAM_CAPTURING.get();
         crate::CUDA_STREAM_CAPTURING.set(true);
         let capture_res = (|| -> anyhow::Result<cudarc::driver::sys::CUgraph> {
