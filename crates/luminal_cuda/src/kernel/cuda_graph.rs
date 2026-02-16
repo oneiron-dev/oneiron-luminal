@@ -491,7 +491,7 @@ mod tests {
     fn wave_b0_stream_capture_with_graph_launch_and_cublaslt() {
         use cudarc::cublas::sys::cublasOperation_t;
         use cudarc::cublaslt::{
-            CudaBlasLT,
+            CudaBlasLT, MatmulShared,
             sys::{
                 cublasComputeType_t, cublasLtMatmul, cublasLtMatmulAlgoGetHeuristic,
                 cublasLtMatmulDesc_t, cublasLtMatmulDescCreate, cublasLtMatmulDescDestroy,
@@ -502,7 +502,7 @@ mod tests {
                 cublasLtMatrixLayoutCreate, cublasLtMatrixLayoutDestroy, cudaDataType,
             },
         };
-        use cudarc::driver::CudaSlice;
+        use cudarc::driver::{CudaSlice, DevicePtr};
 
         let Ok(ctx) = CudaContext::new(0) else {
             return;
