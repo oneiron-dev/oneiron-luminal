@@ -5,7 +5,7 @@ use luminal::{op::EgglogOp, prelude::*};
 mod cublas;
 mod cublaslt;
 
-pub type Ops = (cublaslt::CuBlasLt,);
+pub type Ops = (cublaslt::CuBlasLt, cublas::CuBlasSgemmV2);
 
 /// Host operations that execute on the CPU but orchestrate GPU work.
 ///

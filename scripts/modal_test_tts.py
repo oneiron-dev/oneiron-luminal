@@ -124,6 +124,14 @@ def test_cuda_inference():
     run_streaming("nvidia-smi")
     run_streaming("nvcc --version")
 
+    # One-time cache clear after cuBLAS→cuBLASLt op-set change.
+    # Remove this block after first successful run with cuBLASLt.
+    if os.path.exists(CACHE_DIR) and os.listdir(CACHE_DIR):
+        import shutil
+        print(f"\nClearing stale e-graph cache (cuBLASLt migration)...", flush=True)
+        shutil.rmtree(CACHE_DIR)
+        os.makedirs(CACHE_DIR, exist_ok=True)
+
     # Show cache status
     if os.path.exists(CACHE_DIR):
         cache_files = os.listdir(CACHE_DIR)
