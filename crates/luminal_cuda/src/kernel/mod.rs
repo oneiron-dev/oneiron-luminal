@@ -173,6 +173,11 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
     /// Returns the output buffer size in elements.
     fn output_size(&self) -> Expression;
 
+    /// Returns the output buffer size in bytes (default assumes f32 elements).
+    fn output_bytes(&self) -> Expression {
+        self.output_size() * 4
+    }
+
     /// Returns the number of bytes this kernel will load from global memory.
     fn bytes_loaded(&self) -> Expression {
         0.into()

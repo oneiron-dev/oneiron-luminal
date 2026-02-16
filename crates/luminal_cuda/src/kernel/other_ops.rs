@@ -192,12 +192,30 @@ extern \"C\" {{
         self.out_shape.iter().copied().product()
     }
 
+    fn output_bytes(&self) -> Expression {
+        let elem_size: Expression = match self.dtype {
+            DType::F32 | DType::Int => 4,
+            DType::F16 | DType::Bf16 => 2,
+            DType::Bool => 1,
+            DType::NvFp4 | DType::Mxfp4 => 1,
+        }
+        .into();
+        self.output_size() * elem_size
+    }
+
     fn bytes_loaded(&self) -> Expression {
-        self.out_shape.iter().copied().product::<Expression>() * self.iters * 4
+        let elem_size: Expression = match self.dtype {
+            DType::F32 | DType::Int => 4,
+            DType::F16 | DType::Bf16 => 2,
+            DType::Bool => 1,
+            DType::NvFp4 | DType::Mxfp4 => 1,
+        }
+        .into();
+        self.out_shape.iter().copied().product::<Expression>() * self.iters * elem_size
     }
 
     fn bytes_stored(&self) -> Expression {
-        self.output_size() * 4
+        self.output_bytes()
     }
 
     fn flops(&self) -> Expression {

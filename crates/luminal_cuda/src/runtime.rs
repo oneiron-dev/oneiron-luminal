@@ -26,7 +26,6 @@ use std::{
     collections::{VecDeque, hash_map::Entry},
     fmt::Debug,
     fs::File,
-    mem::size_of,
     sync::Arc,
     time::Duration,
 };
@@ -107,6 +106,8 @@ pub struct CudaRuntime {
     llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
     hlir_to_llir: FxHashMap<NodeIndex, NodeIndex>,
     changed_hlir: FxHashSet<NodeIndex>,
+    /// Intermediate buffers that must be zeroed before execution.
+    buffers_requiring_zero: FxHashSet<NodeIndex>,
     /// Cached buffer pointers to avoid repeated device_ptr() calls (keyed by llir_node)
     cached_buffer_ptrs: FxHashMap<NodeIndex, u64>,
     pub last_kernel_stats: Vec<KernelStats>,
@@ -181,13 +182,14 @@ impl CudaRuntime {
     /// Does NOT mark the buffer as changed (pointer is unchanged).
     pub fn update_buffer_slice(&mut self, id: impl ToId, byte_offset: usize, data: &[f32]) {
         let id = id.to_id();
-        let byte_data: &[u8] = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-        };
+        let byte_data: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
         let byte_end = byte_offset + byte_data.len();
         let buf = match self.hlir_buffers.get_mut(&id) {
             Some(CudaInput::Buffer(buf)) => buf,
-            Some(CudaInput::Ptr(_)) => panic!("update_buffer_slice: {:?} is a Ptr, not a Buffer", id),
+            Some(CudaInput::Ptr(_)) => {
+                panic!("update_buffer_slice: {:?} is a Ptr, not a Buffer", id)
+            }
             None => panic!("update_buffer_slice: no buffer for {:?}", id),
         };
         let mut view = buf.slice_mut(byte_offset..byte_end);
@@ -259,14 +261,14 @@ impl CudaRuntime {
                 continue;
             }
             if let Some(op) = self.llir_graph[node].to_dialect::<dyn BlockOp>() {
-                let out_size = op.output_size();
-                let exec_size = out_size.exec(dyn_dims).unwrap();
+                let out_bytes = op.output_bytes();
+                let exec_bytes = out_bytes.exec(dyn_dims).unwrap();
                 // Skip allocation for ops with zero output size
-                if exec_size == 0 {
+                if exec_bytes == 0 {
                     continue;
                 }
-                self.intermediate_buffer_dims.extend(out_size.dyn_vars());
-                let alloc_bytes = exec_size * size_of::<f32>();
+                self.intermediate_buffer_dims.extend(out_bytes.dyn_vars());
+                let alloc_bytes = exec_bytes;
                 total_alloc_bytes += alloc_bytes;
                 self.buffers.insert(
                     node,
@@ -287,14 +289,14 @@ impl CudaRuntime {
             } else if let Some(op) = self.llir_graph[node].to_dialect::<dyn KernelOp>() {
                 // Kernel nodes remain in the graph for buffer allocation.
                 // Their execution is handled by CudaGraphOp.
-                let out_size = op.output_size();
-                let exec_size = out_size.exec(dyn_dims).unwrap();
+                let out_bytes = op.output_bytes();
+                let exec_size = out_bytes.exec(dyn_dims).unwrap();
                 // Skip allocation for kernels with zero output size (e.g., megakernels)
                 if exec_size == 0 {
                     continue;
                 }
-                self.intermediate_buffer_dims.extend(out_size.dyn_vars());
-                let alloc_bytes = exec_size * size_of::<f32>();
+                self.intermediate_buffer_dims.extend(out_bytes.dyn_vars());
+                let alloc_bytes = exec_size;
                 total_alloc_bytes += alloc_bytes;
                 self.buffers.insert(
                     node,
@@ -314,9 +316,9 @@ impl CudaRuntime {
                 self.cached_buffer_ptrs.insert(node, ptr);
             } else if let Some(op) = self.llir_graph[node].to_dialect::<dyn HostOp>() {
                 // Allocate output buffer for this HostOp if it has one
-                let exec_size = op.output_size().exec(dyn_dims).unwrap();
-                if exec_size > 0 {
-                    let alloc_bytes = exec_size * size_of::<f32>();
+                let out_bytes = op.output_bytes().exec(dyn_dims).unwrap();
+                if out_bytes > 0 {
+                    let alloc_bytes = out_bytes;
                     total_alloc_bytes += alloc_bytes;
                     self.buffers.insert(
                         node,
@@ -489,6 +491,7 @@ impl Runtime for CudaRuntime {
             hlir_to_llir: FxHashMap::default(),
             llir_to_hlir: FxHashMap::default(),
             changed_hlir: FxHashSet::default(),
+            buffers_requiring_zero: FxHashSet::default(),
             cached_buffer_ptrs: FxHashMap::default(),
             timings: vec![],
             cuda_graph_timings: vec![],
@@ -520,6 +523,7 @@ impl Runtime for CudaRuntime {
         // Mark all HLIR inputs as changed so their pointers get re-cached in execute
         self.changed_hlir.extend(self.hlir_buffers.keys().copied());
         self.exec_graph.clear();
+        self.buffers_requiring_zero.clear();
 
         // Sync after clearing all buffers to ensure CUDA resources are freed
         self.cuda_stream
@@ -592,6 +596,13 @@ impl Runtime for CudaRuntime {
                     .is_none()
             {
                 exec_graph.add_edge(exec_start, exec_end, ());
+            }
+        }
+
+        for host_op_node_index in llir_graph.node_indices() {
+            if let Some(host_op) = llir_graph[host_op_node_index].to_dialect::<dyn HostOp>() {
+                self.buffers_requiring_zero
+                    .extend(host_op.zero_output_nodes());
             }
         }
 
@@ -730,15 +741,38 @@ impl Runtime for CudaRuntime {
         }
 
         let rt_profiling = std::env::var("LUMINAL_PROFILE").map_or(false, |v| v == "1");
+        let sync_debug = std::env::var("LUMINAL_SYNC_DEBUG").map_or(false, |v| v == "1");
+        let force_zero_all = std::env::var("LUMINAL_FORCE_ZERO_ALL").map_or(false, |v| v == "1");
 
-        // Always clear intermediate buffers to ensure correctness for operations using atomicAdd
-        // TODO: this is very expensive. Need to eliminate ops that require zeroed outputs
+        let single_stream = self
+            .exec_graph
+            .node_indices()
+            .all(|n| Arc::ptr_eq(&self.exec_graph[n].stream, &self.cuda_stream));
+        assert!(
+            single_stream || sync_debug,
+            "Detected multi-stream host op execution. Set LUMINAL_SYNC_DEBUG=1 or add stream event dependencies before disabling per-op sync.",
+        );
+
+        // Zero only buffers that require accumulation semantics, unless explicitly forced.
         let zero_t = std::time::Instant::now();
-        let n_bufs = self.buffers.len();
-        for buffer in self.buffers.values_mut() {
-            self.cuda_stream.memset_zeros(buffer).unwrap();
+        let mut n_zeroed_bufs = 0usize;
+        if force_zero_all {
+            for buffer in self.buffers.values_mut() {
+                self.cuda_stream.memset_zeros(buffer).unwrap();
+                n_zeroed_bufs += 1;
+            }
+        } else {
+            let zero_nodes = self.buffers_requiring_zero.iter().copied().collect_vec();
+            for node in zero_nodes {
+                if let Some(buffer) = self.buffers.get_mut(&node) {
+                    self.cuda_stream.memset_zeros(buffer).unwrap();
+                    n_zeroed_bufs += 1;
+                }
+            }
         }
-        self.cuda_stream.synchronize().unwrap();
+        if n_zeroed_bufs > 0 {
+            self.cuda_stream.synchronize().unwrap();
+        }
         let zero_us = zero_t.elapsed().as_micros() as f64;
 
         // Cache HLIR input pointers
@@ -828,7 +862,9 @@ impl Runtime for CudaRuntime {
                         exec_op.output, exec_op.inputs, buffer_map.len()
                     );
                 });
-            self.cuda_stream.synchronize().unwrap();
+            if sync_debug {
+                self.cuda_stream.synchronize().unwrap();
+            }
         }
         let exec_ops_us = total_start.elapsed().as_micros() as f64;
 
@@ -845,8 +881,12 @@ impl Runtime for CudaRuntime {
             let total_us = zero_us + prebuild_us + exec_ops_us + final_sync_us;
             eprintln!(
                 "    [runtime] zero_buffers: {:.2}ms ({} bufs) | prebuild: {:.2}ms | exec_ops: {:.2}ms ({} ops) | final_sync: {:.2}ms | total: {:.2}ms",
-                zero_us / 1000.0, n_bufs, prebuild_us / 1000.0,
-                exec_ops_us / 1000.0, n_ops, final_sync_us / 1000.0,
+                zero_us / 1000.0,
+                n_zeroed_bufs,
+                prebuild_us / 1000.0,
+                exec_ops_us / 1000.0,
+                n_ops,
+                final_sync_us / 1000.0,
                 total_us / 1000.0,
             );
         }

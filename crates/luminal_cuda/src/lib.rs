@@ -17,7 +17,7 @@ fn cuda_dtype(dtype: DType) -> &'static str {
     match dtype {
         DType::F32 => "float",
         DType::F16 => "half",
-        DType::Bf16 => todo!(),
+        DType::Bf16 => "__nv_bfloat16",
         DType::Int => "int",
         DType::Bool | DType::NvFp4 | DType::Mxfp4 => "unsigned char",
     }

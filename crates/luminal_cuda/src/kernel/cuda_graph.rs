@@ -486,6 +486,234 @@ mod tests {
         assert_eq!(result[0], 6.0f32);
     }
 
+    #[test]
+    #[ignore = "Wave B.0 feasibility spike; run manually on a CUDA host"]
+    fn wave_b0_stream_capture_with_graph_launch_and_cublaslt() {
+        use cudarc::cublas::sys::cublasOperation_t;
+        use cudarc::cublaslt::{
+            CudaBlasLT, MatmulShared,
+            sys::{
+                cublasComputeType_t, cublasLtMatmul, cublasLtMatmulAlgoGetHeuristic,
+                cublasLtMatmulDesc_t, cublasLtMatmulDescCreate, cublasLtMatmulDescDestroy,
+                cublasLtMatmulDescSetAttribute, cublasLtMatmulHeuristicResult_t,
+                cublasLtMatmulPreference_t, cublasLtMatmulPreferenceAttributes_t,
+                cublasLtMatmulPreferenceCreate, cublasLtMatmulPreferenceDestroy,
+                cublasLtMatmulPreferenceSetAttribute, cublasLtMatrixLayout_t,
+                cublasLtMatrixLayoutCreate, cublasLtMatrixLayoutDestroy, cudaDataType,
+            },
+        };
+        use cudarc::driver::{CudaSlice, DevicePtr};
+
+        let Ok(ctx) = CudaContext::new(0) else {
+            return;
+        };
+        if ctx.bind_to_thread().is_err() {
+            return;
+        }
+        let stream = ctx.default_stream();
+
+        // Child graph that will be launched during stream capture (proxy for CudaGraphOp launch).
+        let kernel_src = r#"extern "C" __global__ void test_kernel(float* out, float* in1) { if (threadIdx.x == 0) out[0] = in1[0] + 1.0f; }"#;
+        let Ok(ptx) = cudarc::nvrtc::compile_ptx(kernel_src) else {
+            return;
+        };
+        let module = ctx.load_module(ptx).unwrap();
+        let func = module.load_function("test_kernel").unwrap();
+        let mut output: CudaSlice<f32> = unsafe { stream.alloc(1) }.unwrap();
+        let mut input: CudaSlice<f32> = unsafe { stream.alloc(1) }.unwrap();
+        stream.memcpy_htod(&[2.0f32], &mut input).unwrap();
+
+        let mut child_graph = CudaGraphHandle::new(ctx.clone()).unwrap();
+        let mut params =
+            KernelParams::new(output.device_ptr(&stream).0, &[input.device_ptr(&stream).0]);
+        unsafe {
+            child_graph
+                .add_kernel_node(
+                    &[],
+                    func.raw_function(),
+                    (1, 1, 1),
+                    (1, 1, 1),
+                    0,
+                    params.as_cuda_params(),
+                )
+                .unwrap();
+        }
+        let child_exec = child_graph.instantiate().unwrap();
+
+        // Buffers for a tiny F32 GEMM on cuBLASLt.
+        const M: u64 = 8;
+        const N: u64 = 8;
+        const K: u64 = 8;
+        let mut a: CudaSlice<f32> = unsafe { stream.alloc((M * K) as usize) }.unwrap();
+        let mut b: CudaSlice<f32> = unsafe { stream.alloc((K * N) as usize) }.unwrap();
+        let c: CudaSlice<f32> = unsafe { stream.alloc((M * N) as usize) }.unwrap();
+        stream.memcpy_htod(&vec![1.0f32; (M * K) as usize], &mut a).unwrap();
+        stream.memcpy_htod(&vec![2.0f32; (K * N) as usize], &mut b).unwrap();
+
+        let cublaslt = CudaBlasLT::new(stream.clone()).unwrap();
+        let (a_ptr, _a_guard) = a.device_ptr(&stream);
+        let (b_ptr, _b_guard) = b.device_ptr(&stream);
+        let (c_ptr, _c_guard) = c.device_ptr(&stream);
+
+        let mut launch_matmul = || -> anyhow::Result<()> {
+            let mut matmul_desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
+            let mut a_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();
+            let mut b_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();
+            let mut c_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();
+            let mut preference: cublasLtMatmulPreference_t = std::ptr::null_mut();
+            let mut heuristic: cublasLtMatmulHeuristicResult_t = unsafe { std::mem::zeroed() };
+            let mut algo_count: i32 = 0;
+
+            const WORKSPACE_SIZE: usize = 4 * 1024 * 1024;
+            let workspace = unsafe { stream.alloc::<u8>(WORKSPACE_SIZE)? };
+            let (workspace_ptr, _workspace_guard) = workspace.device_ptr(&stream);
+
+            let alpha_f32: f32 = 1.0;
+            let beta_f32: f32 = 0.0;
+            unsafe {
+                cublasLtMatmulDescCreate(
+                    &mut matmul_desc,
+                    cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cudaDataType::CUDA_R_32F,
+                )
+                .result()?;
+                let layout_n = cublasOperation_t::CUBLAS_OP_N;
+                cublasLtMatmulDescSetAttribute(
+                    matmul_desc,
+                    cudarc::cublaslt::sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                    &layout_n as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<cublasOperation_t>(),
+                )
+                .result()?;
+                cublasLtMatmulDescSetAttribute(
+                    matmul_desc,
+                    cudarc::cublaslt::sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                    &layout_n as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<cublasOperation_t>(),
+                )
+                .result()?;
+
+                cublasLtMatrixLayoutCreate(&mut a_desc, cudaDataType::CUDA_R_32F, M, K, K as i64)
+                    .result()?;
+                cublasLtMatrixLayoutCreate(&mut b_desc, cudaDataType::CUDA_R_32F, K, N, N as i64)
+                    .result()?;
+                cublasLtMatrixLayoutCreate(&mut c_desc, cudaDataType::CUDA_R_32F, M, N, N as i64)
+                    .result()?;
+
+                cublasLtMatmulPreferenceCreate(&mut preference).result()?;
+                cublasLtMatmulPreferenceSetAttribute(
+                    preference,
+                    cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                    &WORKSPACE_SIZE as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<usize>(),
+                )
+                .result()?;
+                cublasLtMatmulAlgoGetHeuristic(
+                    *cublaslt.handle(),
+                    matmul_desc,
+                    a_desc,
+                    b_desc,
+                    c_desc,
+                    c_desc,
+                    preference,
+                    1,
+                    &mut heuristic,
+                    &mut algo_count,
+                )
+                .result()?;
+                if algo_count == 0 {
+                    cublasLtMatmulPreferenceDestroy(preference);
+                    cublasLtMatrixLayoutDestroy(c_desc);
+                    cublasLtMatrixLayoutDestroy(b_desc);
+                    cublasLtMatrixLayoutDestroy(a_desc);
+                    cublasLtMatmulDescDestroy(matmul_desc);
+                    panic!("No suitable cuBLASLt algorithm found during capture spike");
+                }
+
+                cublasLtMatmul(
+                    *cublaslt.handle(),
+                    matmul_desc,
+                    &alpha_f32 as *const _ as *const std::ffi::c_void,
+                    a_ptr as *const std::ffi::c_void,
+                    a_desc,
+                    b_ptr as *const std::ffi::c_void,
+                    b_desc,
+                    &beta_f32 as *const _ as *const std::ffi::c_void,
+                    c_ptr as *const std::ffi::c_void,
+                    c_desc,
+                    c_ptr as *mut std::ffi::c_void,
+                    c_desc,
+                    &heuristic.algo,
+                    workspace_ptr as *mut std::ffi::c_void,
+                    WORKSPACE_SIZE,
+                    stream.cu_stream() as *mut _,
+                )
+                .result()?;
+
+                cublasLtMatmulPreferenceDestroy(preference);
+                cublasLtMatrixLayoutDestroy(c_desc);
+                cublasLtMatrixLayoutDestroy(b_desc);
+                cublasLtMatrixLayoutDestroy(a_desc);
+                cublasLtMatmulDescDestroy(matmul_desc);
+            }
+            Ok(())
+        };
+
+        // Capture child graph launch + cuBLASLt call into a parent graph.
+        unsafe {
+            sys::cuStreamBeginCapture_v2(
+                stream.cu_stream(),
+                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+            )
+            .result()
+            .unwrap();
+        }
+        child_exec.launch(&stream).unwrap();
+        launch_matmul().unwrap();
+
+        let mut captured_graph = std::ptr::null_mut();
+        unsafe {
+            sys::cuStreamEndCapture(stream.cu_stream(), &mut captured_graph)
+                .result()
+                .unwrap();
+        }
+        assert!(!captured_graph.is_null(), "capture should return a graph");
+
+        let mut captured_exec = std::ptr::null_mut();
+        unsafe {
+            sys::cuGraphInstantiateWithFlags(&mut captured_exec, captured_graph, 0)
+                .result()
+                .unwrap();
+            sys::cuGraphLaunch(captured_exec, stream.cu_stream())
+                .result()
+                .unwrap();
+        }
+        stream.synchronize().unwrap();
+
+        let mut child_out = [0.0f32; 1];
+        stream.memcpy_dtoh(&output, &mut child_out).unwrap();
+        assert!(
+            (child_out[0] - 3.0).abs() < 1e-6,
+            "captured child graph kernel result mismatch"
+        );
+
+        let mut c_out = vec![0.0f32; (M * N) as usize];
+        stream.memcpy_dtoh(&c, &mut c_out).unwrap();
+        // A is all ones and B is all twos -> each C element is 2*K.
+        let expected = (2 * K) as f32;
+        assert!(
+            (c_out[0] - expected).abs() < 1e-3,
+            "captured cuBLASLt result mismatch: got {}, expected {}",
+            c_out[0],
+            expected
+        );
+
+        unsafe {
+            sys::cuGraphExecDestroy(captured_exec).result().unwrap();
+            sys::cuGraphDestroy(captured_graph).result().unwrap();
+        }
+    }
+
     // CUDA Graph Tests
 
     #[test]

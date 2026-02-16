@@ -20,7 +20,7 @@ use crate::{cudarc::driver::CudaSlice, host::HostOp};
 static SHARED_CUBLAS: OnceLock<Arc<CudaBlas>> = OnceLock::new();
 
 /// Parse cuBLAS operation from egglog string (e.g., "\"T\"" -> CUBLAS_OP_T)
-fn parse_cublas_op(s: &str) -> cublasOperation_t {
+pub(crate) fn parse_cublas_op(s: &str) -> cublasOperation_t {
     // Strip quotes if present (egglog strings are stored with quotes)
     let stripped = s.trim_matches('"');
     match stripped {
@@ -213,7 +213,9 @@ impl HostOp for CuBlasSgemmV2 {
                 ldc,
             )
         };
-        stream.synchronize().unwrap();
+        if std::env::var("LUMINAL_SYNC_DEBUG").map_or(false, |v| v == "1") {
+            stream.synchronize().unwrap();
+        }
 
         if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(anyhow::anyhow!(
@@ -227,5 +229,13 @@ impl HostOp for CuBlasSgemmV2 {
 
     fn output_size(&self) -> Expression {
         self.m * self.n
+    }
+
+    fn output_bytes(&self) -> Expression {
+        self.output_size() * 4
+    }
+
+    fn stats_name(&self) -> Option<&'static str> {
+        Some("cuBLAS")
     }
 }

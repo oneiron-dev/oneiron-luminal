@@ -49,6 +49,10 @@ pub trait BlockOp: Debug + as_any::AsAny {
     fn output_size(&self) -> Expression {
         unimplemented!()
     }
+    /// Returns the output buffer size in bytes (BlockOps are F32 currently).
+    fn output_bytes(&self) -> Expression {
+        self.output_size() * 4
+    }
     fn producer_barriers_seperate(&self) -> Vec<bool>;
     fn consumer_barriers_seperate(&self) -> Vec<Vec<bool>>;
     /// C function body
@@ -1070,7 +1074,8 @@ impl crate::kernel::KernelOp for MegakernelOp {
                 buffer_count,
                 self.work_queue.len(),
                 self.n_barriers,
-                self.node_to_buffer_index.iter()
+                self.node_to_buffer_index
+                    .iter()
                     .map(|(n, i)| format!("{:?}->{}", n, i))
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -1078,12 +1083,16 @@ impl crate::kernel::KernelOp for MegakernelOp {
             // Dump ALL task fields from the raw work_queue data
             let task_stride = self.work_queue.stride();
             let data = self.work_queue.as_slice();
-            eprintln!("[MEGA_DIAG]   task_stride={} bytes, total_data={} bytes", task_stride, data.len());
+            eprintln!(
+                "[MEGA_DIAG]   task_stride={} bytes, total_data={} bytes",
+                task_stride,
+                data.len()
+            );
             for t in 0..self.work_queue.len() {
                 let offset = t * task_stride;
                 if offset + 72 <= data.len() {
                     let i32_at = |off: usize| -> i32 {
-                        i32::from_ne_bytes(data[offset+off..offset+off+4].try_into().unwrap())
+                        i32::from_ne_bytes(data[offset + off..offset + off + 4].try_into().unwrap())
                     };
                     let op = i32_at(0);
                     let range = i32_at(4);
@@ -1103,32 +1112,41 @@ impl crate::kernel::KernelOp for MegakernelOp {
                         t, op, range, remaining, src_indices, out_index
                     );
                     eprintln!(
-                        "[MEGA_DIAG]     dep_a: stride={} base={}", in_dep_a_stride, in_dep_a_base
+                        "[MEGA_DIAG]     dep_a: stride={} base={}",
+                        in_dep_a_stride, in_dep_a_base
                     );
                     eprintln!(
-                        "[MEGA_DIAG]     dep_b: stride={} base={}", in_dep_b_stride, in_dep_b_base
+                        "[MEGA_DIAG]     dep_b: stride={} base={}",
+                        in_dep_b_stride, in_dep_b_base
                     );
                     eprintln!(
-                        "[MEGA_DIAG]     dep_c: stride={} base={}", in_dep_c_stride, in_dep_c_base
+                        "[MEGA_DIAG]     dep_c: stride={} base={}",
+                        in_dep_c_stride, in_dep_c_base
                     );
                     eprintln!(
-                        "[MEGA_DIAG]     out_dep: stride={} base={}", out_dep_stride, out_dep_base
+                        "[MEGA_DIAG]     out_dep: stride={} base={}",
+                        out_dep_stride, out_dep_base
                     );
                     // Dump payload bytes (after the 72-byte base)
                     let payload_start = offset + 72;
                     let payload_end = (offset + task_stride).min(data.len());
                     if payload_start < payload_end {
                         let payload_bytes = &data[payload_start..payload_end];
-                        let hex: String = payload_bytes.iter()
+                        let hex: String = payload_bytes
+                            .iter()
                             .map(|b| format!("{:02x}", b))
-                            .collect::<Vec<_>>().join(" ");
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         // Also interpret payload as i32 values
-                        let payload_ints: Vec<i32> = payload_bytes.chunks_exact(4)
+                        let payload_ints: Vec<i32> = payload_bytes
+                            .chunks_exact(4)
                             .map(|c| i32::from_ne_bytes(c.try_into().unwrap()))
                             .collect();
                         eprintln!(
                             "[MEGA_DIAG]     payload ({} bytes): hex=[{}] ints={:?}",
-                            payload_bytes.len(), hex, payload_ints
+                            payload_bytes.len(),
+                            hex,
+                            payload_ints
                         );
                     }
                 }
@@ -1209,7 +1227,10 @@ impl crate::kernel::KernelOp for MegakernelOp {
                 panic!(
                     "MegakernelOp: null buffer at idx {} for node {:?}. \
                      all_buffer_ptrs has {} entries, buffer_count={}",
-                    buffer_idx, node, all_buffer_ptrs.len(), buffer_count
+                    buffer_idx,
+                    node,
+                    all_buffer_ptrs.len(),
+                    buffer_count
                 );
             }
         }

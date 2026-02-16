@@ -3,8 +3,9 @@ use std::{fmt::Debug, sync::Arc};
 use crate::cudarc::driver::{CudaSlice, CudaStream};
 use luminal::{op::EgglogOp, prelude::*};
 mod cublas;
+mod cublaslt;
 
-pub type Ops = (cublas::CuBlasSgemmV2,);
+pub type Ops = (cublaslt::CuBlasLt,);
 
 /// Host operations that execute on the CPU but orchestrate GPU work.
 ///
@@ -31,6 +32,17 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
     /// Return 0 if this op doesn't have a single output buffer (e.g., CudaGraphOp).
     fn output_size(&self) -> Expression;
 
+    /// Returns the output buffer size in bytes (accounts for dtype when relevant).
+    fn output_bytes(&self) -> Expression {
+        self.output_size() * 4
+    }
+
+    /// Returns output buffer nodes that must be zeroed before execution.
+    /// Used for kernels with accumulation semantics (e.g., atomicAdd).
+    fn zero_output_nodes(&self) -> Vec<NodeIndex> {
+        vec![]
+    }
+
     /// Returns additional nodes (beyond graph edges) that this op needs buffers for.
     ///
     /// For most ops, this returns empty (buffers determined by graph edges).
@@ -39,7 +51,7 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         vec![]
     }
 
-    /// Returns buffer size requirements for extra nodes (node -> size in elements).
+    /// Returns buffer size requirements for extra nodes (node -> size in bytes).
     ///
     /// Called during buffer allocation to ensure all required buffers exist.
     /// For CudaGraphOp, this returns sizes for all internal kernel output buffers.
