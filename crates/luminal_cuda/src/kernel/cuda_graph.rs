@@ -510,7 +510,8 @@ mod tests {
         if ctx.bind_to_thread().is_err() {
             return;
         }
-        let stream = ctx.default_stream();
+        // Stream capture requires a non-default stream.
+        let stream = ctx.new_stream().unwrap();
 
         // Child graph that will be launched during stream capture (proxy for CudaGraphOp launch).
         let kernel_src = r#"extern "C" __global__ void test_kernel(float* out, float* in1) { if (threadIdx.x == 0) out[0] = in1[0] + 1.0f; }"#;
@@ -555,81 +556,87 @@ mod tests {
         let (b_ptr, _b_guard) = b.device_ptr(&stream);
         let (c_ptr, _c_guard) = c.device_ptr(&stream);
 
+        // Pre-allocate workspace BEFORE capture (cuMemAlloc is not capturable).
+        const WORKSPACE_SIZE: usize = 4 * 1024 * 1024;
+        let workspace = unsafe { stream.alloc::<u8>(WORKSPACE_SIZE) }.unwrap();
+        let (workspace_ptr, _workspace_guard) = workspace.device_ptr(&stream);
+
+        // Pre-create descriptors and find algorithm BEFORE capture (host-side ops).
+        let mut matmul_desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
+        let mut a_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut b_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut c_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut preference: cublasLtMatmulPreference_t = std::ptr::null_mut();
+        let mut heuristic: cublasLtMatmulHeuristicResult_t = unsafe { std::mem::zeroed() };
+        let mut algo_count: i32 = 0;
+        unsafe {
+            cublasLtMatmulDescCreate(
+                &mut matmul_desc,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cudaDataType::CUDA_R_32F,
+            )
+            .result()
+            .unwrap();
+            let layout_n = cublasOperation_t::CUBLAS_OP_N;
+            cublasLtMatmulDescSetAttribute(
+                matmul_desc,
+                cudarc::cublaslt::sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                &layout_n as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<cublasOperation_t>(),
+            )
+            .result()
+            .unwrap();
+            cublasLtMatmulDescSetAttribute(
+                matmul_desc,
+                cudarc::cublaslt::sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                &layout_n as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<cublasOperation_t>(),
+            )
+            .result()
+            .unwrap();
+
+            cublasLtMatrixLayoutCreate(&mut a_desc, cudaDataType::CUDA_R_32F, M, K, K as i64)
+                .result()
+                .unwrap();
+            cublasLtMatrixLayoutCreate(&mut b_desc, cudaDataType::CUDA_R_32F, K, N, N as i64)
+                .result()
+                .unwrap();
+            cublasLtMatrixLayoutCreate(&mut c_desc, cudaDataType::CUDA_R_32F, M, N, N as i64)
+                .result()
+                .unwrap();
+
+            cublasLtMatmulPreferenceCreate(&mut preference).result().unwrap();
+            cublasLtMatmulPreferenceSetAttribute(
+                preference,
+                cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &WORKSPACE_SIZE as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<usize>(),
+            )
+            .result()
+            .unwrap();
+            cublasLtMatmulAlgoGetHeuristic(
+                *cublaslt.handle(),
+                matmul_desc,
+                a_desc,
+                b_desc,
+                c_desc,
+                c_desc,
+                preference,
+                1,
+                &mut heuristic,
+                &mut algo_count,
+            )
+            .result()
+            .unwrap();
+            assert!(algo_count > 0, "No suitable cuBLASLt algorithm found during capture spike");
+        }
+
+        let alpha_f32: f32 = 1.0;
+        let beta_f32: f32 = 0.0;
+
+        // Closure that only does the GPU-enqueued matmul call (safe during capture).
         let mut launch_matmul = || -> anyhow::Result<()> {
-            let mut matmul_desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
-            let mut a_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();
-            let mut b_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();
-            let mut c_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();
-            let mut preference: cublasLtMatmulPreference_t = std::ptr::null_mut();
-            let mut heuristic: cublasLtMatmulHeuristicResult_t = unsafe { std::mem::zeroed() };
-            let mut algo_count: i32 = 0;
-
-            const WORKSPACE_SIZE: usize = 4 * 1024 * 1024;
-            let workspace = unsafe { stream.alloc::<u8>(WORKSPACE_SIZE)? };
-            let (workspace_ptr, _workspace_guard) = workspace.device_ptr(&stream);
-
-            let alpha_f32: f32 = 1.0;
-            let beta_f32: f32 = 0.0;
             unsafe {
-                cublasLtMatmulDescCreate(
-                    &mut matmul_desc,
-                    cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                    cudaDataType::CUDA_R_32F,
-                )
-                .result()?;
-                let layout_n = cublasOperation_t::CUBLAS_OP_N;
-                cublasLtMatmulDescSetAttribute(
-                    matmul_desc,
-                    cudarc::cublaslt::sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
-                    &layout_n as *const _ as *const std::ffi::c_void,
-                    std::mem::size_of::<cublasOperation_t>(),
-                )
-                .result()?;
-                cublasLtMatmulDescSetAttribute(
-                    matmul_desc,
-                    cudarc::cublaslt::sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
-                    &layout_n as *const _ as *const std::ffi::c_void,
-                    std::mem::size_of::<cublasOperation_t>(),
-                )
-                .result()?;
-
-                cublasLtMatrixLayoutCreate(&mut a_desc, cudaDataType::CUDA_R_32F, M, K, K as i64)
-                    .result()?;
-                cublasLtMatrixLayoutCreate(&mut b_desc, cudaDataType::CUDA_R_32F, K, N, N as i64)
-                    .result()?;
-                cublasLtMatrixLayoutCreate(&mut c_desc, cudaDataType::CUDA_R_32F, M, N, N as i64)
-                    .result()?;
-
-                cublasLtMatmulPreferenceCreate(&mut preference).result()?;
-                cublasLtMatmulPreferenceSetAttribute(
-                    preference,
-                    cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                    &WORKSPACE_SIZE as *const _ as *const std::ffi::c_void,
-                    std::mem::size_of::<usize>(),
-                )
-                .result()?;
-                cublasLtMatmulAlgoGetHeuristic(
-                    *cublaslt.handle(),
-                    matmul_desc,
-                    a_desc,
-                    b_desc,
-                    c_desc,
-                    c_desc,
-                    preference,
-                    1,
-                    &mut heuristic,
-                    &mut algo_count,
-                )
-                .result()?;
-                if algo_count == 0 {
-                    cublasLtMatmulPreferenceDestroy(preference);
-                    cublasLtMatrixLayoutDestroy(c_desc);
-                    cublasLtMatrixLayoutDestroy(b_desc);
-                    cublasLtMatrixLayoutDestroy(a_desc);
-                    cublasLtMatmulDescDestroy(matmul_desc);
-                    panic!("No suitable cuBLASLt algorithm found during capture spike");
-                }
-
                 cublasLtMatmul(
                     *cublaslt.handle(),
                     matmul_desc,
@@ -649,12 +656,6 @@ mod tests {
                     stream.cu_stream() as *mut _,
                 )
                 .result()?;
-
-                cublasLtMatmulPreferenceDestroy(preference);
-                cublasLtMatrixLayoutDestroy(c_desc);
-                cublasLtMatrixLayoutDestroy(b_desc);
-                cublasLtMatrixLayoutDestroy(a_desc);
-                cublasLtMatmulDescDestroy(matmul_desc);
             }
             Ok(())
         };
@@ -711,6 +712,11 @@ mod tests {
         unsafe {
             sys::cuGraphExecDestroy(captured_exec).result().unwrap();
             sys::cuGraphDestroy(captured_graph).result().unwrap();
+            cublasLtMatmulPreferenceDestroy(preference);
+            cublasLtMatrixLayoutDestroy(c_desc);
+            cublasLtMatrixLayoutDestroy(b_desc);
+            cublasLtMatrixLayoutDestroy(a_desc);
+            cublasLtMatmulDescDestroy(matmul_desc);
         }
     }
 

@@ -159,7 +159,9 @@ impl CudaRuntime {
         let ctx = cudarc::driver::CudaContext::new(0)?;
         ctx.bind_to_thread()?;
         ctx.set_flags(cudarc::driver::sys::CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC)?;
-        let stream = ctx.default_stream();
+        // Use a non-default stream so that CUDA stream capture works.
+        // cuStreamBeginCapture requires a non-default stream.
+        let stream = ctx.new_stream()?;
 
         Ok(Self::initialize(stream))
     }

@@ -211,11 +211,74 @@ def test_wave_b0_capture():
     }
 
 
+@app.function(
+    gpu="A100-80GB:1",
+    timeout=3600,  # 60 minutes
+    volumes={
+        "/models": model_volume,
+        "/cache": cache_volume,
+    },
+)
+def test_replay_inference():
+    """Run inference with LUMINAL_RUNTIME_GRAPH_REPLAY=1 to test B1 capture/replay."""
+    import os
+
+    run_streaming("nvidia-smi")
+
+    # Show cache status
+    if os.path.exists(CACHE_DIR):
+        cache_files = os.listdir(CACHE_DIR)
+        total_size = sum(os.path.getsize(os.path.join(CACHE_DIR, f)) for f in cache_files)
+        print(f"\nCache: {len(cache_files)} files ({total_size / 1024 / 1024:.1f} MB)", flush=True)
+
+    # Download model weights
+    print("\nDownloading model weights...", flush=True)
+    if not download_model(MAIN_MODEL_REPO, MAIN_MODEL_DIR, ["*.safetensors", "*.json"]):
+        return {"status": "download_failed"}
+    if not download_model(TOKENIZER_REPO, TOKENIZER_DIR, ["*.safetensors", "*.json", "tokenizer*", "vocab*"]):
+        return {"status": "download_failed"}
+    model_volume.commit()
+
+    # Build
+    print("\nBuilding qwen3_tts with CUDA feature...", flush=True)
+    rc, _ = run_streaming("cargo build --release -p qwen3_tts --features cuda", cwd=MOUNT_PATH)
+    if rc != 0:
+        return {"status": "build_failed"}
+
+    binary = f"{MOUNT_PATH}/target/release/qwen3_tts_infer"
+    if not os.path.exists(binary):
+        return {"status": "binary_not_found"}
+
+    # Run with graph replay enabled
+    print("\nRunning CUDA inference with RUNTIME GRAPH REPLAY...", flush=True)
+    rc, output = run_streaming(
+        binary,
+        env={
+            **os.environ,
+            "QWEN3_TTS_MODEL_DIR": MAIN_MODEL_DIR,
+            "QWEN3_TTS_TOKENIZER_DIR": TOKENIZER_DIR,
+            "RUST_BACKTRACE": "1",
+            "QWEN3_TTS_MAX_FRAMES": "100",
+            "LUMINAL_CACHE_DIR": CACHE_DIR,
+            "LUMINAL_PROFILE": "1",
+            "LUMINAL_RUNTIME_GRAPH_REPLAY": "1",
+        },
+    )
+
+    cache_volume.commit()
+    status = "success" if rc == 0 else "failed"
+    print(f"\nReplay inference {status} (exit code: {rc})", flush=True)
+    return {"status": status, "returncode": rc}
+
+
 @app.local_entrypoint()
 def main(target: str = "inference"):
     if target == "wave_b0":
         print("Launching Wave B.0 capture test on Modal A100...")
         result = test_wave_b0_capture.remote()
+    elif target == "replay":
+        print("Launching replay inference test on Modal A100...")
+        result = test_replay_inference.remote()
     else:
         print("Launching CUDA inference test on Modal A100...")
         result = test_cuda_inference.remote()
