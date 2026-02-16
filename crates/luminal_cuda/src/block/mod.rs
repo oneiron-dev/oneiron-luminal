@@ -1245,10 +1245,13 @@ impl crate::kernel::KernelOp for MegakernelOp {
             .memcpy_htod(&buffer_array, &mut buffers_typed)
             .expect("Failed to update buffer array");
 
-        // Ensure all uploads complete before kernel execution
-        stream
-            .synchronize()
-            .expect("Failed to sync after pre_execute");
+        // Ensure all uploads complete before kernel execution.
+        // Skip during CUDA stream capture (synchronize is illegal on a captured stream).
+        if !crate::CUDA_STREAM_CAPTURING.get() {
+            stream
+                .synchronize()
+                .expect("Failed to sync after pre_execute");
+        }
     }
 
     fn timing_buffer_indices(&self) -> Option<(usize, usize, usize)> {

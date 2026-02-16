@@ -1160,8 +1160,20 @@ impl CudaRuntime {
             .result()?;
         }
 
+        // Set the thread-local capturing flag so that synchronize calls inside
+        // MegakernelOp::pre_execute and CudaGraphOp::execute_internal are suppressed.
+        // Use a drop guard to ensure the flag is always cleared, even on panic.
+        struct CaptureGuard;
+        impl Drop for CaptureGuard {
+            fn drop(&mut self) {
+                crate::CUDA_STREAM_CAPTURING.set(false);
+            }
+        }
+        crate::CUDA_STREAM_CAPTURING.set(true);
+        let _guard = CaptureGuard;
         let (n_zeroed_bufs, zero_us) = self.zero_buffers_for_execute(force_zero_all, false);
         let (n_ops, dispatch_us) = self.execute_host_ops_loop(dyn_map, false);
+        drop(_guard);
 
         let mut captured_graph = std::ptr::null_mut();
         unsafe {
@@ -1176,9 +1188,18 @@ impl CudaRuntime {
         }
 
         let mut captured_exec = std::ptr::null_mut();
-        unsafe {
+        let instantiate_result = unsafe {
             cudarc::driver::sys::cuGraphInstantiateWithFlags(&mut captured_exec, captured_graph, 0)
-                .result()?;
+                .result()
+        };
+        if let Err(e) = instantiate_result {
+            // Clean up the graph handle on instantiation failure to avoid leaking it.
+            unsafe {
+                cudarc::driver::sys::cuGraphDestroy(captured_graph).result().ok();
+            }
+            return Err(e.into());
+        }
+        unsafe {
             cudarc::driver::sys::cuGraphDestroy(captured_graph).result()?;
         }
 

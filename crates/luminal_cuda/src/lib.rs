@@ -3,9 +3,16 @@ pub mod host;
 pub mod kernel;
 pub mod logical;
 pub mod runtime;
+use std::cell::Cell;
 use std::sync::Arc;
 
 pub use cudarc;
+
+// Thread-local flag set during CUDA stream capture. When true, synchronize calls
+// on the captured stream must be skipped (cuStreamSynchronize is illegal during capture).
+thread_local! {
+    pub static CUDA_STREAM_CAPTURING: Cell<bool> = const { Cell::new(false) };
+}
 
 #[cfg(test)]
 mod tests;

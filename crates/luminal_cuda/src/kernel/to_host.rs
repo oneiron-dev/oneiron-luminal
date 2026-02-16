@@ -490,7 +490,8 @@ impl CudaGraphOp {
         }
 
         // Keep pre-launch sync only when debugging or when graph params changed this call.
-        if sync_debug || graph_rebuilt || needs_update {
+        // Skip during CUDA stream capture (synchronize is illegal on a captured stream).
+        if !crate::CUDA_STREAM_CAPTURING.get() && (sync_debug || graph_rebuilt || needs_update) {
             stream.synchronize()?;
         }
 
