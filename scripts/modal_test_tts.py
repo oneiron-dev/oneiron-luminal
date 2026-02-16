@@ -124,14 +124,6 @@ def test_cuda_inference():
     run_streaming("nvidia-smi")
     run_streaming("nvcc --version")
 
-    # One-time cache clear after cuBLAS→cuBLASLt op-set change.
-    # Remove this block after first successful run with cuBLASLt.
-    if os.path.exists(CACHE_DIR) and os.listdir(CACHE_DIR):
-        import shutil
-        print(f"\nClearing stale e-graph cache (cuBLASLt migration)...", flush=True)
-        shutil.rmtree(CACHE_DIR)
-        os.makedirs(CACHE_DIR, exist_ok=True)
-
     # Show cache status
     if os.path.exists(CACHE_DIR):
         cache_files = os.listdir(CACHE_DIR)
@@ -196,8 +188,35 @@ def test_cuda_inference():
     return {"status": status, "returncode": rc}
 
 
+@app.function(
+    gpu="A100-80GB:1",
+    timeout=1800,  # 30 minutes
+)
+def test_wave_b0_capture():
+    # Print GPU info
+    run_streaming("nvidia-smi")
+    run_streaming("nvcc --version")
+
+    cmd = (
+        "cargo test -p luminal_cuda "
+        "wave_b0_stream_capture_with_graph_launch_and_cublaslt "
+        "-- --ignored --nocapture"
+    )
+    rc, output = run_streaming(cmd, cwd=MOUNT_PATH)
+    status = "success" if rc == 0 else "failed"
+    return {
+        "status": status,
+        "returncode": rc,
+        "summary": output[-4000:],
+    }
+
+
 @app.local_entrypoint()
-def main():
-    print("Launching CUDA test on Modal A100...")
-    result = test_cuda_inference.remote()
+def main(target: str = "inference"):
+    if target == "wave_b0":
+        print("Launching Wave B.0 capture test on Modal A100...")
+        result = test_wave_b0_capture.remote()
+    else:
+        print("Launching CUDA inference test on Modal A100...")
+        result = test_cuda_inference.remote()
     print(f"\nResult: {result['status']}")
