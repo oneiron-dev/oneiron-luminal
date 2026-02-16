@@ -262,6 +262,7 @@ def test_replay_inference():
             "LUMINAL_CACHE_DIR": CACHE_DIR,
             "LUMINAL_PROFILE": "1",
             "LUMINAL_RUNTIME_GRAPH_REPLAY": "1",
+            "LUMINAL_RUNTIME_GRAPH_DEBUG": "1",
         },
     )
 

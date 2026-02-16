@@ -1274,7 +1274,7 @@ impl CudaRuntime {
                 parent_graph.add_child_graph_node(&[], child_graph)?
             } else {
                 let op_name = exec_op.internal.stats_name().unwrap_or("unknown");
-                if op_name != "cuBLAS" && op_name != "cuBLASLT" {
+                if op_name != "cuBLAS" && op_name != "cuBLASLt" {
                     anyhow::bail!("Unsupported HostOp for runtime graph build: {op_name}");
                 }
 
