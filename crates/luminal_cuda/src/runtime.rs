@@ -1339,7 +1339,10 @@ impl CudaRuntime {
         capture_stream: &Arc<CudaStream>,
     ) -> anyhow::Result<(usize, usize, f64, f64, usize)> {
         let build_t = std::time::Instant::now();
-        let mut parent_graph = CudaGraphHandle::new(self.cuda_stream.context().clone())?;
+        let replay_debug =
+            std::env::var("LUMINAL_RUNTIME_GRAPH_DEBUG").map_or(false, |v| v == "1");
+        let mut parent_graph = CudaGraphHandle::new(self.cuda_stream.context().clone())
+            .map_err(|e| anyhow::anyhow!("[graph_build:create] {e}"))?;
         let exec_order = toposort(&self.exec_graph, None).unwrap();
         let n_ops = exec_order.len();
 
@@ -1360,33 +1363,52 @@ impl CudaRuntime {
         for node in zero_targets.into_iter().sorted_by_key(|n| n.index()) {
             if let Some(buffer) = self.buffers.get(&node) {
                 let ptr = buffer.device_ptr(&self.cuda_stream).0;
-                let memset_node = parent_graph.add_memset_zero_node_u8(&[], ptr, buffer.len())?;
+                let memset_node = parent_graph
+                    .add_memset_zero_node_u8(&[], ptr, buffer.len())
+                    .map_err(|e| anyhow::anyhow!("[graph_build:memset node={:?}] {e}", node))?;
                 zero_nodes.insert(node, memset_node);
                 n_zeroed_bufs += 1;
             }
         }
+        if replay_debug {
+            eprintln!(
+                "    [graph_build] added {n_zeroed_bufs} memset nodes, building {n_ops} ops..."
+            );
+        }
 
         // Build one parent node per HostOp.
-        for exec_node in exec_order {
-            let exec_op = &self.exec_graph[exec_node];
+        for (op_idx, exec_node) in exec_order.iter().enumerate() {
+            let exec_op = &self.exec_graph[*exec_node];
             let buffer_map = self.build_host_op_buffer_map(exec_op);
-            touched_buffers.insert(exec_node, buffer_map.keys().copied().collect());
+            touched_buffers.insert(*exec_node, buffer_map.keys().copied().collect());
 
+            let op_name = exec_op.internal.stats_name().unwrap_or("unknown");
             let graph_node = if let Some(cuda_graph_op) =
                 exec_op.internal.as_any().downcast_ref::<CudaGraphOp>()
             {
                 // Build/update child graph without launching; parent graph will launch it later.
-                cuda_graph_op.ensure_built_and_updated_for_runtime_graph(
-                    &exec_op.stream,
-                    &buffer_map,
-                    dyn_map,
-                )?;
+                cuda_graph_op
+                    .ensure_built_and_updated_for_runtime_graph(
+                        &exec_op.stream,
+                        &buffer_map,
+                        dyn_map,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "[graph_build:ensure_built op={op_idx} {op_name}] {e}"
+                        )
+                    })?;
                 let child_graph = cuda_graph_op.cu_graph().ok_or_else(|| {
                     anyhow::anyhow!("CudaGraphOp child graph missing after ensure_built")
                 })?;
-                parent_graph.add_child_graph_node(&[], child_graph)?
+                parent_graph
+                    .add_child_graph_node(&[], child_graph)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "[graph_build:add_child_cudagraph op={op_idx} {op_name}] {e}"
+                        )
+                    })?
             } else {
-                let op_name = exec_op.internal.stats_name().unwrap_or("unknown");
                 if op_name != "cuBLAS" && op_name != "cuBLASLt" {
                     anyhow::bail!("Unsupported HostOp for runtime graph build: {op_name}");
                 }
@@ -1394,21 +1416,34 @@ impl CudaRuntime {
                 // Mini-capture uses current buffer_map pointers; parent node clones this graph.
                 // Capture prep and mini-capture must use the same CUDA stream handle.
                 // If pointers change, signature invalidation forces a full parent graph rebuild.
-                let captured = self.capture_single_host_op_graph(
-                    exec_op,
-                    capture_stream,
-                    &buffer_map,
-                    dyn_map,
-                )?;
+                let captured = self
+                    .capture_single_host_op_graph(exec_op, capture_stream, &buffer_map, dyn_map)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "[graph_build:mini_capture op={op_idx} {op_name}] {e}"
+                        )
+                    })?;
                 mini_capture_count += 1;
-                let node = parent_graph.add_child_graph_node(&[], captured)?;
+                let node = parent_graph
+                    .add_child_graph_node(&[], captured)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "[graph_build:add_child_minicap op={op_idx} {op_name}] {e}"
+                        )
+                    })?;
                 unsafe {
                     cudarc::driver::sys::cuGraphDestroy(captured).result()?;
                 }
                 node
             };
 
-            op_nodes.insert(exec_node, graph_node);
+            op_nodes.insert(*exec_node, graph_node);
+        }
+
+        if replay_debug {
+            eprintln!(
+                "    [graph_build] all ops added ({mini_capture_count} mini-captures), adding deps..."
+            );
         }
 
         // Add data dependencies from exec_graph edges.
@@ -1423,7 +1458,9 @@ impl CudaRuntime {
             };
             let key = (from_node as usize, to_node as usize);
             if added_deps.insert(key) {
-                parent_graph.add_dependency(from_node, to_node)?;
+                parent_graph
+                    .add_dependency(from_node, to_node)
+                    .map_err(|e| anyhow::anyhow!("[graph_build:edge_dep] {e}"))?;
             }
         }
 
@@ -1438,12 +1475,25 @@ impl CudaRuntime {
                 };
                 let key = (zero_node as usize, op_node as usize);
                 if added_deps.insert(key) {
-                    parent_graph.add_dependency(zero_node, op_node)?;
+                    parent_graph
+                        .add_dependency(zero_node, op_node)
+                        .map_err(|e| {
+                            anyhow::anyhow!("[graph_build:zero_dep buf={buffer_node:?}] {e}")
+                        })?;
                 }
             }
         }
 
-        let graph_exec = parent_graph.instantiate()?;
+        if replay_debug {
+            eprintln!(
+                "    [graph_build] deps added ({} total), instantiating...",
+                added_deps.len()
+            );
+        }
+
+        let graph_exec = parent_graph
+            .instantiate()
+            .map_err(|e| anyhow::anyhow!("[graph_build:instantiate] {e}"))?;
         let build_us = build_t.elapsed().as_micros() as f64;
         self.runtime_replay.graph_exec = Some(graph_exec);
 
