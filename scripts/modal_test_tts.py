@@ -47,7 +47,7 @@ image = (
         # Install Rust toolchain
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
     )
-    .pip_install("huggingface_hub[hf_xet]")
+    .pip_install("huggingface_hub[hf_xet]", "triton>=2.1")
     .env({
         "PATH": "/root/.cargo/bin:/usr/local/cuda-12.4/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "CUDA_PATH": "/usr/local/cuda-12.4",
@@ -272,6 +272,39 @@ def test_replay_inference():
     return {"status": status, "returncode": rc}
 
 
+@app.function(
+    gpu="A100-80GB:1",
+    timeout=600,  # 10 minutes
+)
+def compile_flash_attn_kernels():
+    """Compile FlashAttention Triton kernels to CUBIN on A100 and return artifacts."""
+    import base64
+
+    run_streaming("nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader")
+
+    out_dir = f"{MOUNT_PATH}/crates/luminal_cuda/kernels"
+    rc, output = run_streaming(
+        f"python3 {MOUNT_PATH}/scripts/compile_flash_attn.py "
+        f"--modes masked causal --head-dims 64 128 --sms 80 "
+        f"--out-dir {out_dir}",
+    )
+    if rc != 0:
+        return {"status": "compile_failed"}
+
+    # Collect all generated artifacts
+    import os
+    artifacts = {}
+    for fname in os.listdir(out_dir):
+        if fname.endswith(".cubin") or fname.endswith(".entry"):
+            fpath = os.path.join(out_dir, fname)
+            with open(fpath, "rb") as f:
+                artifacts[fname] = base64.b64encode(f.read()).decode("ascii")
+            size = os.path.getsize(fpath)
+            print(f"  {fname}: {size} bytes", flush=True)
+
+    return {"status": "success", "artifacts": artifacts}
+
+
 @app.local_entrypoint()
 def main(target: str = "inference"):
     if target == "wave_b0":
@@ -280,6 +313,20 @@ def main(target: str = "inference"):
     elif target == "replay":
         print("Launching replay inference test on Modal A100...")
         result = test_replay_inference.remote()
+    elif target == "compile_fa":
+        print("Compiling FlashAttention kernels on Modal A100...")
+        result = compile_flash_attn_kernels.remote()
+        if result["status"] == "success":
+            import base64
+            import os
+            local_dir = os.path.join(LOCAL_REPO, "crates/luminal_cuda/kernels")
+            os.makedirs(local_dir, exist_ok=True)
+            for fname, b64data in result["artifacts"].items():
+                out_path = os.path.join(local_dir, fname)
+                with open(out_path, "wb") as f:
+                    f.write(base64.b64decode(b64data))
+                print(f"  Wrote {out_path} ({os.path.getsize(out_path)} bytes)")
+            print(f"\n{len(result['artifacts'])} artifacts written to {local_dir}")
     else:
         print("Launching CUDA inference test on Modal A100...")
         result = test_cuda_inference.remote()
