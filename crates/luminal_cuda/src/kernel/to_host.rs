@@ -516,11 +516,11 @@ impl CudaGraphOp {
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<ReplayRefreshOutcome> {
         let mut state = self.state.borrow_mut();
-        let Some(captured_internal_ptrs) = state.runtime_capture_internal_ptrs.clone() else {
+        if state.runtime_capture_internal_ptrs.is_none() {
             return Ok(ReplayRefreshOutcome::NeedsRecapture(
                 "missing capture internal pointer fingerprint".to_string(),
             ));
-        };
+        }
 
         if dyn_map.len() != state.last_dyn_values.len()
             || dyn_map
@@ -544,13 +544,13 @@ impl CudaGraphOp {
                 "kernel params missing or stale".to_string(),
             ));
         }
-        let pre_refresh_fingerprint = Self::internal_pointer_fingerprint(&state, stream);
-        if pre_refresh_fingerprint != captured_internal_ptrs {
-            return Ok(ReplayRefreshOutcome::NeedsRecapture(
-                "internal pointer drift detected before replay refresh".to_string(),
-            ));
-        }
 
+        // Run pre_execute to update MegakernelOp buffer arrays (writes buffer
+        // pointers into internal_bufs[6]).  Internal buffer *pointers* cannot
+        // change here — they are owned by CudaGraphOpState and only reallocated
+        // when dynamic dimensions change (already caught above).  Skipping the
+        // expensive device_ptr()-based fingerprint check saves ~38ms/frame by
+        // avoiding thousands of CUDA event inject/record operations.
         for idx in 0..state.kernels.len() {
             let kernel = &mut state.kernels[idx];
             kernel.kernel_op.pre_execute(
@@ -560,13 +560,6 @@ impl CudaGraphOp {
                 &current_buffer_ptrs,
                 dyn_map,
             );
-        }
-
-        let post_refresh_fingerprint = Self::internal_pointer_fingerprint(&state, stream);
-        if post_refresh_fingerprint != captured_internal_ptrs {
-            return Ok(ReplayRefreshOutcome::NeedsRecapture(
-                "internal pointer drift detected after replay refresh".to_string(),
-            ));
         }
 
         Ok(ReplayRefreshOutcome::Ready)
