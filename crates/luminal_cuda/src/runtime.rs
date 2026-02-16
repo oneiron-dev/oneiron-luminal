@@ -3,7 +3,7 @@ use crate::{
     host::HostOp,
     kernel::{
         CudaGraphExecHandle, CudaGraphHandle, CudaGraphOp, CudaGraphTiming, KernelOp,
-        record_cuda_graph_timings,
+        ReplayRefreshOutcome, record_cuda_graph_timings,
     },
 };
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice};
@@ -910,32 +910,17 @@ impl Runtime for CudaRuntime {
                     panic!("runtime_replay signature changed without invalidation");
                 }
                 if let Some(exec) = self.runtime_replay.graph_exec.as_ref() {
-                    // Parent replay launches frozen child graphs only; refresh CudaGraphOp
-                    // pre_execute state (e.g. Megakernel queues/counters) each frame.
-                    if let Err(err) = self.refresh_cuda_graph_ops_for_replay(dyn_map) {
-                        if replay_debug {
-                            eprintln!(
-                                "    [runtime_replay] pre-launch refresh failed, falling back: {err}"
-                            );
-                        }
-                        self.runtime_replay.last_error = Some(err.to_string());
-                        self.runtime_replay.state = RuntimeReplayState::WarmupPending;
-                        let (n_zeroed, zero_time_us) =
-                            self.zero_buffers_for_execute(force_zero_all, true);
-                        n_zeroed_bufs = n_zeroed;
-                        zero_us = zero_time_us;
-                        replay_mode = "fallback";
-                        self.execute_host_ops_loop(dyn_map, sync_debug)
-                    } else {
-                        let launch_t = std::time::Instant::now();
-                        // Replay launches the frozen parent graph after per-frame CudaGraphOp pre_execute refresh.
-                        if let Err(err) = exec.launch(&self.cuda_stream) {
+                    // Parent replay launches frozen kernels only; refresh CudaGraphOp pre_execute
+                    // state each frame and recapture if any internal pointer drift is detected.
+                    match self.refresh_cuda_graph_ops_for_replay(dyn_map) {
+                        Ok(Some(reason)) => {
                             if replay_debug {
                                 eprintln!(
-                                    "    [runtime_replay] launch failed, falling back: {err}"
+                                    "    [runtime_replay] pre-launch refresh requested recapture: {reason}"
                                 );
                             }
-                            self.runtime_replay.last_error = Some(err.to_string());
+                            self.runtime_replay.last_error = Some(reason);
+                            self.runtime_replay.graph_exec = None;
                             self.runtime_replay.state = RuntimeReplayState::WarmupPending;
                             let (n_zeroed, zero_time_us) =
                                 self.zero_buffers_for_execute(force_zero_all, true);
@@ -943,9 +928,44 @@ impl Runtime for CudaRuntime {
                             zero_us = zero_time_us;
                             replay_mode = "fallback";
                             self.execute_host_ops_loop(dyn_map, sync_debug)
-                        } else {
-                            replay_mode = "replay";
-                            (1, launch_t.elapsed().as_micros() as f64)
+                        }
+                        Ok(None) => {
+                            let launch_t = std::time::Instant::now();
+                            if let Err(err) = exec.launch(&self.cuda_stream) {
+                                if replay_debug {
+                                    eprintln!(
+                                        "    [runtime_replay] launch failed, falling back: {err}"
+                                    );
+                                }
+                                self.runtime_replay.last_error = Some(err.to_string());
+                                self.runtime_replay.graph_exec = None;
+                                self.runtime_replay.state = RuntimeReplayState::WarmupPending;
+                                let (n_zeroed, zero_time_us) =
+                                    self.zero_buffers_for_execute(force_zero_all, true);
+                                n_zeroed_bufs = n_zeroed;
+                                zero_us = zero_time_us;
+                                replay_mode = "fallback";
+                                self.execute_host_ops_loop(dyn_map, sync_debug)
+                            } else {
+                                replay_mode = "replay";
+                                (1, launch_t.elapsed().as_micros() as f64)
+                            }
+                        }
+                        Err(err) => {
+                            if replay_debug {
+                                eprintln!(
+                                    "    [runtime_replay] pre-launch refresh failed, falling back: {err}"
+                                );
+                            }
+                            self.runtime_replay.last_error = Some(err.to_string());
+                            self.runtime_replay.graph_exec = None;
+                            self.runtime_replay.state = RuntimeReplayState::WarmupPending;
+                            let (n_zeroed, zero_time_us) =
+                                self.zero_buffers_for_execute(force_zero_all, true);
+                            n_zeroed_bufs = n_zeroed;
+                            zero_us = zero_time_us;
+                            replay_mode = "fallback";
+                            self.execute_host_ops_loop(dyn_map, sync_debug)
                         }
                     }
                 } else {
@@ -984,16 +1004,16 @@ impl Runtime for CudaRuntime {
                     replay_mode = "fallback";
                     self.execute_host_ops_loop(dyn_map, sync_debug)
                 } else {
-                    match self.build_runtime_graph(dyn_map, force_zero_all, &capture_stream) {
-                        Ok((n_zeroed, ops, build_us, replay_launch_us, mini_captures)) => {
+                    match self.build_runtime_graph_v2(dyn_map, force_zero_all, &capture_stream) {
+                        Ok((n_zeroed, ops, build_us, replay_launch_us)) => {
                             n_zeroed_bufs = n_zeroed;
                             zero_us = 0.0;
                             // launch time is the meaningful host-side cost after capture is built.
                             self.runtime_replay.state = RuntimeReplayState::Ready;
-                            replay_mode = "capture";
+                            replay_mode = "capture_v2";
                             if replay_debug {
                                 eprintln!(
-                                    "    [runtime_replay] built parent graph ({mini_captures} mini-captures, build: {:.2}ms)",
+                                    "    [runtime_replay] built flat runtime graph (build: {:.2}ms)",
                                     build_us / 1000.0
                                 );
                             }
@@ -1143,7 +1163,7 @@ impl CudaRuntime {
     fn refresh_cuda_graph_ops_for_replay(
         &self,
         dyn_map: &FxHashMap<char, usize>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
         let exec_order = toposort(&self.exec_graph, None).unwrap();
         for exec_node in exec_order {
             let exec_op = &self.exec_graph[exec_node];
@@ -1151,14 +1171,57 @@ impl CudaRuntime {
             else {
                 continue;
             };
-            let buffer_map = self.build_host_op_buffer_map(exec_op);
-            cuda_graph_op.ensure_built_and_updated_for_runtime_graph(
-                &exec_op.stream,
-                &buffer_map,
-                dyn_map,
-            )?;
+            let raw_map = self.build_host_op_raw_ptr_map(exec_op)?;
+            match cuda_graph_op.refresh_for_runtime_replay(&self.cuda_stream, &raw_map, dyn_map)? {
+                ReplayRefreshOutcome::Ready => {}
+                ReplayRefreshOutcome::NeedsRecapture(reason) => {
+                    let op_name = exec_op.internal.stats_name().unwrap_or("unknown");
+                    return Ok(Some(format!(
+                        "replay refresh requested recapture at op {} ({op_name}): {reason}",
+                        exec_node.index()
+                    )));
+                }
+            }
         }
-        Ok(())
+        Ok(None)
+    }
+
+    fn resolve_cached_or_input_ptr(&self, node: NodeIndex) -> Option<u64> {
+        if let Some(ptr) = self.cached_buffer_ptrs.get(&node) {
+            return Some(*ptr);
+        }
+        if let Some(hlir_node) = self.llir_to_hlir.get(&node) {
+            return match self.hlir_buffers.get(hlir_node) {
+                Some(CudaInput::Ptr(p)) => Some(*p),
+                Some(CudaInput::Buffer(buf)) => Some(buf.device_ptr(&self.cuda_stream).0),
+                None => None,
+            };
+        }
+        self.buffers
+            .get(&node)
+            .map(|buf| buf.device_ptr(&self.cuda_stream).0)
+    }
+
+    fn build_host_op_raw_ptr_map(
+        &self,
+        exec_op: &ExecutableHostOp,
+    ) -> anyhow::Result<FxHashMap<NodeIndex, u64>> {
+        let mut nodes = Vec::with_capacity(
+            1 + exec_op.inputs.len() + exec_op.internal.extra_buffer_nodes().len(),
+        );
+        nodes.push(exec_op.output);
+        nodes.extend(exec_op.inputs.iter().copied());
+        nodes.extend(exec_op.internal.extra_buffer_nodes());
+        nodes.sort_by_key(|n| n.index());
+        nodes.dedup();
+
+        let mut ptrs = FxHashMap::default();
+        for node in nodes {
+            if let Some(ptr) = self.resolve_cached_or_input_ptr(node) {
+                ptrs.insert(node, ptr);
+            }
+        }
+        Ok(ptrs)
     }
 
     fn build_host_op_buffer_map<'a>(
@@ -1332,6 +1395,218 @@ impl CudaRuntime {
         capture_res
     }
 
+    fn enqueue_zero_buffers_for_capture(
+        &self,
+        force_zero_all: bool,
+        capture_stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<usize> {
+        let zero_targets = if force_zero_all {
+            self.buffers.keys().copied().collect_vec()
+        } else {
+            self.buffers_requiring_zero.iter().copied().collect_vec()
+        };
+
+        let mut n_zeroed = 0usize;
+        for node in zero_targets.into_iter().sorted_by_key(|n| n.index()) {
+            let Some(buffer) = self.buffers.get(&node) else {
+                continue;
+            };
+            if buffer.is_empty() {
+                continue;
+            }
+            let Some(&ptr) = self.cached_buffer_ptrs.get(&node) else {
+                anyhow::bail!("Missing cached pointer for zeroing node {:?}", node);
+            };
+            unsafe {
+                cudarc::driver::sys::cuMemsetD8Async(
+                    ptr,
+                    0,
+                    buffer.len(),
+                    capture_stream.cu_stream(),
+                )
+                .result()?;
+            }
+            n_zeroed += 1;
+        }
+        Ok(n_zeroed)
+    }
+
+    fn build_runtime_graph_v2(
+        &mut self,
+        dyn_map: &FxHashMap<char, usize>,
+        force_zero_all: bool,
+        capture_stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<(usize, usize, f64, f64)> {
+        let build_t = std::time::Instant::now();
+        let exec_order = toposort(&self.exec_graph, None).unwrap();
+        let n_ops = exec_order.len();
+
+        capture_stream.context().bind_to_thread()?;
+
+        // Phase A: pre-capture warmup/preparation.
+        let mut raw_maps: Vec<FxHashMap<NodeIndex, u64>> = Vec::with_capacity(n_ops);
+        for exec_node in &exec_order {
+            let exec_op = &self.exec_graph[*exec_node];
+            let op_name = exec_op.internal.stats_name().unwrap_or("unknown");
+            let raw_map = self.build_host_op_raw_ptr_map(exec_op).map_err(|e| {
+                anyhow::anyhow!(
+                    "[capture_v2:raw_ptr_map op={} {op_name}] {e:#}",
+                    exec_node.index()
+                )
+            })?;
+
+            if let Some(cuda_graph_op) = exec_op.internal.as_any().downcast_ref::<CudaGraphOp>() {
+                cuda_graph_op
+                    .prepare_for_runtime_capture(capture_stream, &raw_map, dyn_map)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "[capture_v2:prepare_cuda_graph op={} {op_name}] {e:#}",
+                            exec_node.index()
+                        )
+                    })?;
+            } else if matches!(op_name, "cuBLAS" | "cuBLASLt") {
+                let buffer_map = self.build_host_op_buffer_map(exec_op);
+                exec_op
+                    .internal
+                    .warmup_for_capture(
+                        capture_stream,
+                        exec_op.output,
+                        &exec_op.inputs,
+                        &buffer_map,
+                        dyn_map,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "[capture_v2:warmup op={} {op_name}] {e:#}",
+                            exec_node.index()
+                        )
+                    })?;
+            } else {
+                anyhow::bail!(
+                    "Unsupported HostOp for runtime graph capture_v2 warmup: {} (op index {})",
+                    op_name,
+                    exec_node.index()
+                );
+            }
+
+            raw_maps.push(raw_map);
+        }
+        capture_stream.synchronize()?;
+
+        // Phase B: capture the whole runtime op stream into one flat graph.
+        let prev_capture_flag = crate::CUDA_STREAM_CAPTURING.get();
+        crate::CUDA_STREAM_CAPTURING.set(true);
+        let capture_res = (|| -> anyhow::Result<(cudarc::driver::sys::CUgraph, usize)> {
+            unsafe {
+                cudarc::driver::sys::cuStreamBeginCapture_v2(
+                    capture_stream.cu_stream(),
+                    cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_GLOBAL,
+                )
+                .result()?;
+            }
+
+            let n_zeroed_bufs =
+                match self.enqueue_zero_buffers_for_capture(force_zero_all, capture_stream) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let mut discarded_graph = std::ptr::null_mut();
+                        unsafe {
+                            let _ = cudarc::driver::sys::cuStreamEndCapture(
+                                capture_stream.cu_stream(),
+                                &mut discarded_graph,
+                            );
+                            if !discarded_graph.is_null() {
+                                let _ = cudarc::driver::sys::cuGraphDestroy(discarded_graph);
+                            }
+                        }
+                        return Err(err);
+                    }
+                };
+
+            for (idx, exec_node) in exec_order.iter().enumerate() {
+                let exec_op = &self.exec_graph[*exec_node];
+                let op_name = exec_op.internal.stats_name().unwrap_or("unknown");
+                let execute_res = if let Some(cuda_graph_op) =
+                    exec_op.internal.as_any().downcast_ref::<CudaGraphOp>()
+                {
+                    cuda_graph_op.replay_kernels_onto_stream(capture_stream, dyn_map)
+                } else if matches!(op_name, "cuBLAS" | "cuBLASLt") {
+                    exec_op.internal.execute_for_capture_raw(
+                        capture_stream,
+                        exec_op.output,
+                        &exec_op.inputs,
+                        &raw_maps[idx],
+                        dyn_map,
+                    )
+                } else {
+                    anyhow::bail!(
+                        "Unsupported HostOp for runtime graph capture_v2: {} (op index {})",
+                        op_name,
+                        exec_node.index()
+                    );
+                };
+
+                if let Err(err) = execute_res {
+                    let mut discarded_graph = std::ptr::null_mut();
+                    unsafe {
+                        let _ = cudarc::driver::sys::cuStreamEndCapture(
+                            capture_stream.cu_stream(),
+                            &mut discarded_graph,
+                        );
+                        if !discarded_graph.is_null() {
+                            let _ = cudarc::driver::sys::cuGraphDestroy(discarded_graph);
+                        }
+                    }
+                    return Err(anyhow::anyhow!(
+                        "[capture_v2:execute op={} {op_name}] {err:#}",
+                        exec_node.index()
+                    ));
+                }
+            }
+
+            let mut captured_graph = std::ptr::null_mut();
+            unsafe {
+                cudarc::driver::sys::cuStreamEndCapture(
+                    capture_stream.cu_stream(),
+                    &mut captured_graph,
+                )
+                .result()?;
+            }
+            if captured_graph.is_null() {
+                anyhow::bail!("capture_v2 returned null graph");
+            }
+
+            Ok((captured_graph, n_zeroed_bufs))
+        })();
+        crate::CUDA_STREAM_CAPTURING.set(prev_capture_flag);
+
+        let (captured_graph, n_zeroed_bufs) = capture_res?;
+
+        let mut captured_exec = std::ptr::null_mut();
+        unsafe {
+            cudarc::driver::sys::cuGraphInstantiateWithFlags(&mut captured_exec, captured_graph, 0)
+                .result()?;
+            cudarc::driver::sys::cuGraphDestroy(captured_graph).result()?;
+        }
+        self.runtime_replay.graph_exec = Some(CudaGraphExecHandle {
+            cu_graph_exec: captured_exec,
+            ctx: self.cuda_stream.context().clone(),
+        });
+
+        let build_us = build_t.elapsed().as_micros() as f64;
+
+        // Launch once for this capture frame.
+        let launch_t = std::time::Instant::now();
+        self.runtime_replay
+            .graph_exec
+            .as_ref()
+            .expect("runtime graph exec should be initialized")
+            .launch(&self.cuda_stream)?;
+        let launch_us = launch_t.elapsed().as_micros() as f64;
+
+        Ok((n_zeroed_bufs, n_ops, build_us, launch_us))
+    }
+
     fn build_runtime_graph(
         &mut self,
         dyn_map: &FxHashMap<char, usize>,
@@ -1339,8 +1614,7 @@ impl CudaRuntime {
         capture_stream: &Arc<CudaStream>,
     ) -> anyhow::Result<(usize, usize, f64, f64, usize)> {
         let build_t = std::time::Instant::now();
-        let replay_debug =
-            std::env::var("LUMINAL_RUNTIME_GRAPH_DEBUG").map_or(false, |v| v == "1");
+        let replay_debug = std::env::var("LUMINAL_RUNTIME_GRAPH_DEBUG").map_or(false, |v| v == "1");
         let mut parent_graph = CudaGraphHandle::new(self.cuda_stream.context().clone())
             .map_err(|e| anyhow::anyhow!("[graph_build:create] {e}"))?;
         let exec_order = toposort(&self.exec_graph, None).unwrap();
@@ -1394,9 +1668,7 @@ impl CudaRuntime {
                         dyn_map,
                     )
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "[graph_build:ensure_built op={op_idx} {op_name}] {e}"
-                        )
+                        anyhow::anyhow!("[graph_build:ensure_built op={op_idx} {op_name}] {e}")
                     })?;
                 let child_graph = cuda_graph_op.cu_graph().ok_or_else(|| {
                     anyhow::anyhow!("CudaGraphOp child graph missing after ensure_built")
@@ -1419,17 +1691,13 @@ impl CudaRuntime {
                 let captured = self
                     .capture_single_host_op_graph(exec_op, capture_stream, &buffer_map, dyn_map)
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "[graph_build:mini_capture op={op_idx} {op_name}] {e}"
-                        )
+                        anyhow::anyhow!("[graph_build:mini_capture op={op_idx} {op_name}] {e}")
                     })?;
                 mini_capture_count += 1;
                 let node = parent_graph
                     .add_child_graph_node(&[], captured)
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "[graph_build:add_child_minicap op={op_idx} {op_name}] {e}"
-                        )
+                        anyhow::anyhow!("[graph_build:add_child_minicap op={op_idx} {op_name}] {e}")
                     })?;
                 unsafe {
                     cudarc::driver::sys::cuGraphDestroy(captured).result()?;

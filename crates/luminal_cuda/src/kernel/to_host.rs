@@ -128,6 +128,9 @@ struct CudaGraphOpState {
     last_dyn_values: FxHashMap<char, usize>,
     /// Last buffer pointers (for change detection)
     last_buffer_ptrs: FxHashMap<NodeIndex, u64>,
+    /// Fingerprint of internal pointers used when runtime replay graph was captured.
+    /// Includes all kernel internal buffers and the dyn-dims pointer (if any).
+    runtime_capture_internal_ptrs: Option<Vec<u64>>,
     /// Timing events for profiling
     timing_events: Vec<cudarc::driver::sys::CUevent>,
 }
@@ -143,6 +146,7 @@ impl CudaGraphOpState {
             kernel_params: Vec::new(),
             last_dyn_values: FxHashMap::default(),
             last_buffer_ptrs: FxHashMap::default(),
+            runtime_capture_internal_ptrs: None,
             timing_events: Vec::new(),
         }
     }
@@ -267,6 +271,12 @@ impl HostOp for CudaGraphOp {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayRefreshOutcome {
+    Ready,
+    NeedsRecapture(String),
+}
+
 impl CudaGraphOp {
     /// Ensures the child CUDA graph is built and updated for the given buffers and dynamic dims.
     /// This path intentionally does NOT launch the child graph.
@@ -286,6 +296,352 @@ impl CudaGraphOp {
             .cuda_graph
             .as_ref()
             .map(CudaGraphHandle::raw_graph)
+    }
+
+    fn collect_buffer_ptrs_from_raw(
+        &self,
+        raw_ptrs: &FxHashMap<NodeIndex, u64>,
+    ) -> FxHashMap<NodeIndex, u64> {
+        let mut ptrs = FxHashMap::default();
+        for &node in &self.buffer_nodes {
+            if let Some(ptr) = raw_ptrs.get(&node) {
+                ptrs.insert(node, *ptr);
+            }
+        }
+        ptrs
+    }
+
+    fn validate_required_buffer_ptrs(
+        &self,
+        buffer_ptrs: &FxHashMap<NodeIndex, u64>,
+        context: &str,
+    ) -> anyhow::Result<()> {
+        let missing: Vec<_> = self
+            .buffer_nodes
+            .iter()
+            .filter(|n| !buffer_ptrs.contains_key(n))
+            .filter(|n| match self.buffer_sizes.get(n) {
+                Some(size) => size.exec(&FxHashMap::default()).unwrap_or(1) != 0,
+                None => true,
+            })
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "{context}: {} required buffer pointers missing: {:?}",
+                missing.len(),
+                missing
+            );
+        }
+        Ok(())
+    }
+
+    fn internal_pointer_fingerprint(
+        state: &CudaGraphOpState,
+        stream: &Arc<CudaStream>,
+    ) -> Vec<u64> {
+        let mut fingerprint = Vec::new();
+        for kernel in &state.kernels {
+            for buf in &kernel.internal_bufs {
+                fingerprint.push(buf.device_ptr(stream).0);
+            }
+        }
+        let dyn_dims_ptr = state
+            .dyn_dims_buffer
+            .as_ref()
+            .map(|buf| buf.device_ptr(stream).0)
+            .unwrap_or(0);
+        fingerprint.push(dyn_dims_ptr);
+        fingerprint
+    }
+
+    fn build_kernel_params_from_ptrs(
+        state: &mut CudaGraphOpState,
+        stream: &Arc<CudaStream>,
+        dyn_map: &FxHashMap<char, usize>,
+        current_buffer_ptrs: &FxHashMap<NodeIndex, u64>,
+    ) -> anyhow::Result<()> {
+        let dyn_dims_ptr = state
+            .dyn_dims_buffer
+            .as_ref()
+            .map(|buf| buf.device_ptr(stream).0)
+            .unwrap_or(0);
+
+        let num_kernels = state.kernels.len();
+        state.kernel_params.clear();
+        state.kernel_params.reserve(num_kernels);
+
+        for idx in 0..num_kernels {
+            let kernel = &state.kernels[idx];
+            let has_output = kernel
+                .kernel_op
+                .output_size()
+                .exec(&FxHashMap::default())
+                .unwrap_or(1)
+                != 0;
+            let output_ptr = current_buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
+            if has_output && output_ptr == 0 {
+                anyhow::bail!(
+                    "Missing output pointer for kernel '{}' node {:?}",
+                    kernel.kernel_name,
+                    kernel.node
+                );
+            }
+            let mut input_ptrs = Vec::with_capacity(kernel.inputs.len());
+            for input in &kernel.inputs {
+                let ptr = current_buffer_ptrs.get(input).copied().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Missing input pointer for kernel '{}' input node {:?}",
+                        kernel.kernel_name,
+                        input
+                    )
+                })?;
+                input_ptrs.push(ptr);
+            }
+            let param_values = kernel.kernel_op.build_params(
+                stream,
+                output_ptr,
+                &input_ptrs,
+                &kernel.internal_bufs,
+                dyn_dims_ptr,
+            );
+            state
+                .kernel_params
+                .push(UnifiedKernelParams::new(param_values));
+        }
+        Ok(())
+    }
+
+    pub fn prepare_for_runtime_capture(
+        &self,
+        stream: &Arc<CudaStream>,
+        raw_ptrs: &FxHashMap<NodeIndex, u64>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.borrow_mut();
+
+        let dyn_map_changed = dyn_map.len() != state.last_dyn_values.len()
+            || dyn_map
+                .iter()
+                .any(|(k, v)| state.last_dyn_values.get(k) != Some(v));
+
+        let mut needs_internal_realloc = false;
+        for kernel in state.kernels.iter() {
+            let internal_dims = kernel.kernel_op.internal_buffer_dyn_dims();
+            if internal_dims
+                .iter()
+                .any(|d| dyn_map.get(d) != state.last_dyn_values.get(d))
+            {
+                needs_internal_realloc = true;
+                break;
+            }
+        }
+
+        if needs_internal_realloc {
+            for kernel in state.kernels.iter_mut() {
+                kernel.internal_bufs = kernel.kernel_op.allocate_internal_buffers(stream, dyn_map);
+            }
+            state.cuda_graph = None;
+            state.cuda_graph_exec = None;
+            state.node_to_graph_node.clear();
+            state.kernel_params.clear();
+        }
+
+        // Ensure internal buffers are initialized on first runtime-capture preparation.
+        let mut allocated_missing_internal_bufs = false;
+        for kernel in state.kernels.iter_mut() {
+            if kernel.internal_bufs.is_empty() {
+                kernel.internal_bufs = kernel.kernel_op.allocate_internal_buffers(stream, dyn_map);
+                allocated_missing_internal_bufs = true;
+            }
+        }
+        if allocated_missing_internal_bufs {
+            state.kernel_params.clear();
+        }
+
+        if !self.dyn_dims_order.is_empty() && state.dyn_dims_buffer.is_none() {
+            state.dyn_dims_buffer = Some(
+                stream
+                    .alloc_zeros::<i32>(self.dyn_dims_order.len())
+                    .expect("Failed to allocate dyn_dims buffer"),
+            );
+        }
+
+        if dyn_map_changed && !self.dyn_dims_order.is_empty() {
+            let values: Vec<i32> = self
+                .dyn_dims_order
+                .iter()
+                .map(|d| dyn_map.get(d).copied().unwrap_or(0) as i32)
+                .collect();
+            if let Some(buf) = state.dyn_dims_buffer.as_mut() {
+                stream.memcpy_htod(&values, buf)?;
+            }
+        }
+
+        let current_buffer_ptrs = self.collect_buffer_ptrs_from_raw(raw_ptrs);
+        self.validate_required_buffer_ptrs(&current_buffer_ptrs, "prepare_for_runtime_capture")?;
+
+        for idx in 0..state.kernels.len() {
+            let kernel = &mut state.kernels[idx];
+            kernel.kernel_op.pre_execute(
+                stream,
+                &mut kernel.internal_bufs,
+                &mut kernel.constants,
+                &current_buffer_ptrs,
+                dyn_map,
+            );
+        }
+
+        let buffer_ptrs_changed = current_buffer_ptrs != state.last_buffer_ptrs;
+        let need_params_rebuild = needs_internal_realloc
+            || allocated_missing_internal_bufs
+            || dyn_map_changed
+            || buffer_ptrs_changed
+            || state.kernel_params.len() != state.kernels.len();
+        if need_params_rebuild {
+            Self::build_kernel_params_from_ptrs(&mut state, stream, dyn_map, &current_buffer_ptrs)?;
+        }
+
+        state.last_dyn_values = dyn_map.clone();
+        state.last_buffer_ptrs = current_buffer_ptrs;
+        state.runtime_capture_internal_ptrs =
+            Some(Self::internal_pointer_fingerprint(&state, stream));
+        Ok(())
+    }
+
+    pub fn refresh_for_runtime_replay(
+        &self,
+        stream: &Arc<CudaStream>,
+        raw_ptrs: &FxHashMap<NodeIndex, u64>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<ReplayRefreshOutcome> {
+        let mut state = self.state.borrow_mut();
+        let Some(captured_internal_ptrs) = state.runtime_capture_internal_ptrs.clone() else {
+            return Ok(ReplayRefreshOutcome::NeedsRecapture(
+                "missing capture internal pointer fingerprint".to_string(),
+            ));
+        };
+
+        if dyn_map.len() != state.last_dyn_values.len()
+            || dyn_map
+                .iter()
+                .any(|(k, v)| state.last_dyn_values.get(k) != Some(v))
+        {
+            return Ok(ReplayRefreshOutcome::NeedsRecapture(
+                "dynamic dimensions changed".to_string(),
+            ));
+        }
+
+        let current_buffer_ptrs = self.collect_buffer_ptrs_from_raw(raw_ptrs);
+        self.validate_required_buffer_ptrs(&current_buffer_ptrs, "refresh_for_runtime_replay")?;
+        if current_buffer_ptrs != state.last_buffer_ptrs {
+            return Ok(ReplayRefreshOutcome::NeedsRecapture(
+                "buffer pointers changed".to_string(),
+            ));
+        }
+        if state.kernel_params.len() != state.kernels.len() {
+            return Ok(ReplayRefreshOutcome::NeedsRecapture(
+                "kernel params missing or stale".to_string(),
+            ));
+        }
+        if state.kernels.iter().any(|k| k.internal_bufs.is_empty()) {
+            return Ok(ReplayRefreshOutcome::NeedsRecapture(
+                "internal buffers missing".to_string(),
+            ));
+        }
+
+        let pre_refresh_fingerprint = Self::internal_pointer_fingerprint(&state, stream);
+        if pre_refresh_fingerprint != captured_internal_ptrs {
+            return Ok(ReplayRefreshOutcome::NeedsRecapture(
+                "internal pointer drift detected before replay refresh".to_string(),
+            ));
+        }
+
+        for idx in 0..state.kernels.len() {
+            let kernel = &mut state.kernels[idx];
+            kernel.kernel_op.pre_execute(
+                stream,
+                &mut kernel.internal_bufs,
+                &mut kernel.constants,
+                &current_buffer_ptrs,
+                dyn_map,
+            );
+        }
+
+        let post_refresh_fingerprint = Self::internal_pointer_fingerprint(&state, stream);
+        if post_refresh_fingerprint != captured_internal_ptrs {
+            return Ok(ReplayRefreshOutcome::NeedsRecapture(
+                "internal pointer drift detected after replay refresh".to_string(),
+            ));
+        }
+
+        Ok(ReplayRefreshOutcome::Ready)
+    }
+
+    pub fn replay_kernels_onto_stream(
+        &self,
+        stream: &Arc<CudaStream>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.borrow_mut();
+        if state.kernel_params.len() != state.kernels.len() {
+            anyhow::bail!(
+                "replay_kernels_onto_stream: kernel params length {} does not match kernel count {}",
+                state.kernel_params.len(),
+                state.kernels.len()
+            );
+        }
+
+        for idx in 0..state.kernels.len() {
+            let (cu_func, kernel_name, kernel_node, grid_dim, block_dim, shared_mem) = {
+                let kernel = &state.kernels[idx];
+                (
+                    unsafe { kernel.function.raw_function() },
+                    kernel.kernel_name,
+                    kernel.node,
+                    (
+                        kernel.grid.0.exec(dyn_map).unwrap() as u32,
+                        kernel.grid.1.exec(dyn_map).unwrap() as u32,
+                        kernel.grid.2.exec(dyn_map).unwrap() as u32,
+                    ),
+                    (
+                        kernel.block.0.exec(dyn_map).unwrap() as u32,
+                        kernel.block.1.exec(dyn_map).unwrap() as u32,
+                        kernel.block.2.exec(dyn_map).unwrap() as u32,
+                    ),
+                    kernel.shared_mem.exec(dyn_map).unwrap() as u32,
+                )
+            };
+
+            let params_ptr = state.kernel_params[idx].as_cuda_params();
+            unsafe {
+                use cudarc::driver::sys::{CUresult, cuLaunchKernel};
+                let result = cuLaunchKernel(
+                    cu_func,
+                    grid_dim.0,
+                    grid_dim.1,
+                    grid_dim.2,
+                    block_dim.0,
+                    block_dim.1,
+                    block_dim.2,
+                    shared_mem,
+                    stream.cu_stream(),
+                    params_ptr,
+                    std::ptr::null_mut(),
+                );
+                if result != CUresult::CUDA_SUCCESS {
+                    anyhow::bail!(
+                        "cuLaunchKernel failed for kernel '{}' node {:?} idx {}: {:?}",
+                        kernel_name,
+                        kernel_node,
+                        idx,
+                        result
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Execute the CUDA graph with the given buffers and dynamic dimensions.

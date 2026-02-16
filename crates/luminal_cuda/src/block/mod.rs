@@ -1245,9 +1245,10 @@ impl crate::kernel::KernelOp for MegakernelOp {
             .memcpy_htod(&buffer_array, &mut buffers_typed)
             .expect("Failed to update buffer array");
 
-        // Ensure all uploads complete before kernel execution.
-        // Skip during CUDA stream capture (synchronize is illegal on a captured stream).
-        if !crate::CUDA_STREAM_CAPTURING.get() {
+        // Stream ordering guarantees the above HtoD writes complete before the next kernel launch
+        // on this stream. Keep explicit sync only for opt-in debug mode.
+        let sync_debug = std::env::var("LUMINAL_SYNC_DEBUG").map_or(false, |v| v == "1");
+        if sync_debug && !crate::CUDA_STREAM_CAPTURING.get() {
             stream
                 .synchronize()
                 .expect("Failed to sync after pre_execute");
