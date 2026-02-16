@@ -116,8 +116,9 @@ impl CudaGraphHandle {
         to: CUgraphNode,
     ) -> Result<(), DriverError> {
         unsafe {
-            sys::cuGraphAddDependencies_v2(self.cu_graph, &from, &to, std::ptr::null(), 1)
-                .result()?;
+            // Use v1 API — v2 with NULL edgeData defaults to PROGRAMMATIC dependency type,
+            // which is NOT supported by memset nodes (only kernel/empty/child graph nodes).
+            sys::cuGraphAddDependencies(self.cu_graph, &from, &to, 1).result()?;
         }
         Ok(())
     }
