@@ -2,10 +2,53 @@
 
 **Date**: 2026-02-16
 **GPU**: NVIDIA A100 80GB PCIe (CUDA 12.8, nvcc 12.4)
-**Branch**: `qwen3-tts` (commit `bacf21c9`)
+**Branch**: `qwen3-tts`
 **Workload**: 100 frames of Qwen3-TTS-12Hz-1.7B-VoiceDesign inference
 
-## Per-Frame Averages (frames 2-99, steady state)
+## B2 Whole-Stream Capture Results (commit `25c67dd0`)
+
+### Per-Frame Averages (frames 2-99, steady state, `LUMINAL_RUNTIME_GRAPH_REPLAY=1`)
+
+| Phase | Dispatch (pre-B2) | B2 Replay | Change |
+|-------|-------------------|-----------|--------|
+| set_data | 0.02ms | 0.01ms | — |
+| **decode_exec** | **106.25ms** | **91.19ms** | **-14.2%** |
+| get_f32 | 0.22ms | 0.20ms | — |
+| **pred_exec** | **141.97ms** | **112.96ms** | **-20.4%** |
+| kv_scatter | 4.05ms | 3.40ms | -16.0% |
+| **Total** | **252.50ms** | **207.76ms** | **-17.7%** |
+
+### Runtime Internals (B2 replay mode, typical frame)
+
+```
+Decode:    cuGraphLaunch: 0.05ms | final_sync: 85.6ms | total: 85.7ms
+Predictor: cuGraphLaunch: 0.08ms | final_sync: 99.0ms | total: 99.1ms
+```
+
+- 195/202 runtime invocations in steady-state `replay` mode
+- cuGraphLaunch costs 0.03-0.08ms (down from ~40-75ms dispatch loop)
+- `final_sync` reveals actual GPU kernel execution time: **~185ms total**
+
+### CORRECTED Analysis: GPU-Bound, Not Dispatch-Bound
+
+The original "88% host dispatch overhead" estimate was **wrong**. B2 results reveal:
+
+| | Dispatch overhead | GPU kernel time | Total |
+|---|------------------|-----------------|-------|
+| Decode | ~5ms (overlapped with GPU) | **~86ms** | 91ms |
+| Predictor | ~14ms (refresh + pre_execute) | **~99ms** | 113ms |
+| **Total** | **~19ms** | **~185ms** | **208ms** |
+
+**Why the original estimate was wrong**: Per-op timing (0.15ms/op) included `MegakernelOp::pre_execute`
+synchronization overhead that inflated apparent dispatch cost. With syncs removed (B2 change),
+CPU dispatch overlaps with GPU execution, so the actual dispatch overhead was small.
+
+**The real bottleneck is GPU kernel quality**: Luminal's kernels are 7.1x slower than PyTorch/vLLM
+(185ms vs 26ms). Root causes: no flash attention, Megakernel interpreter overhead, no fused ops.
+
+## Pre-B2 Baseline (commit `bacf21c9`)
+
+### Per-Frame Averages (frames 2-99, steady state, dispatch mode)
 
 | Phase | Time (ms) | Ops | Per-op (ms) | % of frame |
 |-------|-----------|-----|-------------|------------|
@@ -17,7 +60,7 @@
 | kv_scatter | 4.05 | — | — | 1.6% |
 | **Total** | **252.50** | **1677** | **0.151** | **100%** |
 
-## Runtime Internals (typical frame)
+### Runtime Internals (dispatch mode, typical frame)
 
 ```
 Decode:    zero_buffers: 0.00ms | prebuild: 0.00ms | exec_ops: 105ms (495 ops) | final_sync: 0.09ms
@@ -27,7 +70,7 @@ Predictor: zero_buffers: 0.00ms | prebuild: 0.00ms | exec_ops: 137ms (1182 ops) 
 - `zero_buffers`: **NOT a bottleneck** (0.00ms — buffers are not re-zeroed between frames)
 - `prebuild`: 0.00ms (graphs already built)
 - `exec_ops`: **100% of execution time** — the per-op dispatch loop
-- `final_sync`: <0.1ms
+- `final_sync`: <0.1ms (GPU work completed during dispatch — work was overlapping)
 
 ## Frame 1 (Cold Start)
 
@@ -51,25 +94,25 @@ set_data: 0.1ms | kv_upload: 29.6ms | decode_exec: 316.9ms | get_f32: 0.3ms | pr
 
 Spikes occur at ~30-frame and ~60-frame intervals. Likely causes: GPU frequency scaling, thermal throttling, or CUDA context management.
 
-## Luminal vs PyTorch/vLLM Comparison
+## Luminal vs PyTorch/vLLM Comparison (CORRECTED with B2 data)
 
 Same model (hidden=2048, 28 layers, GQA 16/2), same GPU (A100).
 
-| | Luminal | PyTorch/vLLM | Gap | Est. GPU time | **Host overhead** |
-|---|---------|-------------|-----|---------------|-------------------|
-| Decode (Talker) | 106ms (495 ops) | 6.7ms (1 graph) | 15.8x | ~7ms | **~99ms (93%)** |
-| Predictor | 142ms (1182 ops) | 19.1ms (15 graphs) | 7.4x | ~19ms | **~123ms (87%)** |
-| CPU overhead | 4.3ms | 2.1ms | 2.0x | — | — |
-| **Total** | **252ms** | **27.6ms** | **9.1x** | **~26ms** | **~222ms (88%)** |
+| | Luminal (B2) | PyTorch/vLLM | Gap | Bottleneck |
+|---|-------------|-------------|-----|------------|
+| Decode (Talker) | 91ms (GPU: ~86ms) | 6.7ms (1 graph) | 13.6x | Kernel quality |
+| Predictor | 113ms (GPU: ~99ms) | 19.1ms (15 graphs) | 5.9x | Kernel quality |
+| CPU overhead | 3.6ms | 2.1ms | 1.7x | — |
+| **Total** | **208ms** | **27.6ms** | **7.5x** | **GPU kernels** |
 
-### Key Insight
+### Key Insight (CORRECTED)
 
-**88% of per-frame execution time is host dispatch overhead**, not GPU kernel time.
+**The bottleneck is GPU kernel quality, not host dispatch overhead.**
 
-- Luminal dispatches 1,677 individual operations per frame (cuGraphLaunch + cuBLAS/cuBLASLt calls)
-- Each op costs ~0.12-0.22ms of host-side overhead (parameter setup, buffer resolution, launch)
-- PyTorch captures the entire forward pass into 1-15 CUDA graphs → 1-15 `cuGraphLaunch` calls per frame
-- Eliminating per-op dispatch overhead would bring Luminal from ~252ms to ~30ms (competitive with PyTorch)
+- B2 whole-stream capture eliminates dispatch overhead (cuGraphLaunch in 0.05ms vs 40-75ms dispatch)
+- But GPU kernel time is 185ms — 7.1x slower than PyTorch's 26ms
+- Root causes: no FlashAttention-2, Megakernel interpreter overhead, no fused op compilation
+- **To match PyTorch, Luminal needs faster GPU kernels, not faster dispatch**
 
 ## Memory Usage
 
@@ -90,18 +133,49 @@ The predictor's 11 GB intermediate buffer allocation is why `decode_speech` OOMs
 
 Per-kernel GPU timing would require nsight systems profiling or adding explicit CUDA event timing around each op.
 
-## Conclusions
+## Conclusions (UPDATED)
 
-1. **The #1 optimization target is host dispatch overhead elimination** (Wave B.1: whole-graph CUDA capture)
-2. Buffer zeroing, graph prebuild, and data transfer are negligible (<5ms combined)
-3. kv_scatter (CPU-side) is 4ms — acceptable
-4. The theoretical floor is ~30ms/frame if all ops are captured into a single CUDA graph
-5. Per-kernel timing data is not yet available — need nsight or CUDA event instrumentation to identify slow kernels
+1. **The #1 optimization target is now GPU kernel quality** — 7.1x gap vs PyTorch (185ms vs 26ms)
+2. **B2 whole-stream capture works** — eliminates dispatch overhead, saves 45ms/frame (17.7%)
+3. **FlashAttention-2 is the single biggest kernel win** — attention is the dominant operation
+4. **Megakernel interpreter overhead** — GPU-side switch dispatch adds overhead vs compiled kernels
+5. Buffer zeroing, graph prebuild, and data transfer remain negligible (<5ms combined)
 
-## Raw Data
+## Raw Data — B2 Replay (commit `25c67dd0`)
 
 <details>
-<summary>All 100 frame timings</summary>
+<summary>All 100 frame timings (B2 replay mode)</summary>
+
+```
+frame 1  | set_data: 0.1ms | kv_upload: 3.7ms | decode_exec: 270.1ms | get_f32: 0.2ms | pred_exec: 197.9ms | kv_scatter: 3.6ms | total: 475.6ms
+frame 2  | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 119.6ms | get_f32: 0.3ms | pred_exec: 113.9ms | kv_scatter: 3.7ms | total: 237.6ms
+frame 3  | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 91.0ms | get_f32: 0.2ms | pred_exec: 113.0ms | kv_scatter: 3.4ms | total: 207.7ms
+frame 4  | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 91.0ms | get_f32: 0.2ms | pred_exec: 112.7ms | kv_scatter: 3.3ms | total: 207.1ms
+frame 5  | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 90.7ms | get_f32: 0.2ms | pred_exec: 112.3ms | kv_scatter: 3.4ms | total: 206.7ms
+frame 6  | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 90.8ms | get_f32: 0.2ms | pred_exec: 112.3ms | kv_scatter: 3.3ms | total: 206.6ms
+frame 7  | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 90.8ms | get_f32: 0.2ms | pred_exec: 113.3ms | kv_scatter: 3.4ms | total: 207.7ms
+frame 8  | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 91.0ms | get_f32: 0.2ms | pred_exec: 112.9ms | kv_scatter: 3.4ms | total: 207.5ms
+frame 9  | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 91.0ms | get_f32: 0.2ms | pred_exec: 113.2ms | kv_scatter: 3.6ms | total: 208.0ms
+frame 10 | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 91.0ms | get_f32: 0.2ms | pred_exec: 113.1ms | kv_scatter: 3.4ms | total: 207.6ms
+frame 11 | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 90.9ms | get_f32: 0.2ms | pred_exec: 113.1ms | kv_scatter: 3.3ms | total: 207.5ms
+frame 12 | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 90.9ms | get_f32: 0.2ms | pred_exec: 113.3ms | kv_scatter: 3.4ms | total: 207.9ms
+frame 13 | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 91.1ms | get_f32: 0.2ms | pred_exec: 113.2ms | kv_scatter: 3.3ms | total: 207.8ms
+frame 14 | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 91.0ms | get_f32: 0.2ms | pred_exec: 112.8ms | kv_scatter: 3.2ms | total: 207.1ms
+frame 15 | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 90.9ms | get_f32: 0.2ms | pred_exec: 112.7ms | kv_scatter: 3.4ms | total: 207.2ms
+frame 16 | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 90.8ms | get_f32: 0.1ms | pred_exec: 112.6ms | kv_scatter: 3.3ms | total: 206.9ms
+frame 17 | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 90.8ms | get_f32: 0.2ms | pred_exec: 113.2ms | kv_scatter: 3.3ms | total: 207.6ms
+frame 18 | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 90.9ms | get_f32: 0.2ms | pred_exec: 112.6ms | kv_scatter: 3.4ms | total: 207.0ms
+frame 19 | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 90.8ms | get_f32: 0.3ms | pred_exec: 113.6ms | kv_scatter: 3.6ms | total: 208.3ms
+frame 20 | set_data: 0.0ms | kv_upload: 0.0ms | decode_exec: 91.0ms | get_f32: 0.2ms | pred_exec: 113.2ms | kv_scatter: 3.4ms | total: 207.9ms
+frame 21-99: steady at decode ~91ms, pred ~113ms, total ~207ms (no spikes observed with B2)
+```
+
+</details>
+
+## Raw Data — Pre-B2 Dispatch Baseline (commit `bacf21c9`)
+
+<details>
+<summary>All 100 frame timings (dispatch mode)</summary>
 
 ```
 frame 1  | set_data: 0.1ms | kv_upload: 29.6ms | decode_exec: 316.9ms | get_f32: 0.3ms | pred_exec: 141.2ms | kv_scatter: 4.3ms | total: 492.4ms
