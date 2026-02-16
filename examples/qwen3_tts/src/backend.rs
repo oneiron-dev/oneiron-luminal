@@ -93,7 +93,7 @@ fn compile_accelerated(cx: &mut Graph, weights: &HashMap<String, Vec<f32>>, mut 
 
 pub fn set_data(rt: &mut Rt, id: impl ToId, data: Vec<f32>) {
     #[cfg(feature = "cuda")]
-    rt.set_data(id, data);
+    rt.set_data_f32(id, &data);
 
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     rt.set_data(id, &data);
@@ -104,7 +104,7 @@ pub fn set_data(rt: &mut Rt, id: impl ToId, data: Vec<f32>) {
 
 pub fn set_data_i32(rt: &mut Rt, id: impl ToId, data: Vec<i32>) {
     #[cfg(feature = "cuda")]
-    rt.set_data(id, data);
+    rt.set_data_i32(id, &data);
 
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
@@ -121,10 +121,16 @@ pub fn update_data_slice(rt: &mut Rt, id: impl ToId, byte_offset: usize, data: &
     rt.update_buffer_slice(id, byte_offset, data);
 
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    { let _ = (rt, id, byte_offset, data); unimplemented!("Metal partial update not yet implemented"); }
+    {
+        let _ = (rt, id, byte_offset, data);
+        unimplemented!("Metal partial update not yet implemented");
+    }
 
     #[cfg(not(any(feature = "metal", feature = "cuda")))]
-    { let _ = (rt, id, byte_offset, data); unimplemented!("Native partial update not yet implemented"); }
+    {
+        let _ = (rt, id, byte_offset, data);
+        unimplemented!("Native partial update not yet implemented");
+    }
 }
 
 pub fn get_f32(rt: &Rt, id: impl ToId) -> Vec<f32> {

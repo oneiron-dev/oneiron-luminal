@@ -1,7 +1,7 @@
 use crate::{
     block::{BlockOp, N_TIMING_SLOTS, SMEvent, record_block_op_timings},
     host::HostOp,
-    kernel::{CudaGraphTiming, KernelOp, record_cuda_graph_timings},
+    kernel::{CudaGraphExecHandle, CudaGraphTiming, KernelOp, record_cuda_graph_timings},
 };
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice};
 
@@ -83,6 +83,39 @@ struct PendingTimingData {
     span_id: Uuid,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct RuntimeReplaySignature {
+    dyn_map: Vec<(char, usize)>,
+    cached_ptrs: Vec<(usize, u64)>,
+    force_zero_all: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeReplayState {
+    Disabled,
+    WarmupPending,
+    CapturePending,
+    Ready,
+}
+
+struct RuntimeReplayCache {
+    state: RuntimeReplayState,
+    signature: Option<RuntimeReplaySignature>,
+    graph_exec: Option<CudaGraphExecHandle>,
+    last_error: Option<String>,
+}
+
+impl Default for RuntimeReplayCache {
+    fn default() -> Self {
+        Self {
+            state: RuntimeReplayState::Disabled,
+            signature: None,
+            graph_exec: None,
+            last_error: None,
+        }
+    }
+}
+
 pub struct CudaRuntime {
     pub hlir_buffers: FxHashMap<NodeIndex, CudaInput>,
     pub buffers: FxHashMap<NodeIndex, CudaSlice<u8>>,
@@ -114,6 +147,7 @@ pub struct CudaRuntime {
     pub last_total_time_us: f64,
     kernel_cache: FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
     num_sms: usize,
+    runtime_replay: RuntimeReplayCache,
 }
 
 impl CudaRuntime {
@@ -174,6 +208,40 @@ impl CudaRuntime {
         let id = id.to_id();
         let cuda_input = data.to_cuda_input(&self.cuda_stream);
         self.hlir_buffers.insert(id, cuda_input);
+        self.changed_hlir.insert(id);
+    }
+
+    /// Upload f32 input data, reusing an existing device buffer when size matches.
+    /// This keeps input pointers stable across frames for runtime-level CUDA graph replay.
+    pub fn set_data_f32(&mut self, id: impl ToId, data: &[f32]) {
+        let id = id.to_id();
+        let byte_data: &[u8] = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+        };
+        self.set_data_bytes_reuse(id, byte_data);
+    }
+
+    /// Upload i32 input data, reusing an existing device buffer when size matches.
+    pub fn set_data_i32(&mut self, id: impl ToId, data: &[i32]) {
+        let id = id.to_id();
+        let byte_data: &[u8] = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+        };
+        self.set_data_bytes_reuse(id, byte_data);
+    }
+
+    fn set_data_bytes_reuse(&mut self, id: NodeIndex, byte_data: &[u8]) {
+        if let Some(CudaInput::Buffer(buf)) = self.hlir_buffers.get_mut(&id)
+            && buf.len() == byte_data.len()
+        {
+            self.cuda_stream.memcpy_htod(byte_data, buf).unwrap();
+            return;
+        }
+
+        self.hlir_buffers.insert(
+            id,
+            CudaInput::Buffer(self.cuda_stream.clone_htod(byte_data).unwrap()),
+        );
         self.changed_hlir.insert(id);
     }
 
@@ -504,6 +572,7 @@ impl Runtime for CudaRuntime {
             last_kernel_stats: vec![],
             last_total_time_us: 0.0,
             kernel_cache: FxHashMap::default(),
+            runtime_replay: RuntimeReplayCache::default(),
         }
     }
 
@@ -520,6 +589,7 @@ impl Runtime for CudaRuntime {
         // reallocated and re-registered with the new work_queue
         self.buffers.clear();
         self.cached_buffer_ptrs.clear();
+        self.runtime_replay = RuntimeReplayCache::default();
         // Mark all HLIR inputs as changed so their pointers get re-cached in execute
         self.changed_hlir.extend(self.hlir_buffers.keys().copied());
         self.exec_graph.clear();
@@ -647,6 +717,7 @@ impl Runtime for CudaRuntime {
         self.cuda_stream.synchronize().unwrap();
         self.buffers.clear();
         self.cached_buffer_ptrs.clear();
+        self.runtime_replay = RuntimeReplayCache::default();
     }
 
     #[tracing::instrument(skip_all)]
@@ -738,11 +809,17 @@ impl Runtime for CudaRuntime {
         if needs_realloc {
             self.last_dyn_map = dyn_map.clone();
             self.allocate_intermediate_buffers(dyn_map);
+            self.runtime_replay = RuntimeReplayCache::default();
         }
 
         let rt_profiling = std::env::var("LUMINAL_PROFILE").map_or(false, |v| v == "1");
         let sync_debug = std::env::var("LUMINAL_SYNC_DEBUG").map_or(false, |v| v == "1");
         let force_zero_all = std::env::var("LUMINAL_FORCE_ZERO_ALL").map_or(false, |v| v == "1");
+        let replay_enabled = !sync_debug
+            && std::env::var("LUMINAL_RUNTIME_GRAPH_REPLAY").map_or(false, |v| v == "1");
+        let replay_debug = std::env::var("LUMINAL_RUNTIME_GRAPH_DEBUG").map_or(false, |v| v == "1");
+        let force_recapture =
+            std::env::var("LUMINAL_RUNTIME_GRAPH_FORCE_RECAPTURE").map_or(false, |v| v == "1");
 
         let single_stream = self
             .exec_graph
@@ -752,28 +829,6 @@ impl Runtime for CudaRuntime {
             single_stream || sync_debug,
             "Detected multi-stream host op execution. Set LUMINAL_SYNC_DEBUG=1 or add stream event dependencies before disabling per-op sync.",
         );
-
-        // Zero only buffers that require accumulation semantics, unless explicitly forced.
-        let zero_t = std::time::Instant::now();
-        let mut n_zeroed_bufs = 0usize;
-        if force_zero_all {
-            for buffer in self.buffers.values_mut() {
-                self.cuda_stream.memset_zeros(buffer).unwrap();
-                n_zeroed_bufs += 1;
-            }
-        } else {
-            let zero_nodes = self.buffers_requiring_zero.iter().copied().collect_vec();
-            for node in zero_nodes {
-                if let Some(buffer) = self.buffers.get_mut(&node) {
-                    self.cuda_stream.memset_zeros(buffer).unwrap();
-                    n_zeroed_bufs += 1;
-                }
-            }
-        }
-        if n_zeroed_bufs > 0 {
-            self.cuda_stream.synchronize().unwrap();
-        }
-        let zero_us = zero_t.elapsed().as_micros() as f64;
 
         // Cache HLIR input pointers
         if !self.changed_hlir.is_empty() {
@@ -796,8 +851,228 @@ impl Runtime for CudaRuntime {
         self.prebuild_graphs(dyn_map);
         let prebuild_us = prebuild_t.elapsed().as_micros() as f64;
 
-        let total_start = std::time::Instant::now();
+        if !replay_enabled {
+            self.runtime_replay = RuntimeReplayCache::default();
+        }
+        if replay_enabled && self.runtime_replay.state == RuntimeReplayState::Disabled {
+            self.runtime_replay.state = RuntimeReplayState::WarmupPending;
+        }
 
+        let signature = self.build_runtime_replay_signature(dyn_map, force_zero_all);
+        if replay_enabled
+            && self
+                .runtime_replay
+                .signature
+                .as_ref()
+                .is_some_and(|prev| prev != &signature)
+        {
+            if replay_debug {
+                eprintln!("    [runtime_replay] invalidating cached parent graph");
+            }
+            self.runtime_replay = RuntimeReplayCache::default();
+            self.runtime_replay.state = RuntimeReplayState::WarmupPending;
+        }
+        if replay_enabled
+            && force_recapture
+            && self.runtime_replay.state == RuntimeReplayState::Ready
+        {
+            self.runtime_replay.graph_exec = None;
+            self.runtime_replay.state = RuntimeReplayState::CapturePending;
+        }
+        if replay_enabled {
+            self.runtime_replay.signature = Some(signature);
+        }
+
+        let mut n_zeroed_bufs = 0usize;
+        let mut zero_us = 0.0;
+        let mut replay_mode = "dispatch";
+        let (n_ops, exec_ops_us) = match self.runtime_replay.state {
+            RuntimeReplayState::Ready if replay_enabled => {
+                if let Some(exec) = self.runtime_replay.graph_exec.as_ref() {
+                    let launch_t = std::time::Instant::now();
+                    if let Err(err) = exec.launch(&self.cuda_stream) {
+                        if replay_debug {
+                            eprintln!("    [runtime_replay] launch failed, falling back: {err}");
+                        }
+                        self.runtime_replay.last_error = Some(err.to_string());
+                        self.runtime_replay.state = RuntimeReplayState::WarmupPending;
+                        let (n_zeroed, zero_time_us) =
+                            self.zero_buffers_for_execute(force_zero_all, true);
+                        n_zeroed_bufs = n_zeroed;
+                        zero_us = zero_time_us;
+                        replay_mode = "fallback";
+                        self.execute_host_ops_loop(dyn_map, sync_debug)
+                    } else {
+                        replay_mode = "replay";
+                        (1, launch_t.elapsed().as_micros() as f64)
+                    }
+                } else {
+                    self.runtime_replay.state = RuntimeReplayState::WarmupPending;
+                    let (n_zeroed, zero_time_us) =
+                        self.zero_buffers_for_execute(force_zero_all, true);
+                    n_zeroed_bufs = n_zeroed;
+                    zero_us = zero_time_us;
+                    replay_mode = "fallback";
+                    self.execute_host_ops_loop(dyn_map, sync_debug)
+                }
+            }
+            RuntimeReplayState::CapturePending if replay_enabled => {
+                self.prepare_host_ops_for_capture().unwrap_or_else(|e| {
+                    panic!("HostOp capture preparation failed: {e:#}");
+                });
+                match self.capture_runtime_graph(dyn_map, force_zero_all) {
+                    Ok((n_zeroed, ops, zero_time_us, capture_dispatch_us, replay_launch_us)) => {
+                        n_zeroed_bufs = n_zeroed;
+                        zero_us = zero_time_us;
+                        // launch time is the meaningful host-side cost after capture is built.
+                        self.runtime_replay.state = RuntimeReplayState::Ready;
+                        replay_mode = "capture";
+                        if replay_debug {
+                            eprintln!(
+                                "    [runtime_replay] captured parent graph (dispatch during capture: {:.2}ms)",
+                                capture_dispatch_us / 1000.0
+                            );
+                        }
+                        (ops, replay_launch_us)
+                    }
+                    Err(err) => {
+                        if replay_debug {
+                            eprintln!("    [runtime_replay] capture failed, falling back: {err:#}");
+                        }
+                        self.runtime_replay.last_error = Some(err.to_string());
+                        self.runtime_replay.graph_exec = None;
+                        self.runtime_replay.state = RuntimeReplayState::WarmupPending;
+                        let (n_zeroed, zero_time_us) =
+                            self.zero_buffers_for_execute(force_zero_all, true);
+                        n_zeroed_bufs = n_zeroed;
+                        zero_us = zero_time_us;
+                        replay_mode = "fallback";
+                        self.execute_host_ops_loop(dyn_map, sync_debug)
+                    }
+                }
+            }
+            RuntimeReplayState::WarmupPending if replay_enabled => {
+                self.prepare_host_ops_for_capture().unwrap_or_else(|e| {
+                    panic!("HostOp capture preparation failed: {e:#}");
+                });
+                let (n_zeroed, zero_time_us) = self.zero_buffers_for_execute(force_zero_all, true);
+                n_zeroed_bufs = n_zeroed;
+                zero_us = zero_time_us;
+                self.runtime_replay.state = RuntimeReplayState::CapturePending;
+                replay_mode = "warmup";
+                self.execute_host_ops_loop(dyn_map, sync_debug)
+            }
+            _ => {
+                let (n_zeroed, zero_time_us) = self.zero_buffers_for_execute(force_zero_all, true);
+                n_zeroed_bufs = n_zeroed;
+                zero_us = zero_time_us;
+                self.execute_host_ops_loop(dyn_map, sync_debug)
+            }
+        };
+
+        // Final sync to ensure all operations completed successfully
+        let sync_t = std::time::Instant::now();
+        self.cuda_stream
+            .synchronize()
+            .expect("Final sync failed in execute");
+        let final_sync_us = sync_t.elapsed().as_micros() as f64;
+
+        self.last_total_time_us = exec_ops_us;
+
+        if rt_profiling {
+            let total_us = zero_us + prebuild_us + exec_ops_us + final_sync_us;
+            eprintln!(
+                "    [runtime] mode: {} | zero_buffers: {:.2}ms ({} bufs) | prebuild: {:.2}ms | exec_ops: {:.2}ms ({} ops) | final_sync: {:.2}ms | total: {:.2}ms",
+                replay_mode,
+                zero_us / 1000.0,
+                n_zeroed_bufs,
+                prebuild_us / 1000.0,
+                exec_ops_us / 1000.0,
+                n_ops,
+                final_sync_us / 1000.0,
+                total_us / 1000.0,
+            );
+        }
+
+        // Populate last_kernel_stats from HostOps that report stats
+        self.last_kernel_stats.clear();
+        for exec_node in self.exec_graph.node_indices() {
+            let exec_op = &self.exec_graph[exec_node];
+            if let Some(name) = exec_op.internal.stats_name() {
+                self.last_kernel_stats.push(KernelStats {
+                    name,
+                    execution_time_us: 0.0,
+                    bytes_loaded: 0,
+                    bytes_stored: 0,
+                    flops: 0,
+                    bandwidth_gbps: 0.0,
+                    tflops: 0.0,
+                });
+            }
+        }
+    }
+}
+
+impl CudaRuntime {
+    fn build_runtime_replay_signature(
+        &self,
+        dyn_map: &FxHashMap<char, usize>,
+        force_zero_all: bool,
+    ) -> RuntimeReplaySignature {
+        let mut dyn_entries = dyn_map.iter().map(|(k, v)| (*k, *v)).collect_vec();
+        dyn_entries.sort_by_key(|(k, _)| *k);
+
+        let mut ptr_entries = self
+            .cached_buffer_ptrs
+            .iter()
+            .map(|(node, ptr)| (node.index(), *ptr))
+            .collect_vec();
+        ptr_entries.sort_by_key(|(node, _)| *node);
+
+        RuntimeReplaySignature {
+            dyn_map: dyn_entries,
+            cached_ptrs: ptr_entries,
+            force_zero_all,
+        }
+    }
+
+    fn prepare_host_ops_for_capture(&self) -> anyhow::Result<()> {
+        for exec_node in self.exec_graph.node_indices() {
+            let exec_op = &self.exec_graph[exec_node];
+            exec_op.internal.prepare_for_capture(&exec_op.stream)?;
+        }
+        Ok(())
+    }
+
+    fn zero_buffers_for_execute(&mut self, force_zero_all: bool, sync_after: bool) -> (usize, f64) {
+        let zero_t = std::time::Instant::now();
+        let mut n_zeroed_bufs = 0usize;
+        if force_zero_all {
+            for buffer in self.buffers.values_mut() {
+                self.cuda_stream.memset_zeros(buffer).unwrap();
+                n_zeroed_bufs += 1;
+            }
+        } else {
+            let zero_nodes = self.buffers_requiring_zero.iter().copied().collect_vec();
+            for node in zero_nodes {
+                if let Some(buffer) = self.buffers.get_mut(&node) {
+                    self.cuda_stream.memset_zeros(buffer).unwrap();
+                    n_zeroed_bufs += 1;
+                }
+            }
+        }
+        if sync_after && n_zeroed_bufs > 0 {
+            self.cuda_stream.synchronize().unwrap();
+        }
+        (n_zeroed_bufs, zero_t.elapsed().as_micros() as f64)
+    }
+
+    fn execute_host_ops_loop(
+        &mut self,
+        dyn_map: &FxHashMap<char, usize>,
+        sync_debug: bool,
+    ) -> (usize, f64) {
+        let total_start = std::time::Instant::now();
         let exec_order = toposort(&self.exec_graph, None).unwrap();
         let n_ops = exec_order.len();
         for exec_node in exec_order {
@@ -866,51 +1141,61 @@ impl Runtime for CudaRuntime {
                 self.cuda_stream.synchronize().unwrap();
             }
         }
-        let exec_ops_us = total_start.elapsed().as_micros() as f64;
-
-        // Final sync to ensure all operations completed successfully
-        let sync_t = std::time::Instant::now();
-        self.cuda_stream
-            .synchronize()
-            .expect("Final sync failed in execute");
-        let final_sync_us = sync_t.elapsed().as_micros() as f64;
-
-        self.last_total_time_us = exec_ops_us;
-
-        if rt_profiling {
-            let total_us = zero_us + prebuild_us + exec_ops_us + final_sync_us;
-            eprintln!(
-                "    [runtime] zero_buffers: {:.2}ms ({} bufs) | prebuild: {:.2}ms | exec_ops: {:.2}ms ({} ops) | final_sync: {:.2}ms | total: {:.2}ms",
-                zero_us / 1000.0,
-                n_zeroed_bufs,
-                prebuild_us / 1000.0,
-                exec_ops_us / 1000.0,
-                n_ops,
-                final_sync_us / 1000.0,
-                total_us / 1000.0,
-            );
-        }
-
-        // Populate last_kernel_stats from HostOps that report stats
-        self.last_kernel_stats.clear();
-        for exec_node in self.exec_graph.node_indices() {
-            let exec_op = &self.exec_graph[exec_node];
-            if let Some(name) = exec_op.internal.stats_name() {
-                self.last_kernel_stats.push(KernelStats {
-                    name,
-                    execution_time_us: 0.0,
-                    bytes_loaded: 0,
-                    bytes_stored: 0,
-                    flops: 0,
-                    bandwidth_gbps: 0.0,
-                    tflops: 0.0,
-                });
-            }
-        }
+        (n_ops, total_start.elapsed().as_micros() as f64)
     }
-}
 
-impl CudaRuntime {
+    fn capture_runtime_graph(
+        &mut self,
+        dyn_map: &FxHashMap<char, usize>,
+        force_zero_all: bool,
+    ) -> anyhow::Result<(usize, usize, f64, f64, f64)> {
+        self.cuda_stream.context().bind_to_thread()?;
+        unsafe {
+            cudarc::driver::sys::cuStreamBeginCapture_v2(
+                self.cuda_stream.cu_stream(),
+                cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_GLOBAL,
+            )
+            .result()?;
+        }
+
+        let (n_zeroed_bufs, zero_us) = self.zero_buffers_for_execute(force_zero_all, false);
+        let (n_ops, dispatch_us) = self.execute_host_ops_loop(dyn_map, false);
+
+        let mut captured_graph = std::ptr::null_mut();
+        unsafe {
+            cudarc::driver::sys::cuStreamEndCapture(
+                self.cuda_stream.cu_stream(),
+                &mut captured_graph,
+            )
+            .result()?;
+        }
+        if captured_graph.is_null() {
+            anyhow::bail!("cuStreamEndCapture returned null graph");
+        }
+
+        let mut captured_exec = std::ptr::null_mut();
+        unsafe {
+            cudarc::driver::sys::cuGraphInstantiateWithFlags(&mut captured_exec, captured_graph, 0)
+                .result()?;
+            cudarc::driver::sys::cuGraphDestroy(captured_graph).result()?;
+        }
+
+        self.runtime_replay.graph_exec = Some(CudaGraphExecHandle {
+            cu_graph_exec: captured_exec,
+            ctx: self.cuda_stream.context().clone(),
+        });
+
+        let launch_t = std::time::Instant::now();
+        self.runtime_replay
+            .graph_exec
+            .as_ref()
+            .expect("runtime graph exec should be initialized")
+            .launch(&self.cuda_stream)?;
+        let launch_us = launch_t.elapsed().as_micros() as f64;
+
+        Ok((n_zeroed_bufs, n_ops, zero_us, dispatch_us, launch_us))
+    }
+
     fn compute_block_op_stats(
         llir_graph: &LLIRGraph,
         timings: &[(Vec<SMEvent>, u64, Uuid)],
