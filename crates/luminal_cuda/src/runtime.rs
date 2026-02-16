@@ -105,6 +105,7 @@ struct RuntimeReplayCache {
     state: RuntimeReplayState,
     signature: Option<RuntimeReplaySignature>,
     graph_exec: Option<CudaGraphExecHandle>,
+    prepared_capture_stream: Option<u64>,
     last_error: Option<String>,
 }
 
@@ -114,6 +115,7 @@ impl Default for RuntimeReplayCache {
             state: RuntimeReplayState::Disabled,
             signature: None,
             graph_exec: None,
+            prepared_capture_stream: None,
             last_error: None,
         }
     }
@@ -957,42 +959,66 @@ impl Runtime for CudaRuntime {
                 }
             }
             RuntimeReplayState::CapturePending if replay_enabled => {
-                self.prepare_host_ops_for_capture().unwrap_or_else(|e| {
+                let capture_stream = Arc::clone(&self.replay_capture_stream);
+                self.prepare_host_ops_for_capture(&capture_stream)
+                    .unwrap_or_else(|e| {
                     panic!("HostOp capture preparation failed: {e:#}");
                 });
-                match self.build_runtime_graph(dyn_map, force_zero_all) {
-                    Ok((n_zeroed, ops, build_us, replay_launch_us, mini_captures)) => {
-                        n_zeroed_bufs = n_zeroed;
-                        zero_us = 0.0;
-                        // launch time is the meaningful host-side cost after capture is built.
-                        self.runtime_replay.state = RuntimeReplayState::Ready;
-                        replay_mode = "capture";
-                        if replay_debug {
-                            eprintln!(
-                                "    [runtime_replay] built parent graph ({mini_captures} mini-captures, build: {:.2}ms)",
-                                build_us / 1000.0
-                            );
-                        }
-                        (ops, replay_launch_us)
+                let prepared_stream = self.runtime_replay.prepared_capture_stream;
+                let capture_stream_ptr = capture_stream.cu_stream() as u64;
+                if prepared_stream != Some(capture_stream_ptr) {
+                    if replay_debug {
+                        eprintln!(
+                            "    [runtime_replay] prep/capture stream mismatch, falling back: prepared={prepared_stream:?} capture=0x{capture_stream_ptr:016x}"
+                        );
                     }
-                    Err(err) => {
-                        if replay_debug {
-                            eprintln!("    [runtime_replay] capture failed, falling back: {err:#}");
+                    self.runtime_replay.last_error = Some(format!(
+                        "prepare/capture stream mismatch: prepared={prepared_stream:?} capture=0x{capture_stream_ptr:016x}"
+                    ));
+                    self.runtime_replay.graph_exec = None;
+                    self.runtime_replay.state = RuntimeReplayState::WarmupPending;
+                    let (n_zeroed, zero_time_us) = self.zero_buffers_for_execute(force_zero_all, true);
+                    n_zeroed_bufs = n_zeroed;
+                    zero_us = zero_time_us;
+                    replay_mode = "fallback";
+                    self.execute_host_ops_loop(dyn_map, sync_debug)
+                } else {
+                    match self.build_runtime_graph(dyn_map, force_zero_all, &capture_stream) {
+                        Ok((n_zeroed, ops, build_us, replay_launch_us, mini_captures)) => {
+                            n_zeroed_bufs = n_zeroed;
+                            zero_us = 0.0;
+                            // launch time is the meaningful host-side cost after capture is built.
+                            self.runtime_replay.state = RuntimeReplayState::Ready;
+                            replay_mode = "capture";
+                            if replay_debug {
+                                eprintln!(
+                                    "    [runtime_replay] built parent graph ({mini_captures} mini-captures, build: {:.2}ms)",
+                                    build_us / 1000.0
+                                );
+                            }
+                            (ops, replay_launch_us)
                         }
-                        self.runtime_replay.last_error = Some(err.to_string());
-                        self.runtime_replay.graph_exec = None;
-                        self.runtime_replay.state = RuntimeReplayState::WarmupPending;
-                        let (n_zeroed, zero_time_us) =
-                            self.zero_buffers_for_execute(force_zero_all, true);
-                        n_zeroed_bufs = n_zeroed;
-                        zero_us = zero_time_us;
-                        replay_mode = "fallback";
-                        self.execute_host_ops_loop(dyn_map, sync_debug)
+                        Err(err) => {
+                            if replay_debug {
+                                eprintln!("    [runtime_replay] capture failed, falling back: {err:#}");
+                            }
+                            self.runtime_replay.last_error = Some(err.to_string());
+                            self.runtime_replay.graph_exec = None;
+                            self.runtime_replay.state = RuntimeReplayState::WarmupPending;
+                            let (n_zeroed, zero_time_us) =
+                                self.zero_buffers_for_execute(force_zero_all, true);
+                            n_zeroed_bufs = n_zeroed;
+                            zero_us = zero_time_us;
+                            replay_mode = "fallback";
+                            self.execute_host_ops_loop(dyn_map, sync_debug)
+                        }
                     }
                 }
             }
             RuntimeReplayState::WarmupPending if replay_enabled => {
-                self.prepare_host_ops_for_capture().unwrap_or_else(|e| {
+                let capture_stream = Arc::clone(&self.replay_capture_stream);
+                self.prepare_host_ops_for_capture(&capture_stream)
+                    .unwrap_or_else(|e| {
                     panic!("HostOp capture preparation failed: {e:#}");
                 });
                 let (n_zeroed, zero_time_us) = self.zero_buffers_for_execute(force_zero_all, true);
@@ -1076,11 +1102,12 @@ impl CudaRuntime {
         }
     }
 
-    fn prepare_host_ops_for_capture(&self) -> anyhow::Result<()> {
+    fn prepare_host_ops_for_capture(&mut self, prep_stream: &Arc<CudaStream>) -> anyhow::Result<()> {
         for exec_node in self.exec_graph.node_indices() {
             let exec_op = &self.exec_graph[exec_node];
-            exec_op.internal.prepare_for_capture(&exec_op.stream)?;
+            exec_op.internal.prepare_for_capture(prep_stream)?;
         }
+        self.runtime_replay.prepared_capture_stream = Some(prep_stream.cu_stream() as u64);
         Ok(())
     }
 
@@ -1275,10 +1302,10 @@ impl CudaRuntime {
         &mut self,
         dyn_map: &FxHashMap<char, usize>,
         force_zero_all: bool,
+        capture_stream: &Arc<CudaStream>,
     ) -> anyhow::Result<(usize, usize, f64, f64, usize)> {
         let build_t = std::time::Instant::now();
         let mut parent_graph = CudaGraphHandle::new(self.cuda_stream.context().clone())?;
-        let capture_stream = Arc::clone(&self.replay_capture_stream);
         let exec_order = toposort(&self.exec_graph, None).unwrap();
         let n_ops = exec_order.len();
 
@@ -1331,10 +1358,11 @@ impl CudaRuntime {
                 }
 
                 // Mini-capture uses current buffer_map pointers; parent node clones this graph.
+                // Capture prep and mini-capture must use the same CUDA stream handle.
                 // If pointers change, signature invalidation forces a full parent graph rebuild.
                 let captured = self.capture_single_host_op_graph(
                     exec_op,
-                    &capture_stream,
+                    capture_stream,
                     &buffer_map,
                     dyn_map,
                 )?;
