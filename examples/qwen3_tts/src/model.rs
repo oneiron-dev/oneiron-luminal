@@ -1,3 +1,8 @@
+#[cfg(feature = "cuda")]
+use crate::flash_attn::{
+    flash_attention_causal, flash_attention_causal_enabled, flash_attention_masked,
+    flash_attention_masked_enabled,
+};
 use crate::maybe_graph_break;
 use luminal::{
     graph::Graph,
@@ -506,19 +511,46 @@ impl TalkerLayer {
         k = repeat_kv_heads(k, config.kv_groups);
         v = repeat_kv_heads(v, config.kv_groups);
 
+        #[cfg(feature = "cuda")]
+        let context = if flash_attention_causal_enabled(config.head_dim) {
+            flash_attention_causal(q, k, v, config.head_dim)
+                .transpose(1, 2)
+                .merge_dims(2, 3)
+        } else {
+            let scores = q.matmul(k.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+            let (batch, heads, seq, _) = scores.dims4();
+            let causal_mask = scores
+                .graph()
+                .tril(seq, 0)
+                .expand_dim(0, batch)
+                .expand_dim(1, heads);
+            let masked_scores = scores.cond(
+                causal_mask,
+                scores.graph().constant_float(-1e9).expand_rhs(scores.shape),
+            );
+            let probs = masked_scores.softmax(3);
+            probs.matmul(v).transpose(1, 2).merge_dims(2, 3)
+        };
+
+        #[cfg(not(feature = "cuda"))]
         let scores = q.matmul(k.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+        #[cfg(not(feature = "cuda"))]
         let (batch, heads, seq, _) = scores.dims4();
+        #[cfg(not(feature = "cuda"))]
         let causal_mask = scores
             .graph()
             .tril(seq, 0)
             .expand_dim(0, batch)
             .expand_dim(1, heads);
+        #[cfg(not(feature = "cuda"))]
         let masked_scores = scores.cond(
             causal_mask,
             scores.graph().constant_float(-1e9).expand_rhs(scores.shape),
         );
+        #[cfg(not(feature = "cuda"))]
         let probs = masked_scores.softmax(3);
 
+        #[cfg(not(feature = "cuda"))]
         let context = probs.matmul(v).transpose(1, 2).merge_dims(2, 3);
         x = residual + context.matmul(self.o_proj.t());
 
@@ -612,11 +644,31 @@ impl TalkerLayer {
         let k_exp = repeat_kv_heads(k_full, config.kv_groups);
         let v_exp = repeat_kv_heads(v_full, config.kv_groups);
 
+        #[cfg(feature = "cuda")]
+        let context = if flash_attention_masked_enabled(config.head_dim) {
+            let (_, heads, _, _) = q.dims4();
+            let expanded_mask = attn_mask.squeeze(1).expand_dim(1, heads);
+            flash_attention_masked(q, k_exp, v_exp, expanded_mask, config.head_dim)
+                .transpose(1, 2)
+                .merge_dims(2, 3)
+        } else {
+            let scores = q.matmul(k_exp.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+            let (_, heads, _, _) = scores.dims4();
+            let expanded_mask = attn_mask.squeeze(1).expand_dim(1, heads);
+            let probs = (scores + expanded_mask).softmax(3);
+            probs.matmul(v_exp).transpose(1, 2).merge_dims(2, 3)
+        };
+
+        #[cfg(not(feature = "cuda"))]
         let scores = q.matmul(k_exp.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+        #[cfg(not(feature = "cuda"))]
         let (_, heads, _, _) = scores.dims4();
+        #[cfg(not(feature = "cuda"))]
         let expanded_mask = attn_mask.squeeze(1).expand_dim(1, heads);
+        #[cfg(not(feature = "cuda"))]
         let probs = (scores + expanded_mask).softmax(3);
 
+        #[cfg(not(feature = "cuda"))]
         let context = probs.matmul(v_exp).transpose(1, 2).merge_dims(2, 3);
         x = residual + context.matmul(self.o_proj.t());
 
@@ -649,19 +701,46 @@ impl TalkerLayer {
         k = repeat_kv_heads(k, config.kv_groups);
         v = repeat_kv_heads(v, config.kv_groups);
 
+        #[cfg(feature = "cuda")]
+        let context = if flash_attention_causal_enabled(config.head_dim) {
+            flash_attention_causal(q, k, v, config.head_dim)
+                .transpose(1, 2)
+                .merge_dims(2, 3)
+        } else {
+            let scores = q.matmul(k.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+            let (batch, heads, seq, _) = scores.dims4();
+            let causal_mask = scores
+                .graph()
+                .tril(seq, 0)
+                .expand_dim(0, batch)
+                .expand_dim(1, heads);
+            let masked_scores = scores.cond(
+                causal_mask,
+                scores.graph().constant_float(-1e9).expand_rhs(scores.shape),
+            );
+            let probs = masked_scores.softmax(3);
+            probs.matmul(v).transpose(1, 2).merge_dims(2, 3)
+        };
+
+        #[cfg(not(feature = "cuda"))]
         let scores = q.matmul(k.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+        #[cfg(not(feature = "cuda"))]
         let (batch, heads, seq, _) = scores.dims4();
+        #[cfg(not(feature = "cuda"))]
         let causal_mask = scores
             .graph()
             .tril(seq, 0)
             .expand_dim(0, batch)
             .expand_dim(1, heads);
+        #[cfg(not(feature = "cuda"))]
         let masked_scores = scores.cond(
             causal_mask,
             scores.graph().constant_float(-1e9).expand_rhs(scores.shape),
         );
+        #[cfg(not(feature = "cuda"))]
         let probs = masked_scores.softmax(3);
 
+        #[cfg(not(feature = "cuda"))]
         let context = probs.matmul(v).transpose(1, 2).merge_dims(2, 3);
         x = residual + context.matmul(self.o_proj.t());
 

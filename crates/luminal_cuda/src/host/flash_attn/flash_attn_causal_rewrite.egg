@@ -1,0 +1,7 @@
+; Phase 1 rewrite hook for causal prefill attention.
+;
+; The CUDA integration currently uses explicit marker/custom-op insertion
+; for qwen3_tts while we stabilize broad decomposition matching for
+; causal masking lowered through arithmetic ops.
+;
+; This file intentionally keeps no active generic rewrite yet.

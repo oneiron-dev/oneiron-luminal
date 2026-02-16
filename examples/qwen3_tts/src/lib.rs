@@ -1,5 +1,7 @@
 pub mod backend;
 pub mod code_predictor;
+#[cfg(feature = "cuda")]
+pub mod flash_attn;
 pub mod model;
 pub mod pipeline;
 pub mod speech_decoder;

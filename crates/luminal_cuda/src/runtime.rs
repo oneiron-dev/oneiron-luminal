@@ -1464,7 +1464,7 @@ impl CudaRuntime {
                             exec_node.index()
                         )
                     })?;
-            } else if matches!(op_name, "cuBLAS" | "cuBLASLt") {
+            } else if matches!(op_name, "cuBLAS" | "cuBLASLt" | "FlashAttn2") {
                 let buffer_map = self.build_host_op_buffer_map(exec_op);
                 exec_op
                     .internal
@@ -1530,7 +1530,7 @@ impl CudaRuntime {
                     exec_op.internal.as_any().downcast_ref::<CudaGraphOp>()
                 {
                     cuda_graph_op.replay_kernels_onto_stream(capture_stream, dyn_map)
-                } else if matches!(op_name, "cuBLAS" | "cuBLASLt") {
+                } else if matches!(op_name, "cuBLAS" | "cuBLASLt" | "FlashAttn2") {
                     exec_op.internal.execute_for_capture_raw(
                         capture_stream,
                         exec_op.output,
@@ -1681,7 +1681,7 @@ impl CudaRuntime {
                         )
                     })?
             } else {
-                if op_name != "cuBLAS" && op_name != "cuBLASLt" {
+                if op_name != "cuBLAS" && op_name != "cuBLASLt" && op_name != "FlashAttn2" {
                     anyhow::bail!("Unsupported HostOp for runtime graph build: {op_name}");
                 }
 

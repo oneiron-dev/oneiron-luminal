@@ -4,8 +4,14 @@ use crate::cudarc::driver::{CudaSlice, CudaStream};
 use luminal::{op::EgglogOp, prelude::*};
 mod cublas;
 mod cublaslt;
+pub mod flash_attn;
 
-pub type Ops = (cublaslt::CuBlasLt, cublas::CuBlasSgemmV2);
+pub type Ops = (
+    cublaslt::CuBlasLt,
+    cublas::CuBlasSgemmV2,
+    flash_attn::FlashAttentionMasked,
+    flash_attn::FlashAttentionCausal,
+);
 
 /// Host operations that execute on the CPU but orchestrate GPU work.
 ///

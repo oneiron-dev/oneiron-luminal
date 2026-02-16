@@ -1,0 +1,8 @@
+; Phase 1 rewrite hook for decode-fixed additive-mask attention.
+;
+; The CUDA integration currently uses explicit marker/custom-op insertion
+; for qwen3_tts hot-path decode attention while we stabilize broad
+; decomposition matching for:
+;   Matmul -> scale -> add(mask) -> softmax decomposition -> matmul.
+;
+; This file intentionally keeps no active generic rewrite yet.
