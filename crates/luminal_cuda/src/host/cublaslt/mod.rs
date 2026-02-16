@@ -32,6 +32,8 @@ use crate::{
     host::{HostOp, cublas::parse_cublas_op},
 };
 
+const CUBLASLT_WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct CuBlasLt {
@@ -45,6 +47,7 @@ pub struct CuBlasLt {
     ldc: Expression,
     dtype: DType,
     cublaslt: OnceLock<Arc<CudaBlasLT>>,
+    workspace: OnceLock<CudaSlice<u8>>,
 }
 
 // Useless default for IntoEgglogOp
@@ -61,6 +64,7 @@ impl Default for CuBlasLt {
             ldc: Expression::default(),
             dtype: DType::F32,
             cublaslt: OnceLock::new(),
+            workspace: OnceLock::new(),
         }
     }
 }
@@ -123,6 +127,7 @@ impl EgglogOp for CuBlasLt {
             ldc,
             dtype,
             cublaslt: OnceLock::new(),
+            workspace: OnceLock::new(),
         };
         trace!(?extracted_state);
 
@@ -161,6 +166,22 @@ fn dtype_to_cuda_types(dtype: DType) -> (cudaDataType, cublasComputeType_t, cuda
         DType::Int => panic!("cuBLAS LT does not support integer matmul"),
         DType::Bool => panic!("cuBLAS LT does not support bool matmul"),
         DType::NvFp4 | DType::Mxfp4 => todo!("cuBLAS LT FP4 matmul not yet implemented"),
+    }
+}
+
+impl CuBlasLt {
+    fn ensure_workspace<'a>(
+        &'a self,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<&'a CudaSlice<u8>> {
+        if self.workspace.get().is_none() {
+            let workspace = unsafe { stream.alloc::<u8>(CUBLASLT_WORKSPACE_SIZE)? };
+            let _ = self.workspace.set(workspace);
+        }
+        Ok(self
+            .workspace
+            .get()
+            .expect("cuBLASLt workspace should be initialized"))
     }
 }
 
@@ -226,6 +247,7 @@ impl HostOp for CuBlasLt {
         let cublaslt = self
             .cublaslt
             .get_or_init(|| Arc::new(CudaBlasLT::new(stream.clone()).unwrap()));
+        let workspace = self.ensure_workspace(stream)?;
 
         let mut matmul_desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
         let mut a_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();
@@ -235,9 +257,6 @@ impl HostOp for CuBlasLt {
         let mut heuristic: cublasLtMatmulHeuristicResult_t = unsafe { std::mem::zeroed() };
         let mut algo_count: i32 = 0;
 
-        // Allocate workspace (32 MiB)
-        const WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
-        let workspace = unsafe { stream.alloc::<u8>(WORKSPACE_SIZE)? };
         let (workspace_ptr, _workspace_guard) = workspace.device_ptr(stream);
 
         unsafe {
@@ -281,7 +300,7 @@ impl HostOp for CuBlasLt {
             cublasLtMatmulPreferenceSetAttribute(
                 preference,
                 cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                &WORKSPACE_SIZE as *const _ as *const std::ffi::c_void,
+                &CUBLASLT_WORKSPACE_SIZE as *const _ as *const std::ffi::c_void,
                 std::mem::size_of::<usize>(),
             )
             .result()?;
@@ -329,7 +348,7 @@ impl HostOp for CuBlasLt {
                 c_desc, // D layout same as C
                 &heuristic.algo,
                 workspace_ptr as *mut std::ffi::c_void,
-                WORKSPACE_SIZE,
+                CUBLASLT_WORKSPACE_SIZE,
                 stream.cu_stream() as *mut _,
             )
             .result()?;
@@ -345,6 +364,14 @@ impl HostOp for CuBlasLt {
         if std::env::var("LUMINAL_SYNC_DEBUG").map_or(false, |v| v == "1") {
             stream.synchronize()?;
         }
+        Ok(())
+    }
+
+    fn prepare_for_capture(&self, stream: &Arc<CudaStream>) -> anyhow::Result<()> {
+        let _ = self
+            .cublaslt
+            .get_or_init(|| Arc::new(CudaBlasLT::new(stream.clone()).unwrap()));
+        let _ = self.ensure_workspace(stream)?;
         Ok(())
     }
 

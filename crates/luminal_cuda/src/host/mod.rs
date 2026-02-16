@@ -28,6 +28,13 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<()>;
 
+    /// Initialize resources that should not be created inside CUDA stream capture.
+    ///
+    /// Default: no-op.
+    fn prepare_for_capture(&self, _stream: &Arc<CudaStream>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Returns the output buffer size in elements.
     /// Return 0 if this op doesn't have a single output buffer (e.g., CudaGraphOp).
     fn output_size(&self) -> Expression;

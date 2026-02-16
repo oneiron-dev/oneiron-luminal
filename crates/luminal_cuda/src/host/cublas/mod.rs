@@ -227,6 +227,11 @@ impl HostOp for CuBlasSgemmV2 {
         Ok(())
     }
 
+    fn prepare_for_capture(&self, stream: &Arc<CudaStream>) -> anyhow::Result<()> {
+        let _ = SHARED_CUBLAS.get_or_init(|| Arc::new(CudaBlas::new(stream.clone()).unwrap()));
+        Ok(())
+    }
+
     fn output_size(&self) -> Expression {
         self.m * self.n
     }
