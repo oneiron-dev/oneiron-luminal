@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use luminal::{
     egglog_utils::{extract_dtype, extract_expr},
@@ -34,6 +34,54 @@ use crate::{
 
 const CUBLASLT_WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CapturedMatmulConfig {
+    m: u64,
+    n: u64,
+    k: u64,
+    a_layout: cublasOperation_t,
+    b_layout: cublasOperation_t,
+    lda: i64,
+    ldb: i64,
+    ldc: i64,
+    dtype: DType,
+}
+
+#[derive(Debug)]
+struct CapturedMatmulState {
+    config: CapturedMatmulConfig,
+    matmul_desc: cublasLtMatmulDesc_t,
+    a_desc: cublasLtMatrixLayout_t,
+    b_desc: cublasLtMatrixLayout_t,
+    c_desc: cublasLtMatrixLayout_t,
+    heuristic: cublasLtMatmulHeuristicResult_t,
+}
+
+impl Drop for CapturedMatmulState {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.c_desc.is_null() {
+                cublasLtMatrixLayoutDestroy(self.c_desc);
+            }
+            if !self.b_desc.is_null() {
+                cublasLtMatrixLayoutDestroy(self.b_desc);
+            }
+            if !self.a_desc.is_null() {
+                cublasLtMatrixLayoutDestroy(self.a_desc);
+            }
+            if !self.matmul_desc.is_null() {
+                cublasLtMatmulDescDestroy(self.matmul_desc);
+            }
+        }
+    }
+}
+
+// SAFETY: descriptors are CUDA-context-scoped opaque handles, and this runtime uses one CUDA
+// device/context per process. Access is synchronized via Mutex when mutated.
+unsafe impl Send for CapturedMatmulState {}
+// SAFETY: same rationale as Send; read-only use after construction is safe under shared access.
+unsafe impl Sync for CapturedMatmulState {}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct CuBlasLt {
@@ -48,6 +96,9 @@ pub struct CuBlasLt {
     dtype: DType,
     cublaslt: OnceLock<Arc<CudaBlasLT>>,
     workspace: OnceLock<CudaSlice<u8>>,
+    capture_cublaslt: OnceLock<Arc<CudaBlasLT>>,
+    capture_workspace: OnceLock<CudaSlice<u8>>,
+    capture_state: Mutex<Option<CapturedMatmulState>>,
 }
 
 // Useless default for IntoEgglogOp
@@ -65,6 +116,9 @@ impl Default for CuBlasLt {
             dtype: DType::F32,
             cublaslt: OnceLock::new(),
             workspace: OnceLock::new(),
+            capture_cublaslt: OnceLock::new(),
+            capture_workspace: OnceLock::new(),
+            capture_state: Mutex::new(None),
         }
     }
 }
@@ -128,6 +182,9 @@ impl EgglogOp for CuBlasLt {
             dtype,
             cublaslt: OnceLock::new(),
             workspace: OnceLock::new(),
+            capture_cublaslt: OnceLock::new(),
+            capture_workspace: OnceLock::new(),
+            capture_state: Mutex::new(None),
         };
         trace!(?extracted_state);
 
@@ -169,6 +226,32 @@ fn dtype_to_cuda_types(dtype: DType) -> (cudaDataType, cublasComputeType_t, cuda
     }
 }
 
+fn destroy_cublaslt_descriptors(
+    matmul_desc: &mut cublasLtMatmulDesc_t,
+    a_desc: &mut cublasLtMatrixLayout_t,
+    b_desc: &mut cublasLtMatrixLayout_t,
+    c_desc: &mut cublasLtMatrixLayout_t,
+) {
+    unsafe {
+        if !c_desc.is_null() {
+            cublasLtMatrixLayoutDestroy(*c_desc);
+            *c_desc = std::ptr::null_mut();
+        }
+        if !b_desc.is_null() {
+            cublasLtMatrixLayoutDestroy(*b_desc);
+            *b_desc = std::ptr::null_mut();
+        }
+        if !a_desc.is_null() {
+            cublasLtMatrixLayoutDestroy(*a_desc);
+            *a_desc = std::ptr::null_mut();
+        }
+        if !matmul_desc.is_null() {
+            cublasLtMatmulDescDestroy(*matmul_desc);
+            *matmul_desc = std::ptr::null_mut();
+        }
+    }
+}
+
 impl CuBlasLt {
     fn ensure_workspace<'a>(
         &'a self,
@@ -182,6 +265,182 @@ impl CuBlasLt {
             .workspace
             .get()
             .expect("cuBLASLt workspace should be initialized"))
+    }
+
+    fn ensure_capture_workspace<'a>(
+        &'a self,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<&'a CudaSlice<u8>> {
+        if self.capture_workspace.get().is_none() {
+            let workspace = unsafe { stream.alloc::<u8>(CUBLASLT_WORKSPACE_SIZE)? };
+            let _ = self.capture_workspace.set(workspace);
+        }
+        Ok(self
+            .capture_workspace
+            .get()
+            .expect("cuBLASLt capture workspace should be initialized"))
+    }
+
+    fn build_capture_config(&self, dyn_map: &FxHashMap<char, usize>) -> CapturedMatmulConfig {
+        CapturedMatmulConfig {
+            m: self.m.exec(dyn_map).unwrap() as u64,
+            n: self.n.exec(dyn_map).unwrap() as u64,
+            k: self.k.exec(dyn_map).unwrap() as u64,
+            a_layout: self.a_layout,
+            b_layout: self.b_layout,
+            lda: self.lda.exec(dyn_map).unwrap() as i64,
+            ldb: self.ldb.exec(dyn_map).unwrap() as i64,
+            ldc: self.ldc.exec(dyn_map).unwrap() as i64,
+            dtype: self.dtype,
+        }
+    }
+
+    fn ensure_capture_state(
+        &self,
+        cublaslt: &Arc<CudaBlasLT>,
+        config: CapturedMatmulConfig,
+    ) -> anyhow::Result<()> {
+        let mut state_guard = self
+            .capture_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cuBLASLt capture state mutex poisoned"))?;
+        if state_guard
+            .as_ref()
+            .is_some_and(|existing| existing.config == config)
+        {
+            return Ok(());
+        }
+
+        let (cuda_dtype, compute_type, scale_dtype) = dtype_to_cuda_types(config.dtype);
+        let mut matmul_desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
+        let mut a_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut b_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut c_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut preference: cublasLtMatmulPreference_t = std::ptr::null_mut();
+        let mut heuristic: cublasLtMatmulHeuristicResult_t = unsafe { std::mem::zeroed() };
+        let mut algo_count: i32 = 0;
+
+        let build_res = (|| -> anyhow::Result<()> {
+            unsafe {
+                cublasLtMatmulDescCreate(&mut matmul_desc, compute_type, scale_dtype).result()?;
+                cublasLtMatmulDescSetAttribute(
+                    matmul_desc,
+                    cudarc::cublaslt::sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                    &config.a_layout as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<cublasOperation_t>(),
+                )
+                .result()?;
+                cublasLtMatmulDescSetAttribute(
+                    matmul_desc,
+                    cudarc::cublaslt::sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                    &config.b_layout as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<cublasOperation_t>(),
+                )
+                .result()?;
+
+                let (a_rows, a_cols) = if config.a_layout == cublasOperation_t::CUBLAS_OP_N {
+                    (config.m, config.k)
+                } else {
+                    (config.k, config.m)
+                };
+                let (b_rows, b_cols) = if config.b_layout == cublasOperation_t::CUBLAS_OP_N {
+                    (config.k, config.n)
+                } else {
+                    (config.n, config.k)
+                };
+
+                cublasLtMatrixLayoutCreate(&mut a_desc, cuda_dtype, a_rows, a_cols, config.lda)
+                    .result()?;
+                cublasLtMatrixLayoutCreate(&mut b_desc, cuda_dtype, b_rows, b_cols, config.ldb)
+                    .result()?;
+                cublasLtMatrixLayoutCreate(&mut c_desc, cuda_dtype, config.m, config.n, config.ldc)
+                    .result()?;
+
+                cublasLtMatmulPreferenceCreate(&mut preference).result()?;
+                cublasLtMatmulPreferenceSetAttribute(
+                    preference,
+                    cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                    &CUBLASLT_WORKSPACE_SIZE as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<usize>(),
+                )
+                .result()?;
+
+                cublasLtMatmulAlgoGetHeuristic(
+                    *cublaslt.handle(),
+                    matmul_desc,
+                    a_desc,
+                    b_desc,
+                    c_desc,
+                    c_desc,
+                    preference,
+                    1,
+                    &mut heuristic,
+                    &mut algo_count,
+                )
+                .result()?;
+            }
+            Ok(())
+        })();
+        unsafe {
+            if !preference.is_null() {
+                cublasLtMatmulPreferenceDestroy(preference);
+            }
+        }
+
+        if let Err(err) = build_res {
+            destroy_cublaslt_descriptors(&mut matmul_desc, &mut a_desc, &mut b_desc, &mut c_desc);
+            return Err(err);
+        }
+        if algo_count == 0 {
+            destroy_cublaslt_descriptors(&mut matmul_desc, &mut a_desc, &mut b_desc, &mut c_desc);
+            anyhow::bail!("No suitable cuBLASLT algorithm found");
+        }
+
+        *state_guard = Some(CapturedMatmulState {
+            config,
+            matmul_desc,
+            a_desc,
+            b_desc,
+            c_desc,
+            heuristic,
+        });
+        Ok(())
+    }
+
+    fn run_captured_matmul(
+        &self,
+        cublaslt: &Arc<CudaBlasLT>,
+        stream: &Arc<CudaStream>,
+        state: &CapturedMatmulState,
+        a_ptr: u64,
+        b_ptr: u64,
+        c_ptr: u64,
+        workspace_ptr: u64,
+    ) -> anyhow::Result<()> {
+        let alpha_f32: f32 = 1.0;
+        let beta_f32: f32 = 0.0;
+        unsafe {
+            cublasLtMatmul(
+                *cublaslt.handle(),
+                state.matmul_desc,
+                &alpha_f32 as *const _ as *const std::ffi::c_void,
+                a_ptr as *const std::ffi::c_void,
+                state.a_desc,
+                b_ptr as *const std::ffi::c_void,
+                state.b_desc,
+                &beta_f32 as *const _ as *const std::ffi::c_void,
+                c_ptr as *const std::ffi::c_void,
+                state.c_desc,
+                c_ptr as *mut std::ffi::c_void,
+                state.c_desc,
+                &state.heuristic.algo,
+                workspace_ptr as *mut std::ffi::c_void,
+                CUBLASLT_WORKSPACE_SIZE,
+                stream.cu_stream() as *mut _,
+            )
+            .result()?;
+        }
+        Ok(())
     }
 }
 
@@ -369,9 +628,92 @@ impl HostOp for CuBlasLt {
 
     fn prepare_for_capture(&self, stream: &Arc<CudaStream>) -> anyhow::Result<()> {
         let _ = self
-            .cublaslt
+            .capture_cublaslt
             .get_or_init(|| Arc::new(CudaBlasLT::new(stream.clone()).unwrap()));
-        let _ = self.ensure_workspace(stream)?;
+        let _ = self.ensure_capture_workspace(stream)?;
+        Ok(())
+    }
+
+    fn warmup_for_capture(
+        &self,
+        stream: &Arc<CudaStream>,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        let config = self.build_capture_config(dyn_map);
+        let c_buf = buffers[&self_node];
+        let a_buf = buffers[&inputs[0]];
+        let b_buf = buffers[&inputs[1]];
+        let (a_ptr, _a_guard) = a_buf.device_ptr(stream);
+        let (b_ptr, _b_guard) = b_buf.device_ptr(stream);
+        let (c_ptr, _c_guard) = c_buf.device_ptr(stream);
+
+        let cublaslt = self
+            .capture_cublaslt
+            .get_or_init(|| Arc::new(CudaBlasLT::new(stream.clone()).unwrap()));
+        self.ensure_capture_state(cublaslt, config)?;
+        let workspace = self.ensure_capture_workspace(stream)?;
+        let (workspace_ptr, _workspace_guard) = workspace.device_ptr(stream);
+        let state_guard = self
+            .capture_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cuBLASLt capture state mutex poisoned"))?;
+        let state = state_guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("cuBLASLt capture state missing after warmup"))?;
+        self.run_captured_matmul(cublaslt, stream, state, a_ptr, b_ptr, c_ptr, workspace_ptr)?;
+
+        if std::env::var("LUMINAL_SYNC_DEBUG").map_or(false, |v| v == "1") {
+            stream.synchronize()?;
+        }
+        Ok(())
+    }
+
+    fn execute_for_capture(
+        &self,
+        stream: &Arc<CudaStream>,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        let config = self.build_capture_config(dyn_map);
+        let cublaslt = self.capture_cublaslt.get().ok_or_else(|| {
+            anyhow::anyhow!("cuBLASLt capture handle not initialized; prepare_for_capture missing")
+        })?;
+
+        let c_buf = buffers[&self_node];
+        let a_buf = buffers[&inputs[0]];
+        let b_buf = buffers[&inputs[1]];
+        let (a_ptr, _a_guard) = a_buf.device_ptr(stream);
+        let (b_ptr, _b_guard) = b_buf.device_ptr(stream);
+        let (c_ptr, _c_guard) = c_buf.device_ptr(stream);
+        let workspace = self.capture_workspace.get().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cuBLASLt capture workspace not initialized; prepare_for_capture missing"
+            )
+        })?;
+        let (workspace_ptr, _workspace_guard) = workspace.device_ptr(stream);
+
+        let state_guard = self
+            .capture_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cuBLASLt capture state mutex poisoned"))?;
+        let state = state_guard.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("cuBLASLt capture state missing; warmup_for_capture not run")
+        })?;
+        if state.config != config {
+            return Err(anyhow::anyhow!(
+                "cuBLASLt capture state config mismatch; recapture required"
+            ));
+        }
+        self.run_captured_matmul(cublaslt, stream, state, a_ptr, b_ptr, c_ptr, workspace_ptr)?;
+
+        if std::env::var("LUMINAL_SYNC_DEBUG").map_or(false, |v| v == "1") {
+            stream.synchronize()?;
+        }
         Ok(())
     }
 

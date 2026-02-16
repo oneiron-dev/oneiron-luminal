@@ -962,8 +962,8 @@ impl Runtime for CudaRuntime {
                 let capture_stream = Arc::clone(&self.replay_capture_stream);
                 self.prepare_host_ops_for_capture(&capture_stream)
                     .unwrap_or_else(|e| {
-                    panic!("HostOp capture preparation failed: {e:#}");
-                });
+                        panic!("HostOp capture preparation failed: {e:#}");
+                    });
                 let prepared_stream = self.runtime_replay.prepared_capture_stream;
                 let capture_stream_ptr = capture_stream.cu_stream() as u64;
                 if prepared_stream != Some(capture_stream_ptr) {
@@ -977,7 +977,8 @@ impl Runtime for CudaRuntime {
                     ));
                     self.runtime_replay.graph_exec = None;
                     self.runtime_replay.state = RuntimeReplayState::WarmupPending;
-                    let (n_zeroed, zero_time_us) = self.zero_buffers_for_execute(force_zero_all, true);
+                    let (n_zeroed, zero_time_us) =
+                        self.zero_buffers_for_execute(force_zero_all, true);
                     n_zeroed_bufs = n_zeroed;
                     zero_us = zero_time_us;
                     replay_mode = "fallback";
@@ -1000,7 +1001,9 @@ impl Runtime for CudaRuntime {
                         }
                         Err(err) => {
                             if replay_debug {
-                                eprintln!("    [runtime_replay] capture failed, falling back: {err:#}");
+                                eprintln!(
+                                    "    [runtime_replay] capture failed, falling back: {err:#}"
+                                );
                             }
                             self.runtime_replay.last_error = Some(err.to_string());
                             self.runtime_replay.graph_exec = None;
@@ -1019,8 +1022,8 @@ impl Runtime for CudaRuntime {
                 let capture_stream = Arc::clone(&self.replay_capture_stream);
                 self.prepare_host_ops_for_capture(&capture_stream)
                     .unwrap_or_else(|e| {
-                    panic!("HostOp capture preparation failed: {e:#}");
-                });
+                        panic!("HostOp capture preparation failed: {e:#}");
+                    });
                 let (n_zeroed, zero_time_us) = self.zero_buffers_for_execute(force_zero_all, true);
                 n_zeroed_bufs = n_zeroed;
                 zero_us = zero_time_us;
@@ -1102,7 +1105,10 @@ impl CudaRuntime {
         }
     }
 
-    fn prepare_host_ops_for_capture(&mut self, prep_stream: &Arc<CudaStream>) -> anyhow::Result<()> {
+    fn prepare_host_ops_for_capture(
+        &mut self,
+        prep_stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<()> {
         for exec_node in self.exec_graph.node_indices() {
             let exec_op = &self.exec_graph[exec_node];
             exec_op.internal.prepare_for_capture(prep_stream)?;
@@ -1252,14 +1258,16 @@ impl CudaRuntime {
         // cuBLAS/cuBLASLt may JIT kernels and allocate internal resources on first execute.
         exec_op
             .internal
-            .execute(
+            .warmup_for_capture(
                 capture_stream,
                 exec_op.output,
                 &exec_op.inputs,
                 buffers,
                 dyn_map,
             )
-            .map_err(|err| anyhow::anyhow!("Mini-capture warmup host op execute failed: {err:#}"))?;
+            .map_err(|err| {
+                anyhow::anyhow!("Mini-capture warmup host op execute failed: {err:#}")
+            })?;
         capture_stream
             .synchronize()
             .map_err(|err| anyhow::anyhow!("Mini-capture warmup sync failed: {err:#}"))?;
@@ -1274,7 +1282,7 @@ impl CudaRuntime {
                 )
                 .result()?;
             }
-            let execute_res = exec_op.internal.execute(
+            let execute_res = exec_op.internal.execute_for_capture(
                 capture_stream,
                 exec_op.output,
                 &exec_op.inputs,

@@ -35,6 +35,34 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         Ok(())
     }
 
+    /// Warm up capture-specific state before stream capture begins.
+    ///
+    /// Default: use normal execute path.
+    fn warmup_for_capture(
+        &self,
+        stream: &Arc<CudaStream>,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        self.execute(stream, self_node, inputs, buffers, dyn_map)
+    }
+
+    /// Execute using capture-safe operations inside a stream capture section.
+    ///
+    /// Default: use normal execute path.
+    fn execute_for_capture(
+        &self,
+        stream: &Arc<CudaStream>,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        self.execute(stream, self_node, inputs, buffers, dyn_map)
+    }
+
     /// Returns the output buffer size in elements.
     /// Return 0 if this op doesn't have a single output buffer (e.g., CudaGraphOp).
     fn output_size(&self) -> Expression;

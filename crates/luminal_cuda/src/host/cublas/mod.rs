@@ -44,6 +44,8 @@ pub struct CuBlasSgemmV2 {
     ldc: Expression,
     /// Lazily initialized cuBLAS handle - created on first execute
     cublas: OnceLock<Arc<CudaBlas>>,
+    /// Capture-specific cuBLAS handle (must be initialized on the capture stream).
+    capture_cublas: OnceLock<Arc<CudaBlas>>,
 }
 
 // Useless default for IntoEgglogOp
@@ -59,6 +61,7 @@ impl Default for CuBlasSgemmV2 {
             ldb: Expression::default(),
             ldc: Expression::default(),
             cublas: OnceLock::new(),
+            capture_cublas: OnceLock::new(),
         }
     }
 }
@@ -115,6 +118,7 @@ impl EgglogOp for CuBlasSgemmV2 {
             ldb,
             ldc,
             cublas: OnceLock::new(),
+            capture_cublas: OnceLock::new(),
         };
         trace!(?extracted_state);
 
@@ -128,14 +132,16 @@ impl EgglogOp for CuBlasSgemmV2 {
     }
 }
 
-impl HostOp for CuBlasSgemmV2 {
-    fn execute(
+impl CuBlasSgemmV2 {
+    fn run_with_handle(
         &self,
+        cublas: &Arc<CudaBlas>,
         stream: &Arc<CudaStream>,
         self_node: NodeIndex,
         inputs: &[NodeIndex],
         buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
         dyn_map: &FxHashMap<char, usize>,
+        set_stream: bool,
     ) -> anyhow::Result<()> {
         // GEMM parameters
         let m = self.m.exec(dyn_map).unwrap() as i32;
@@ -186,13 +192,11 @@ impl HostOp for CuBlasSgemmV2 {
         )
         .entered();
 
-        // Use shared cuBLAS handle to avoid per-operation workspace allocation
-        let cublas = SHARED_CUBLAS.get_or_init(|| Arc::new(CudaBlas::new(stream.clone()).unwrap()));
-
-        // Set the stream for this operation (cuBLAS handle can work with any stream)
-        // The CUstream types from cublas::sys and driver::sys are compatible, just cast
-        unsafe {
-            cublasSetStream_v2(*cublas.handle(), stream.cu_stream() as _);
+        if set_stream {
+            // The CUstream types from cublas::sys and driver::sys are compatible, just cast.
+            unsafe {
+                cublasSetStream_v2(*cublas.handle(), stream.cu_stream() as _);
+            }
         }
 
         let status = unsafe {
@@ -226,9 +230,54 @@ impl HostOp for CuBlasSgemmV2 {
 
         Ok(())
     }
+}
+
+impl HostOp for CuBlasSgemmV2 {
+    fn execute(
+        &self,
+        stream: &Arc<CudaStream>,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        // Use shared cuBLAS handle to avoid per-operation workspace allocation
+        let cublas = SHARED_CUBLAS.get_or_init(|| Arc::new(CudaBlas::new(stream.clone()).unwrap()));
+        self.run_with_handle(cublas, stream, self_node, inputs, buffers, dyn_map, true)
+    }
+
+    fn warmup_for_capture(
+        &self,
+        stream: &Arc<CudaStream>,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        let cublas = self
+            .capture_cublas
+            .get_or_init(|| Arc::new(CudaBlas::new(stream.clone()).unwrap()));
+        self.run_with_handle(cublas, stream, self_node, inputs, buffers, dyn_map, false)
+    }
+
+    fn execute_for_capture(
+        &self,
+        stream: &Arc<CudaStream>,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        let cublas = self.capture_cublas.get().ok_or_else(|| {
+            anyhow::anyhow!("cuBLAS capture handle not initialized; prepare_for_capture missing")
+        })?;
+        self.run_with_handle(cublas, stream, self_node, inputs, buffers, dyn_map, false)
+    }
 
     fn prepare_for_capture(&self, stream: &Arc<CudaStream>) -> anyhow::Result<()> {
-        let _ = SHARED_CUBLAS.get_or_init(|| Arc::new(CudaBlas::new(stream.clone()).unwrap()));
+        let _ = self
+            .capture_cublas
+            .get_or_init(|| Arc::new(CudaBlas::new(stream.clone()).unwrap()));
         Ok(())
     }
 
