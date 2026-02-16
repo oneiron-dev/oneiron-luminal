@@ -1,12 +1,12 @@
 # CUDA Performance Codex — Qwen3-TTS on Luminal
 
-## Current State (post Wave A, 2026-02-16)
+## Current State (post Wave B.0, 2026-02-16)
 
 - **344.6ms/frame** on A100-80GB (decode 114ms + predictor 225ms + overhead 5ms)
 - **Target**: ~28ms/frame (PyTorch reference via CUDA graph replay)
 - **Gap**: 12.3x — entirely due to host-dispatch overhead (1677 ops/frame, each a separate cuLaunchKernel or cuGraphLaunch)
 - **Branch**: qwen3-tts
-- **Completed**: Wave 0 (cuBLASLt), A1 (sync removal), A2 (selective zeroing) — see `docs/wave-a-results.md`
+- **Completed**: Wave 0, A1, A2 (see `docs/wave-a-results.md`) + B.0 spike (see `docs/wave-b0-results.md`)
 
 ## What's Been Done
 
@@ -16,55 +16,84 @@
 | A1 | Per-op sync removal | -27ms/frame | 767ce087 |
 | A2 | Selective buffer zeroing | -55ms/frame (zero_buffers → 0ms) | 767ce087 |
 | — | Cache compat fix | Both cuBLAS+cuBLASLt registered | 65ea3dae |
+| B.0 | Stream capture feasibility spike | cuBLASLt capturable, cuGraphLaunch NOT capturable | c559aa28 |
 
 Safety flags: `LUMINAL_SYNC_DEBUG=1` (restore sync), `LUMINAL_FORCE_ZERO_ALL=1` (restore zero-all)
 
+## B.0 Key Finding: cuGraphLaunch Not Capturable
+
+**Stream capture cannot nest `cuGraphLaunch`**. Attempting `cuGraphLaunch` during `cuStreamBeginCapture` returns `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`. This is a fundamental CUDA limitation — not a driver version or configuration issue.
+
+**What IS capturable**: cuBLASLt matmul calls, custom kernel launches, memset/memcpy. Just not child graph launches.
+
+**Implication**: The original Wave B.1 plan (stream-capture the entire `execute()` call) won't work because `execute()` dispatches CudaGraphOps which do `cuGraphLaunch` internally.
+
 ## What's Next
 
-### Wave B.0: Capture Feasibility Spike (2-4 days)
+### Wave B.1: Explicit Graph Construction with Child Nodes (1-2 weeks)
 
-**Goal**: Determine if CUDA stream capture can wrap the entire `execute()` call — including both CudaGraphOp launches (child graph replay) and cuBLASLt matmuls — into a single parent CUDA graph.
+**Strategy change**: Instead of stream capture, build the parent graph **explicitly** using `cuGraphCreate` + `cuGraphAddChildGraphNode` + mini stream captures for cuBLAS ops.
 
-**Test already exists** (ignored): `crates/luminal_cuda/src/kernel/cuda_graph.rs:491`
+**How it works**:
+
 ```
-#[test]
-#[ignore = "Wave B.0 feasibility spike; run manually on a CUDA host"]
-fn wave_b0_stream_capture_with_graph_launch_and_cublaslt()
+For each runtime.execute() call:
+  1. Create empty parent CUgraph
+  2. For each HostOp in topo order:
+     - CudaGraphOp → cuGraphAddChildGraphNode(parent, deps, child.cu_graph)
+     - CuBlasLt    → mini stream capture of the matmul → cuGraphAddChildGraphNode
+     - CuBlasSgemm → mini stream capture of the sgemm → cuGraphAddChildGraphNode
+  3. Instantiate parent graph → CUgraphExec
+  4. Launch with single cuGraphLaunch
+  5. Cache (CUgraphExec, DynMapSignature) for subsequent frames
+  6. On frame 2+: update buffer pointers via cuGraphExecChildGraphNodeSetParams,
+     then replay
 ```
 
-**What to validate**:
-1. Can `cuStreamBeginCapture` capture a child `cuGraphLaunch` (CudaGraphOp's replay)?
-2. Can it capture a cuBLASLt matmul in the same stream?
-3. Can the resulting parent graph be instantiated and replayed?
-4. Can buffer pointers be updated between replays (via `cudaGraphExecKernelNodeSetParams` or full re-instantiate)?
+**Key CUDA APIs**:
+- `cuGraphCreate` — create empty graph
+- `cuGraphAddChildGraphNode` — add CudaGraphOp as child node (available in cudarc 0.18.2 sys)
+- `cuStreamBeginCapture/EndCapture` — mini-capture for cuBLAS ops
+- `cuGraphInstantiateWithFlags` — instantiate parent graph
+- `cuGraphExecChildGraphNodeSetParams` — update child graph in instantiated exec (if buffer pointers change)
 
-**Known risks**:
-- cuBLAS/cuBLASLt may use internal workspace allocation during capture → capture failure
-- Child graph launch during capture requires CUDA 12.0+ (A100 supports this)
-- If capture fails: fallback is segmented capture (capture CudaGraphOp regions, dispatch cuBLASLt individually)
+**Data flow dependencies**: The `execute_host_ops_loop` already topologically sorts ops. Each op's dependency chain defines the graph node edges.
 
-**Run on Modal**: `modal run scripts/modal_test_tts.py` won't run this test automatically. Need either:
-- A Modal function that runs `cargo test ... wave_b0 -- --ignored --nocapture`, or
-- Add a standalone binary/integration test
+**Access to child CUgraph**: `CudaGraphOpState.cuda_graph` holds a `CudaGraphHandle` with `cu_graph: CUgraph`. Need to expose this via a method on `CudaGraphOp` (currently behind `RefCell`).
 
-### Wave B.1: Runtime-Level Replay (1-2 weeks)
+**Implementation plan**:
 
-**Prereq**: B.0 proves capture is feasible.
+1. **B.1a**: Add `fn cu_graph(&self) -> CUgraph` accessor to CudaGraphOp
+2. **B.1b**: Add `cuGraphAddChildGraphNode` wrapper to `cuda_graph.rs`
+3. **B.1c**: In `CudaRuntime`, implement `build_runtime_graph()`:
+   - Iterate exec ops in topo order
+   - For CudaGraphOp: ensure child graph is built, add as child node
+   - For CuBlasLt/CuBlasSgemm: mini-capture + add as child node
+   - Track data-flow edges as graph dependencies
+4. **B.1d**: Wire into `execute()` with the existing `RuntimeReplayState` machine:
+   - WarmupPending → normal execute (builds child graphs, primes cuBLAS)
+   - CapturePending → `build_runtime_graph()` + instantiate
+   - Ready → single `cuGraphLaunch` + pointer updates
+5. **B.1e**: Correctness test: compare output between dispatch and replay paths
+6. **B.1f**: Modal benchmark: measure frame time with replay enabled
 
-**Design**: Add a replay cache to `CudaRuntime::execute()`:
-1. First call with given `dyn_map` values → normal dispatch + stream capture → store graph
-2. Subsequent calls with same `dyn_map` → replay cached graph
-3. If `dyn_map` changes → invalidate cache, fall back to dispatch + re-capture
-4. Buffer pointer updates between replays (inputs change every frame via `set_data`)
+**Known challenges**:
+- CuBlasLt ops lazily initialize cuBLASLt handles and workspaces (OnceLock) — must be initialized during warmup
+- Buffer pointer updates between frames: `set_data` changes input pointers, need to propagate to child graph nodes
+- Zeroing: some buffers need zeroing before execution — can be memset nodes in the graph
+- CudaGraphOp already manages its own graph rebuild logic — during parent graph construction, child graphs must be in their final state (not pending rebuild)
 
 **Key files**:
-- `crates/luminal_cuda/src/runtime.rs` — `execute()` method (~line 719)
-- `crates/luminal_cuda/src/kernel/to_host.rs` — CudaGraphOp (already does child graph launch)
-- `crates/luminal_cuda/src/host/cublaslt/mod.rs` — cuBLASLt execution
+- `crates/luminal_cuda/src/runtime.rs` — `execute()`, RuntimeReplayState, build_runtime_graph (new)
+- `crates/luminal_cuda/src/kernel/to_host.rs` — CudaGraphOp, cu_graph() accessor (new)
+- `crates/luminal_cuda/src/kernel/cuda_graph.rs` — cuGraphAddChildGraphNode wrapper (new)
+- `crates/luminal_cuda/src/host/cublaslt/mod.rs` — cuBLASLt warmup
+- `crates/luminal_cuda/src/host/cublas/mod.rs` — cuBLAS warmup
 
 **What "done" looks like**:
-- Frame 1: normal dispatch (captures graph) — ~345ms
-- Frame 2+: graph replay — target <80ms (conservative), aspirational <40ms
+- Frame 1: normal dispatch (warmup) — ~345ms
+- Frame 2: explicit graph build + instantiate — ~345ms + build overhead
+- Frame 3+: graph replay — target <80ms (conservative), aspirational <40ms
 - Correctness: output waveform matches non-replay path bit-for-bit
 
 ### Wave C: Graph Size Investigation (conditional)
@@ -104,15 +133,33 @@ pipeline.rs: generate_frames loop
   └── kv_scatter (CPU + partial GPU update) → 4.8ms
 ```
 
+### HostOp types in execute() dispatch
+```
+CudaGraphOp    → wraps MegakernelOp subgraph → cuGraphLaunch (child graph)
+                 Has internal CUgraph handle, builds/updates graph on demand
+                 Buffer pointers updated via cuGraphExecKernelNodeSetParams
+
+CuBlasLt       → cuBLASLt matmul (workspace OnceLock, handle OnceLock)
+                 Capturable via stream capture (B.0 confirmed)
+
+CuBlasSgemmV2  → cuBLAS sgemm (legacy, still registered for cache compat)
+                 Likely capturable (same GPU-only pattern as cuBLASLt)
+```
+
 ### How execution should work after Wave B.1 (~40-80ms/frame)
 ```
 pipeline.rs: generate_frames loop
   ├── set_data (embed, pos, mask)           → 0.04ms
   ├── decode_rt.execute()                   → ~15-25ms
-  │   └── runtime.rs: cuGraphLaunch(cached_decode_graph)  ← 1 call
+  │   └── runtime.rs: cuGraphLaunch(cached_parent_graph)  ← 1 call
+  │       Parent graph contains:
+  │       ├── child_node[0]: CudaGraphOp #0 (attention block)
+  │       ├── child_node[1]: CuBlasLt matmul (captured)
+  │       ├── child_node[2]: CudaGraphOp #1 (MLP block)
+  │       └── ... (495 total, all as graph nodes)
   ├── get_f32 (3 outputs)                   → 0.3ms
   ├── pred set_data + pred_rt.execute()     → ~20-50ms
-  │   └── runtime.rs: cuGraphLaunch(cached_pred_graph)    ← 1 call
+  │   └── runtime.rs: cuGraphLaunch(cached_parent_graph)  ← 1 call
   └── kv_scatter (CPU + partial GPU update) → 4.8ms
 ```
 
@@ -128,16 +175,18 @@ eiri-voice-stack: inference loop
 
 | File | Role |
 |------|------|
-| `crates/luminal_cuda/src/runtime.rs` | CudaRuntime — buffer mgmt, execute(), profiling |
+| `crates/luminal_cuda/src/runtime.rs` | CudaRuntime — buffer mgmt, execute(), replay state machine |
 | `crates/luminal_cuda/src/kernel/to_host.rs` | CudaGraphOp — child graph build/launch |
 | `crates/luminal_cuda/src/host/cublaslt/mod.rs` | cuBLASLt host op |
-| `crates/luminal_cuda/src/host/cublas/mod.rs` | Legacy cuBLAS host op (still registered for cache compat) |
-| `crates/luminal_cuda/src/kernel/cuda_graph.rs` | CUDA graph tests + B.0 spike |
-| `crates/luminal_cuda/src/block/mod.rs` | BlockOp trait (MegakernelOp, interpreter) |
+| `crates/luminal_cuda/src/host/cublas/mod.rs` | Legacy cuBLAS host op |
+| `crates/luminal_cuda/src/kernel/cuda_graph.rs` | CUDA graph wrappers, B.0 spike test |
+| `crates/luminal_cuda/src/block/mod.rs` | MegakernelOp (KernelOp, used inside CudaGraphOp) |
+| `crates/luminal_cuda/src/lib.rs` | CUDA_STREAM_CAPTURING flag |
 | `examples/qwen3_tts/src/pipeline.rs` | TTS pipeline — prefill, generate_frames, decode_speech |
 | `examples/qwen3_tts/src/backend.rs` | Backend abstraction — compile(), set_data, get_f32 |
 | `scripts/modal_test_tts.py` | Modal A100 test harness |
 | `docs/wave-a-results.md` | Wave A measurement data |
+| `docs/wave-b0-results.md` | Wave B.0 capture feasibility results |
 
 ## Validation Checklist
 
@@ -149,11 +198,13 @@ For every wave:
 - [ ] Profiling numbers recorded in `docs/`
 - [ ] Fallback flags tested (`LUMINAL_SYNC_DEBUG=1`, `LUMINAL_FORCE_ZERO_ALL=1`)
 
-For Wave B specifically:
-- [ ] B.0 spike test passes on A100
+For Wave B.1 specifically:
+- [ ] B.0 spike test passes on A100 (DONE: c559aa28)
+- [ ] Parent graph builds without error (child nodes + cuBLAS nodes)
 - [ ] Output correctness: codes match between replay and dispatch paths
-- [ ] dyn_map change triggers cache invalidation and re-capture
+- [ ] dyn_map change triggers cache invalidation and re-build
 - [ ] No memory leak from graph instantiation (check with `nvidia-smi` over 100 frames)
+- [ ] Frame 2+ steady-state time measured and recorded
 
 ## Housekeeping
 
