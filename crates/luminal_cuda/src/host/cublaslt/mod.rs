@@ -98,6 +98,7 @@ pub struct CuBlasLt {
     workspace: OnceLock<CudaSlice<u8>>,
     capture_cublaslt: OnceLock<Arc<CudaBlasLT>>,
     capture_workspace: OnceLock<CudaSlice<u8>>,
+    capture_workspace_ptr: OnceLock<u64>,
     capture_state: Mutex<Option<CapturedMatmulState>>,
 }
 
@@ -118,6 +119,7 @@ impl Default for CuBlasLt {
             workspace: OnceLock::new(),
             capture_cublaslt: OnceLock::new(),
             capture_workspace: OnceLock::new(),
+            capture_workspace_ptr: OnceLock::new(),
             capture_state: Mutex::new(None),
         }
     }
@@ -184,6 +186,7 @@ impl EgglogOp for CuBlasLt {
             workspace: OnceLock::new(),
             capture_cublaslt: OnceLock::new(),
             capture_workspace: OnceLock::new(),
+            capture_workspace_ptr: OnceLock::new(),
             capture_state: Mutex::new(None),
         };
         trace!(?extracted_state);
@@ -630,7 +633,9 @@ impl HostOp for CuBlasLt {
         let _ = self
             .capture_cublaslt
             .get_or_init(|| Arc::new(CudaBlasLT::new(stream.clone()).unwrap()));
-        let _ = self.ensure_capture_workspace(stream)?;
+        let workspace = self.ensure_capture_workspace(stream)?;
+        let (workspace_ptr, _workspace_guard) = workspace.device_ptr(stream);
+        let _ = self.capture_workspace_ptr.get_or_init(|| workspace_ptr);
         Ok(())
     }
 
@@ -654,8 +659,12 @@ impl HostOp for CuBlasLt {
             .capture_cublaslt
             .get_or_init(|| Arc::new(CudaBlasLT::new(stream.clone()).unwrap()));
         self.ensure_capture_state(cublaslt, config)?;
-        let workspace = self.ensure_capture_workspace(stream)?;
-        let (workspace_ptr, _workspace_guard) = workspace.device_ptr(stream);
+        let workspace_ptr = *self.capture_workspace_ptr.get_or_init(|| {
+            self.ensure_capture_workspace(stream)
+                .expect("cuBLASLt capture workspace should be initialized")
+                .device_ptr(stream)
+                .0
+        });
         let state_guard = self
             .capture_state
             .lock()
@@ -714,6 +723,46 @@ impl HostOp for CuBlasLt {
         if std::env::var("LUMINAL_SYNC_DEBUG").map_or(false, |v| v == "1") {
             stream.synchronize()?;
         }
+        Ok(())
+    }
+
+    fn execute_for_capture_raw(
+        &self,
+        stream: &Arc<CudaStream>,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        raw_buffers: &FxHashMap<NodeIndex, u64>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        let config = self.build_capture_config(dyn_map);
+        let cublaslt = self.capture_cublaslt.get().ok_or_else(|| {
+            anyhow::anyhow!("cuBLASLt capture handle not initialized; prepare_for_capture missing")
+        })?;
+        let workspace_ptr = *self.capture_workspace_ptr.get().ok_or_else(|| {
+            anyhow::anyhow!("cuBLASLt capture workspace ptr missing; prepare_for_capture missing")
+        })?;
+
+        let a_ptr = *raw_buffers
+            .get(&inputs[0])
+            .ok_or_else(|| anyhow::anyhow!("Missing raw pointer for cuBLASLt input A"))?;
+        let b_ptr = *raw_buffers
+            .get(&inputs[1])
+            .ok_or_else(|| anyhow::anyhow!("Missing raw pointer for cuBLASLt input B"))?;
+        let c_ptr = *raw_buffers
+            .get(&self_node)
+            .ok_or_else(|| anyhow::anyhow!("Missing raw pointer for cuBLASLt output C"))?;
+
+        let state_guard = self
+            .capture_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cuBLASLt capture state mutex poisoned"))?;
+        let state = state_guard.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("cuBLASLt capture state missing; warmup_for_capture not run")
+        })?;
+        if state.config != config {
+            anyhow::bail!("cuBLASLt capture state config mismatch; recapture required");
+        }
+        self.run_captured_matmul(cublaslt, stream, state, a_ptr, b_ptr, c_ptr, workspace_ptr)?;
         Ok(())
     }
 

@@ -1272,6 +1272,16 @@ impl CudaRuntime {
             .synchronize()
             .map_err(|err| anyhow::anyhow!("Mini-capture warmup sync failed: {err:#}"))?;
 
+        // Resolve all device pointers before capture so no `device_ptr()` calls happen while
+        // capture is active (avoids cudarc event management nodes inside mini-capture).
+        let raw_buffers: FxHashMap<NodeIndex, u64> = buffers
+            .iter()
+            .map(|(node, buf)| {
+                let (ptr, _guard) = buf.device_ptr(capture_stream);
+                (*node, ptr)
+            })
+            .collect();
+
         let prev_capture_flag = crate::CUDA_STREAM_CAPTURING.get();
         crate::CUDA_STREAM_CAPTURING.set(true);
         let capture_res = (|| -> anyhow::Result<cudarc::driver::sys::CUgraph> {
@@ -1282,11 +1292,11 @@ impl CudaRuntime {
                 )
                 .result()?;
             }
-            let execute_res = exec_op.internal.execute_for_capture(
+            let execute_res = exec_op.internal.execute_for_capture_raw(
                 capture_stream,
                 exec_op.output,
                 &exec_op.inputs,
-                buffers,
+                &raw_buffers,
                 dyn_map,
             );
             if let Err(err) = execute_res {

@@ -1,6 +1,9 @@
 use cudarc::cublas::{
     CudaBlas,
-    sys::{cublasOperation_t, cublasSetStream_v2, cublasSgemm_v2, cublasStatus_t},
+    sys::{
+        cublasOperation_t, cublasSetStream_v2, cublasSetWorkspace_v2, cublasSgemm_v2,
+        cublasStatus_t,
+    },
 };
 use cudarc::driver::{CudaStream, DevicePtr};
 use luminal::{
@@ -15,6 +18,8 @@ use std::sync::{Arc, OnceLock};
 use tracing::{Level, span, trace};
 
 use crate::{cudarc::driver::CudaSlice, host::HostOp};
+
+const CUBLAS_CAPTURE_WORKSPACE_SIZE: usize = 4 * 1024 * 1024;
 
 /// Global shared cuBLAS handle to avoid per-operation workspace allocation
 static SHARED_CUBLAS: OnceLock<Arc<CudaBlas>> = OnceLock::new();
@@ -46,6 +51,8 @@ pub struct CuBlasSgemmV2 {
     cublas: OnceLock<Arc<CudaBlas>>,
     /// Capture-specific cuBLAS handle (must be initialized on the capture stream).
     capture_cublas: OnceLock<Arc<CudaBlas>>,
+    /// Capture-only workspace required for cuBLAS stream-capture compatibility.
+    capture_workspace: OnceLock<CudaSlice<u8>>,
 }
 
 // Useless default for IntoEgglogOp
@@ -62,6 +69,7 @@ impl Default for CuBlasSgemmV2 {
             ldc: Expression::default(),
             cublas: OnceLock::new(),
             capture_cublas: OnceLock::new(),
+            capture_workspace: OnceLock::new(),
         }
     }
 }
@@ -119,6 +127,7 @@ impl EgglogOp for CuBlasSgemmV2 {
             ldc,
             cublas: OnceLock::new(),
             capture_cublas: OnceLock::new(),
+            capture_workspace: OnceLock::new(),
         };
         trace!(?extracted_state);
 
@@ -133,6 +142,20 @@ impl EgglogOp for CuBlasSgemmV2 {
 }
 
 impl CuBlasSgemmV2 {
+    fn ensure_capture_workspace<'a>(
+        &'a self,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<&'a CudaSlice<u8>> {
+        if self.capture_workspace.get().is_none() {
+            let workspace = unsafe { stream.alloc::<u8>(CUBLAS_CAPTURE_WORKSPACE_SIZE)? };
+            let _ = self.capture_workspace.set(workspace);
+        }
+        Ok(self
+            .capture_workspace
+            .get()
+            .expect("cuBLAS capture workspace should be initialized"))
+    }
+
     fn run_with_handle(
         &self,
         cublas: &Arc<CudaBlas>,
@@ -230,6 +253,71 @@ impl CuBlasSgemmV2 {
 
         Ok(())
     }
+
+    fn run_with_handle_raw(
+        &self,
+        cublas: &Arc<CudaBlas>,
+        stream: &Arc<CudaStream>,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        raw_buffers: &FxHashMap<NodeIndex, u64>,
+        dyn_map: &FxHashMap<char, usize>,
+        set_stream: bool,
+    ) -> anyhow::Result<()> {
+        let m = self.m.exec(dyn_map).unwrap() as i32;
+        let n = self.n.exec(dyn_map).unwrap() as i32;
+        let k = self.k.exec(dyn_map).unwrap() as i32;
+        let a_layout = self.a_layout;
+        let b_layout = self.b_layout;
+        let lda = self.lda.exec(dyn_map).unwrap() as i32;
+        let ldb = self.ldb.exec(dyn_map).unwrap() as i32;
+        let ldc = self.ldc.exec(dyn_map).unwrap() as i32;
+
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+
+        let a_ptr = *raw_buffers
+            .get(&inputs[0])
+            .ok_or_else(|| anyhow::anyhow!("Missing raw pointer for cuBLAS input A"))?;
+        let b_ptr = *raw_buffers
+            .get(&inputs[1])
+            .ok_or_else(|| anyhow::anyhow!("Missing raw pointer for cuBLAS input B"))?;
+        let c_ptr = *raw_buffers
+            .get(&self_node)
+            .ok_or_else(|| anyhow::anyhow!("Missing raw pointer for cuBLAS output C"))?;
+
+        if set_stream {
+            unsafe {
+                cublasSetStream_v2(*cublas.handle(), stream.cu_stream() as _);
+            }
+        }
+
+        let status = unsafe {
+            cublasSgemm_v2(
+                *cublas.handle(),
+                a_layout,
+                b_layout,
+                m,
+                n,
+                k,
+                &alpha as *const f32,
+                a_ptr as *const f32,
+                lda,
+                b_ptr as *const f32,
+                ldb,
+                &beta as *const f32,
+                c_ptr as *mut f32,
+                ldc,
+            )
+        };
+        if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(anyhow::anyhow!(
+                "cuBLAS SGEMM capture failed with status: {:?}",
+                status
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl HostOp for CuBlasSgemmV2 {
@@ -257,7 +345,8 @@ impl HostOp for CuBlasSgemmV2 {
         let cublas = self
             .capture_cublas
             .get_or_init(|| Arc::new(CudaBlas::new(stream.clone()).unwrap()));
-        self.run_with_handle(cublas, stream, self_node, inputs, buffers, dyn_map, false)
+        // Ensure warmup uses the capture stream/handle pairing that will be used for mini-capture.
+        self.run_with_handle(cublas, stream, self_node, inputs, buffers, dyn_map, true)
     }
 
     fn execute_for_capture(
@@ -275,10 +364,47 @@ impl HostOp for CuBlasSgemmV2 {
     }
 
     fn prepare_for_capture(&self, stream: &Arc<CudaStream>) -> anyhow::Result<()> {
-        let _ = self
+        let cublas = self
             .capture_cublas
             .get_or_init(|| Arc::new(CudaBlas::new(stream.clone()).unwrap()));
+        let workspace = self.ensure_capture_workspace(stream)?;
+        let (workspace_ptr, _workspace_guard) = workspace.device_ptr(stream);
+        let status = unsafe {
+            cublasSetWorkspace_v2(
+                *cublas.handle(),
+                workspace_ptr as *mut std::ffi::c_void,
+                CUBLAS_CAPTURE_WORKSPACE_SIZE,
+            )
+        };
+        if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(anyhow::anyhow!(
+                "cublasSetWorkspace_v2 failed for capture handle: {:?}",
+                status
+            ));
+        }
         Ok(())
+    }
+
+    fn execute_for_capture_raw(
+        &self,
+        stream: &Arc<CudaStream>,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        raw_buffers: &FxHashMap<NodeIndex, u64>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        let cublas = self.capture_cublas.get().ok_or_else(|| {
+            anyhow::anyhow!("cuBLAS capture handle not initialized; prepare_for_capture missing")
+        })?;
+        self.run_with_handle_raw(
+            cublas,
+            stream,
+            self_node,
+            inputs,
+            raw_buffers,
+            dyn_map,
+            false,
+        )
     }
 
     fn output_size(&self) -> Expression {

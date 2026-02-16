@@ -63,6 +63,21 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         self.execute(stream, self_node, inputs, buffers, dyn_map)
     }
 
+    /// Execute inside capture using pre-resolved raw device pointers.
+    ///
+    /// This avoids `CudaSlice::device_ptr()` during active capture, which injects
+    /// stream event management not suitable for mini-capture.
+    fn execute_for_capture_raw(
+        &self,
+        _stream: &Arc<CudaStream>,
+        _self_node: NodeIndex,
+        _inputs: &[NodeIndex],
+        _raw_buffers: &FxHashMap<NodeIndex, u64>,
+        _dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("execute_for_capture_raw not implemented for this HostOp");
+    }
+
     /// Returns the output buffer size in elements.
     /// Return 0 if this op doesn't have a single output buffer (e.g., CudaGraphOp).
     fn output_size(&self) -> Expression;
