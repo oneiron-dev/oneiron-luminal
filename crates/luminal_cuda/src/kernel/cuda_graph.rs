@@ -89,6 +89,74 @@ impl CudaGraphHandle {
         }
     }
 
+    /// Adds a child graph node. CUDA clones the child graph into this node.
+    pub fn add_child_graph_node(
+        &mut self,
+        dependencies: &[CUgraphNode],
+        child_graph: CUgraph,
+    ) -> Result<CUgraphNode, DriverError> {
+        let mut node = MaybeUninit::uninit();
+        unsafe {
+            sys::cuGraphAddChildGraphNode(
+                node.as_mut_ptr(),
+                self.cu_graph,
+                dependencies.as_ptr(),
+                dependencies.len(),
+                child_graph,
+            )
+            .result()?;
+            Ok(node.assume_init())
+        }
+    }
+
+    /// Adds a dependency edge between two existing nodes.
+    pub fn add_dependency(
+        &mut self,
+        from: CUgraphNode,
+        to: CUgraphNode,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            sys::cuGraphAddDependencies_v2(self.cu_graph, &from, &to, std::ptr::null(), 1)
+                .result()?;
+        }
+        Ok(())
+    }
+
+    /// Adds a 1D memset node that fills `nbytes` bytes at `dst_ptr` with zero.
+    pub fn add_memset_zero_node_u8(
+        &mut self,
+        dependencies: &[CUgraphNode],
+        dst_ptr: u64,
+        nbytes: usize,
+    ) -> Result<CUgraphNode, DriverError> {
+        let mut node = MaybeUninit::uninit();
+        let params = sys::CUDA_MEMSET_NODE_PARAMS {
+            dst: dst_ptr,
+            pitch: nbytes,
+            value: 0,
+            elementSize: 1,
+            width: nbytes,
+            height: 1,
+        };
+        unsafe {
+            sys::cuGraphAddMemsetNode(
+                node.as_mut_ptr(),
+                self.cu_graph,
+                dependencies.as_ptr(),
+                dependencies.len(),
+                &params,
+                std::ptr::null_mut(),
+            )
+            .result()?;
+            Ok(node.assume_init())
+        }
+    }
+
+    /// Returns the raw CUgraph handle.
+    pub fn raw_graph(&self) -> CUgraph {
+        self.cu_graph
+    }
+
     /// Instantiates the graph, creating an executable graph.
     pub fn instantiate(&self) -> Result<CudaGraphExecHandle, DriverError> {
         self.ctx.bind_to_thread()?;
@@ -154,6 +222,19 @@ impl CudaGraphExecHandle {
 
         unsafe { sys::cuGraphExecKernelNodeSetParams_v2(self.cu_graph_exec, node, &params) }
             .result()
+    }
+
+    /// Updates a child graph node in an instantiated parent graph.
+    pub fn update_child_graph_node(
+        &mut self,
+        node: CUgraphNode,
+        child_graph: CUgraph,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            sys::cuGraphExecChildGraphNodeSetParams(self.cu_graph_exec, node, child_graph)
+                .result()?;
+        }
+        Ok(())
     }
 }
 
@@ -548,8 +629,12 @@ mod tests {
         let mut a: CudaSlice<f32> = unsafe { stream.alloc((M * K) as usize) }.unwrap();
         let mut b: CudaSlice<f32> = unsafe { stream.alloc((K * N) as usize) }.unwrap();
         let mut c: CudaSlice<f32> = unsafe { stream.alloc((M * N) as usize) }.unwrap();
-        stream.memcpy_htod(&vec![1.0f32; (M * K) as usize], &mut a).unwrap();
-        stream.memcpy_htod(&vec![2.0f32; (K * N) as usize], &mut b).unwrap();
+        stream
+            .memcpy_htod(&vec![1.0f32; (M * K) as usize], &mut a)
+            .unwrap();
+        stream
+            .memcpy_htod(&vec![2.0f32; (K * N) as usize], &mut b)
+            .unwrap();
 
         let cublaslt = CudaBlasLT::new(stream.clone()).unwrap();
         // Drop guards immediately — we only need the raw u64 pointer values.
@@ -607,7 +692,9 @@ mod tests {
                 .result()
                 .unwrap();
 
-            cublasLtMatmulPreferenceCreate(&mut preference).result().unwrap();
+            cublasLtMatmulPreferenceCreate(&mut preference)
+                .result()
+                .unwrap();
             cublasLtMatmulPreferenceSetAttribute(
                 preference,
                 cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
@@ -630,7 +717,10 @@ mod tests {
             )
             .result()
             .unwrap();
-            assert!(algo_count > 0, "No suitable cuBLASLt algorithm found during capture spike");
+            assert!(
+                algo_count > 0,
+                "No suitable cuBLASLt algorithm found during capture spike"
+            );
         }
 
         let alpha_f32: f32 = 1.0;
@@ -686,9 +776,14 @@ mod tests {
                 .result()
                 .unwrap();
         }
-        assert!(!phase1_graph.is_null(), "phase 1: cuBLASLt capture returned null");
+        assert!(
+            !phase1_graph.is_null(),
+            "phase 1: cuBLASLt capture returned null"
+        );
         // Clean up phase 1 graph (we only needed to verify capture works)
-        unsafe { sys::cuGraphDestroy(phase1_graph).result().unwrap(); }
+        unsafe {
+            sys::cuGraphDestroy(phase1_graph).result().unwrap();
+        }
         eprintln!("[B0] Phase 1 PASSED: cuBLASLt matmul is capturable");
 
         // === Phase 2: Test child graph launch capture alone ===
@@ -713,7 +808,9 @@ mod tests {
                             .unwrap();
                     }
                     if !phase2_graph.is_null() {
-                        unsafe { sys::cuGraphDestroy(phase2_graph).result().ok(); }
+                        unsafe {
+                            sys::cuGraphDestroy(phase2_graph).result().ok();
+                        }
                         eprintln!("[B0] Phase 2 PASSED: child graph launch is capturable");
                         true
                     } else {
@@ -725,12 +822,19 @@ mod tests {
                     eprintln!("[B0] Phase 2 FAILED: cuGraphLaunch during capture: {e}");
                     // End capture to restore stream state
                     let mut discard = std::ptr::null_mut();
-                    unsafe { sys::cuStreamEndCapture(stream.cu_stream(), &mut discard).result().ok(); }
+                    unsafe {
+                        sys::cuStreamEndCapture(stream.cu_stream(), &mut discard)
+                            .result()
+                            .ok();
+                    }
                     false
                 }
             }
         } else {
-            eprintln!("[B0] Phase 2 FAILED: cuStreamBeginCapture: {:?}", phase2_result);
+            eprintln!(
+                "[B0] Phase 2 FAILED: cuStreamBeginCapture: {:?}",
+                phase2_result
+            );
             false
         };
 
@@ -752,7 +856,9 @@ mod tests {
             launch_matmul().unwrap();
         } else {
             // Phase 2 failed: capture only cuBLASLt (child graph launch not supported)
-            eprintln!("[B0] Phase 3: capturing cuBLASLt only (child graph launch not capturable)...");
+            eprintln!(
+                "[B0] Phase 3: capturing cuBLASLt only (child graph launch not capturable)..."
+            );
             unsafe {
                 sys::cuStreamBeginCapture_v2(
                     stream.cu_stream(),
@@ -770,11 +876,16 @@ mod tests {
                 .result()
                 .unwrap();
         }
-        assert!(!captured_graph.is_null(), "phase 3: capture should return a graph");
+        assert!(
+            !captured_graph.is_null(),
+            "phase 3: capture should return a graph"
+        );
 
         // Zero output buffers before replay so we test the captured graph, not warmup leftovers.
         stream.memcpy_htod(&[0.0f32], &mut output).unwrap();
-        stream.memcpy_htod(&vec![0.0f32; (M * N) as usize], &mut c).unwrap();
+        stream
+            .memcpy_htod(&vec![0.0f32; (M * N) as usize], &mut c)
+            .unwrap();
         stream.synchronize().unwrap();
 
         let mut captured_exec = std::ptr::null_mut();
@@ -801,7 +912,10 @@ mod tests {
             eprintln!("[B0] Child graph output verified: {}", child_out[0]);
         } else {
             // Child graph wasn't captured, output should still be zero from our memset
-            eprintln!("[B0] Child graph output (not captured): {} (expected 0.0)", child_out[0]);
+            eprintln!(
+                "[B0] Child graph output (not captured): {} (expected 0.0)",
+                child_out[0]
+            );
         }
 
         // Validate cuBLASLt output (always part of captured graph)
@@ -814,12 +928,22 @@ mod tests {
             c_out[0],
             expected
         );
-        eprintln!("[B0] cuBLASLt output verified: {} (expected {})", c_out[0], expected);
+        eprintln!(
+            "[B0] cuBLASLt output verified: {} (expected {})",
+            c_out[0], expected
+        );
 
         // Summary
         eprintln!("\n=== B0 Spike Results ===");
         eprintln!("  Phase 1 (cuBLASLt capture):      PASS");
-        eprintln!("  Phase 2 (child graph capture):    {}", if phase2_ok { "PASS" } else { "FAIL (expected — cuGraphLaunch not capturable)" });
+        eprintln!(
+            "  Phase 2 (child graph capture):    {}",
+            if phase2_ok {
+                "PASS"
+            } else {
+                "FAIL (expected — cuGraphLaunch not capturable)"
+            }
+        );
         eprintln!("  Phase 3 (instantiate + replay):   PASS");
         eprintln!("  cuBLASLt replay correctness:      PASS");
         if phase2_ok {

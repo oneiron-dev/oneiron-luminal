@@ -7,7 +7,8 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, sys::CUgraphNode,
+    CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr,
+    sys::{CUgraph, CUgraphNode},
 };
 use itertools::Itertools;
 use luminal::{
@@ -229,7 +230,7 @@ impl HostOp for CudaGraphOp {
         buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<()> {
-        self.execute_internal(stream, buffers, dyn_map)
+        self.execute_internal(stream, buffers, dyn_map, true)
     }
 
     fn output_size(&self) -> Expression {
@@ -267,12 +268,33 @@ impl HostOp for CudaGraphOp {
 }
 
 impl CudaGraphOp {
+    /// Ensures the child CUDA graph is built and updated for the given buffers and dynamic dims.
+    /// This path intentionally does NOT launch the child graph.
+    pub fn ensure_built_and_updated_for_runtime_graph(
+        &self,
+        stream: &Arc<CudaStream>,
+        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        self.execute_internal(stream, buffers, dyn_map, false)
+    }
+
+    /// Returns the raw child CUgraph handle if this op has built its graph.
+    pub fn cu_graph(&self) -> Option<CUgraph> {
+        self.state
+            .borrow()
+            .cuda_graph
+            .as_ref()
+            .map(CudaGraphHandle::raw_graph)
+    }
+
     /// Execute the CUDA graph with the given buffers and dynamic dimensions.
     fn execute_internal(
         &self,
         stream: &Arc<CudaStream>,
         buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
         dyn_map: &FxHashMap<char, usize>,
+        launch_graph: bool,
     ) -> anyhow::Result<()> {
         let mut state = self.state.borrow_mut();
         let _span = span!(Level::TRACE, "cuda_graph", kernels = state.kernels.len()).entered();
@@ -496,6 +518,10 @@ impl CudaGraphOp {
         // Skip during CUDA stream capture (synchronize is illegal on a captured stream).
         if !crate::CUDA_STREAM_CAPTURING.get() && (sync_debug || graph_rebuilt || needs_update) {
             stream.synchronize()?;
+        }
+
+        if !launch_graph {
+            return Ok(());
         }
 
         // Check if we should bypass the CUDA graph and launch kernels individually

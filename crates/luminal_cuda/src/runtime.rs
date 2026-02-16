@@ -1,7 +1,10 @@
 use crate::{
     block::{BlockOp, N_TIMING_SLOTS, SMEvent, record_block_op_timings},
     host::HostOp,
-    kernel::{CudaGraphExecHandle, CudaGraphTiming, KernelOp, record_cuda_graph_timings},
+    kernel::{
+        CudaGraphExecHandle, CudaGraphHandle, CudaGraphOp, CudaGraphTiming, KernelOp,
+        record_cuda_graph_timings,
+    },
 };
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice};
 
@@ -882,7 +885,7 @@ impl Runtime for CudaRuntime {
             self.runtime_replay.state = RuntimeReplayState::CapturePending;
         }
         if replay_enabled {
-            self.runtime_replay.signature = Some(signature);
+            self.runtime_replay.signature = Some(signature.clone());
         }
 
         let mut n_zeroed_bufs = 0usize;
@@ -890,8 +893,18 @@ impl Runtime for CudaRuntime {
         let mut replay_mode = "dispatch";
         let (n_ops, exec_ops_us) = match self.runtime_replay.state {
             RuntimeReplayState::Ready if replay_enabled => {
+                if replay_debug
+                    && self
+                        .runtime_replay
+                        .signature
+                        .as_ref()
+                        .is_some_and(|sig| sig != &signature)
+                {
+                    panic!("runtime_replay signature changed without invalidation");
+                }
                 if let Some(exec) = self.runtime_replay.graph_exec.as_ref() {
                     let launch_t = std::time::Instant::now();
+                    // Replay only launches the frozen parent graph. pre_execute is build-only.
                     if let Err(err) = exec.launch(&self.cuda_stream) {
                         if replay_debug {
                             eprintln!("    [runtime_replay] launch failed, falling back: {err}");
@@ -922,17 +935,17 @@ impl Runtime for CudaRuntime {
                 self.prepare_host_ops_for_capture().unwrap_or_else(|e| {
                     panic!("HostOp capture preparation failed: {e:#}");
                 });
-                match self.capture_runtime_graph(dyn_map, force_zero_all) {
-                    Ok((n_zeroed, ops, zero_time_us, capture_dispatch_us, replay_launch_us)) => {
+                match self.build_runtime_graph(dyn_map, force_zero_all) {
+                    Ok((n_zeroed, ops, build_us, replay_launch_us, mini_captures)) => {
                         n_zeroed_bufs = n_zeroed;
-                        zero_us = zero_time_us;
+                        zero_us = 0.0;
                         // launch time is the meaningful host-side cost after capture is built.
                         self.runtime_replay.state = RuntimeReplayState::Ready;
                         replay_mode = "capture";
                         if replay_debug {
                             eprintln!(
-                                "    [runtime_replay] captured parent graph (dispatch during capture: {:.2}ms)",
-                                capture_dispatch_us / 1000.0
+                                "    [runtime_replay] built parent graph ({mini_captures} mini-captures, build: {:.2}ms)",
+                                build_us / 1000.0
                             );
                         }
                         (ops, replay_launch_us)
@@ -1069,6 +1082,49 @@ impl CudaRuntime {
         (n_zeroed_bufs, zero_t.elapsed().as_micros() as f64)
     }
 
+    fn build_host_op_buffer_map<'a>(
+        &'a self,
+        exec_op: &'a ExecutableHostOp,
+    ) -> FxHashMap<NodeIndex, &'a CudaSlice<u8>> {
+        // Build buffer map for the HostOp interface
+        let mut buffer_map: FxHashMap<NodeIndex, &CudaSlice<u8>> = FxHashMap::default();
+        // Add output buffer
+        if let Some(buf) = self.buffers.get(&exec_op.output) {
+            buffer_map.insert(exec_op.output, buf);
+        }
+        // Add input buffers
+        for inp in exec_op.inputs.iter() {
+            if let Some(buf) = self.buffers.get(inp) {
+                buffer_map.insert(*inp, buf);
+            } else if let Some(hlir_node) = self.llir_to_hlir.get(inp)
+                && let Some(CudaInput::Buffer(buf)) = self.hlir_buffers.get(hlir_node)
+            {
+                buffer_map.insert(*inp, buf);
+            }
+        }
+        // Add extra buffer nodes (for CudaGraphOp)
+        let extra_nodes = exec_op.internal.extra_buffer_nodes();
+        for extra_node in extra_nodes {
+            if let Entry::Vacant(e) = buffer_map.entry(extra_node) {
+                if let Some(buf) = self.buffers.get(&extra_node) {
+                    e.insert(buf);
+                } else if let Some(hlir_node) = self.llir_to_hlir.get(&extra_node)
+                    && let Some(CudaInput::Buffer(buf)) = self.hlir_buffers.get(hlir_node)
+                {
+                    e.insert(buf);
+                } else {
+                    panic!(
+                        "Missing buffer for extra_buffer_node {:?}. has_llir_to_hlir={}, node_in_llir={}",
+                        extra_node,
+                        self.llir_to_hlir.contains_key(&extra_node),
+                        self.llir_graph.node_weight(extra_node).is_some()
+                    );
+                }
+            }
+        }
+        buffer_map
+    }
+
     fn execute_host_ops_loop(
         &mut self,
         dyn_map: &FxHashMap<char, usize>,
@@ -1081,42 +1137,7 @@ impl CudaRuntime {
             let exec_op = &self.exec_graph[exec_node];
             trace!("Executing: {:?}", exec_op);
 
-            // Build buffer map for the HostOp interface
-            let mut buffer_map: FxHashMap<NodeIndex, &CudaSlice<u8>> = FxHashMap::default();
-            // Add output buffer
-            if let Some(buf) = self.buffers.get(&exec_op.output) {
-                buffer_map.insert(exec_op.output, buf);
-            }
-            // Add input buffers
-            for inp in exec_op.inputs.iter() {
-                if let Some(buf) = self.buffers.get(inp) {
-                    buffer_map.insert(*inp, buf);
-                } else if let Some(hlir_node) = self.llir_to_hlir.get(inp)
-                    && let Some(CudaInput::Buffer(buf)) = self.hlir_buffers.get(hlir_node)
-                {
-                    buffer_map.insert(*inp, buf);
-                }
-            }
-            // Add extra buffer nodes (for CudaGraphOp)
-            let extra_nodes = exec_op.internal.extra_buffer_nodes();
-            for extra_node in extra_nodes {
-                if let Entry::Vacant(e) = buffer_map.entry(extra_node) {
-                    if let Some(buf) = self.buffers.get(&extra_node) {
-                        e.insert(buf);
-                    } else if let Some(hlir_node) = self.llir_to_hlir.get(&extra_node)
-                        && let Some(CudaInput::Buffer(buf)) = self.hlir_buffers.get(hlir_node)
-                    {
-                        e.insert(buf);
-                    } else {
-                        panic!(
-                            "Missing buffer for extra_buffer_node {:?}. has_llir_to_hlir={}, node_in_llir={}",
-                            extra_node,
-                            self.llir_to_hlir.contains_key(&extra_node),
-                            self.llir_graph.node_weight(extra_node).is_some()
-                        );
-                    }
-                }
-            }
+            let buffer_map = self.build_host_op_buffer_map(exec_op);
             let _span = span!(
                 Level::TRACE,
                 "host_op_execute",
@@ -1146,67 +1167,166 @@ impl CudaRuntime {
         (n_ops, total_start.elapsed().as_micros() as f64)
     }
 
-    fn capture_runtime_graph(
-        &mut self,
+    fn capture_single_host_op_graph(
+        &self,
+        exec_op: &ExecutableHostOp,
+        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
         dyn_map: &FxHashMap<char, usize>,
-        force_zero_all: bool,
-    ) -> anyhow::Result<(usize, usize, f64, f64, f64)> {
+    ) -> anyhow::Result<cudarc::driver::sys::CUgraph> {
         self.cuda_stream.context().bind_to_thread()?;
         unsafe {
             cudarc::driver::sys::cuStreamBeginCapture_v2(
-                self.cuda_stream.cu_stream(),
+                exec_op.stream.cu_stream(),
                 cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_GLOBAL,
             )
             .result()?;
         }
 
-        // Set the thread-local capturing flag so that synchronize calls inside
-        // MegakernelOp::pre_execute and CudaGraphOp::execute_internal are suppressed.
-        // Use a drop guard to ensure the flag is always cleared, even on panic.
-        struct CaptureGuard;
-        impl Drop for CaptureGuard {
-            fn drop(&mut self) {
-                crate::CUDA_STREAM_CAPTURING.set(false);
+        let execute_res = exec_op.internal.execute(
+            &exec_op.stream,
+            exec_op.output,
+            &exec_op.inputs,
+            buffers,
+            dyn_map,
+        );
+        if let Err(err) = execute_res {
+            let mut discarded_graph = std::ptr::null_mut();
+            unsafe {
+                let _ = cudarc::driver::sys::cuStreamEndCapture(
+                    exec_op.stream.cu_stream(),
+                    &mut discarded_graph,
+                );
+                if !discarded_graph.is_null() {
+                    let _ = cudarc::driver::sys::cuGraphDestroy(discarded_graph);
+                }
             }
+            return Err(anyhow::anyhow!(
+                "Mini-capture host op execute failed: {err:#}"
+            ));
         }
-        crate::CUDA_STREAM_CAPTURING.set(true);
-        let _guard = CaptureGuard;
-        let (n_zeroed_bufs, zero_us) = self.zero_buffers_for_execute(force_zero_all, false);
-        let (n_ops, dispatch_us) = self.execute_host_ops_loop(dyn_map, false);
-        drop(_guard);
 
         let mut captured_graph = std::ptr::null_mut();
         unsafe {
             cudarc::driver::sys::cuStreamEndCapture(
-                self.cuda_stream.cu_stream(),
+                exec_op.stream.cu_stream(),
                 &mut captured_graph,
             )
             .result()?;
         }
         if captured_graph.is_null() {
-            anyhow::bail!("cuStreamEndCapture returned null graph");
+            anyhow::bail!("Mini-capture returned null graph");
         }
 
-        let mut captured_exec = std::ptr::null_mut();
-        let instantiate_result = unsafe {
-            cudarc::driver::sys::cuGraphInstantiateWithFlags(&mut captured_exec, captured_graph, 0)
-                .result()
+        Ok(captured_graph)
+    }
+
+    fn build_runtime_graph(
+        &mut self,
+        dyn_map: &FxHashMap<char, usize>,
+        force_zero_all: bool,
+    ) -> anyhow::Result<(usize, usize, f64, f64, usize)> {
+        let build_t = std::time::Instant::now();
+        let mut parent_graph = CudaGraphHandle::new(self.cuda_stream.context().clone())?;
+        let exec_order = toposort(&self.exec_graph, None).unwrap();
+        let n_ops = exec_order.len();
+
+        let mut n_zeroed_bufs = 0usize;
+        let mut mini_capture_count = 0usize;
+        let mut op_nodes: FxHashMap<NodeIndex, cudarc::driver::sys::CUgraphNode> =
+            FxHashMap::default();
+        let mut zero_nodes: FxHashMap<NodeIndex, cudarc::driver::sys::CUgraphNode> =
+            FxHashMap::default();
+        let mut touched_buffers: FxHashMap<NodeIndex, FxHashSet<NodeIndex>> = FxHashMap::default();
+
+        // Add memset nodes for buffers requiring zeroing.
+        let zero_targets = if force_zero_all {
+            self.buffers.keys().copied().collect_vec()
+        } else {
+            self.buffers_requiring_zero.iter().copied().collect_vec()
         };
-        if let Err(e) = instantiate_result {
-            // Clean up the graph handle on instantiation failure to avoid leaking it.
-            unsafe {
-                cudarc::driver::sys::cuGraphDestroy(captured_graph).result().ok();
+        for node in zero_targets.into_iter().sorted_by_key(|n| n.index()) {
+            if let Some(buffer) = self.buffers.get(&node) {
+                let ptr = buffer.device_ptr(&self.cuda_stream).0;
+                let memset_node = parent_graph.add_memset_zero_node_u8(&[], ptr, buffer.len())?;
+                zero_nodes.insert(node, memset_node);
+                n_zeroed_bufs += 1;
             }
-            return Err(e.into());
-        }
-        unsafe {
-            cudarc::driver::sys::cuGraphDestroy(captured_graph).result()?;
         }
 
-        self.runtime_replay.graph_exec = Some(CudaGraphExecHandle {
-            cu_graph_exec: captured_exec,
-            ctx: self.cuda_stream.context().clone(),
-        });
+        // Build one parent node per HostOp.
+        for exec_node in exec_order {
+            let exec_op = &self.exec_graph[exec_node];
+            let buffer_map = self.build_host_op_buffer_map(exec_op);
+            touched_buffers.insert(exec_node, buffer_map.keys().copied().collect());
+
+            let graph_node = if let Some(cuda_graph_op) =
+                exec_op.internal.as_any().downcast_ref::<CudaGraphOp>()
+            {
+                // Build/update child graph without launching; parent graph will launch it later.
+                cuda_graph_op.ensure_built_and_updated_for_runtime_graph(
+                    &exec_op.stream,
+                    &buffer_map,
+                    dyn_map,
+                )?;
+                let child_graph = cuda_graph_op.cu_graph().ok_or_else(|| {
+                    anyhow::anyhow!("CudaGraphOp child graph missing after ensure_built")
+                })?;
+                parent_graph.add_child_graph_node(&[], child_graph)?
+            } else {
+                let op_name = exec_op.internal.stats_name().unwrap_or("unknown");
+                if op_name != "cuBLAS" && op_name != "cuBLASLT" {
+                    anyhow::bail!("Unsupported HostOp for runtime graph build: {op_name}");
+                }
+
+                // Mini-capture uses current buffer_map pointers; parent node clones this graph.
+                // If pointers change, signature invalidation forces a full parent graph rebuild.
+                let captured = self.capture_single_host_op_graph(exec_op, &buffer_map, dyn_map)?;
+                mini_capture_count += 1;
+                let node = parent_graph.add_child_graph_node(&[], captured)?;
+                unsafe {
+                    cudarc::driver::sys::cuGraphDestroy(captured).result()?;
+                }
+                node
+            };
+
+            op_nodes.insert(exec_node, graph_node);
+        }
+
+        // Add data dependencies from exec_graph edges.
+        let mut added_deps: FxHashSet<(usize, usize)> = FxHashSet::default();
+        for edge in self.exec_graph.edge_indices() {
+            let (src, dst) = self.exec_graph.edge_endpoints(edge).unwrap();
+            let Some(&from_node) = op_nodes.get(&src) else {
+                continue;
+            };
+            let Some(&to_node) = op_nodes.get(&dst) else {
+                continue;
+            };
+            let key = (from_node as usize, to_node as usize);
+            if added_deps.insert(key) {
+                parent_graph.add_dependency(from_node, to_node)?;
+            }
+        }
+
+        // Zeroing dependencies: memset(X) must happen before every op that touches X.
+        for (exec_node, buffers) in touched_buffers {
+            let Some(&op_node) = op_nodes.get(&exec_node) else {
+                continue;
+            };
+            for buffer_node in buffers {
+                let Some(&zero_node) = zero_nodes.get(&buffer_node) else {
+                    continue;
+                };
+                let key = (zero_node as usize, op_node as usize);
+                if added_deps.insert(key) {
+                    parent_graph.add_dependency(zero_node, op_node)?;
+                }
+            }
+        }
+
+        let graph_exec = parent_graph.instantiate()?;
+        let build_us = build_t.elapsed().as_micros() as f64;
+        self.runtime_replay.graph_exec = Some(graph_exec);
 
         let launch_t = std::time::Instant::now();
         self.runtime_replay
@@ -1216,7 +1336,13 @@ impl CudaRuntime {
             .launch(&self.cuda_stream)?;
         let launch_us = launch_t.elapsed().as_micros() as f64;
 
-        Ok((n_zeroed_bufs, n_ops, zero_us, dispatch_us, launch_us))
+        Ok((
+            n_zeroed_bufs,
+            n_ops,
+            build_us,
+            launch_us,
+            mini_capture_count,
+        ))
     }
 
     fn compute_block_op_stats(
