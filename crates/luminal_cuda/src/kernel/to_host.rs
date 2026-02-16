@@ -544,12 +544,6 @@ impl CudaGraphOp {
                 "kernel params missing or stale".to_string(),
             ));
         }
-        if state.kernels.iter().any(|k| k.internal_bufs.is_empty()) {
-            return Ok(ReplayRefreshOutcome::NeedsRecapture(
-                "internal buffers missing".to_string(),
-            ));
-        }
-
         let pre_refresh_fingerprint = Self::internal_pointer_fingerprint(&state, stream);
         if pre_refresh_fingerprint != captured_internal_ptrs {
             return Ok(ReplayRefreshOutcome::NeedsRecapture(
