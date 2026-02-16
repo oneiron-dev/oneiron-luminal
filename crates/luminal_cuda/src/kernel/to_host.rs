@@ -450,13 +450,16 @@ impl CudaGraphOp {
                 state.kernel_params[idx] = UnifiedKernelParams::new(param_values);
             }
 
-            // Now update CUDA graph nodes
-            state
-                .cuda_graph_exec
-                .as_ref()
-                .unwrap()
-                .ctx
-                .bind_to_thread()?;
+            // Now update CUDA graph nodes.
+            // Skip bind_to_thread during parent-level stream capture.
+            if !crate::CUDA_STREAM_CAPTURING.get() {
+                state
+                    .cuda_graph_exec
+                    .as_ref()
+                    .unwrap()
+                    .ctx
+                    .bind_to_thread()?;
+            }
 
             for idx in 0..num_kernels {
                 let kernel = &state.kernels[idx];
@@ -713,8 +716,17 @@ impl CudaGraphOp {
                 state.kernels.len()
             );
         } else {
-            // Launch the CUDA graph normally
-            state.cuda_graph_exec.as_ref().unwrap().launch(stream)?;
+            // Launch the CUDA graph. During parent-level stream capture,
+            // bind_to_thread() (cuCtxSetCurrent) is illegal, so use raw cuGraphLaunch.
+            let exec = state.cuda_graph_exec.as_ref().unwrap();
+            if crate::CUDA_STREAM_CAPTURING.get() {
+                unsafe {
+                    cudarc::driver::sys::cuGraphLaunch(exec.cu_graph_exec, stream.cu_stream())
+                        .result()?;
+                }
+            } else {
+                exec.launch(stream)?;
+            }
         }
 
         // Keep post-launch sync only in explicit debug mode.

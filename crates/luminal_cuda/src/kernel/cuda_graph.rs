@@ -660,7 +660,16 @@ mod tests {
             Ok(())
         };
 
+        // Warmup: run one matmul + child graph launch before capture to trigger any
+        // one-time internal allocations inside cuBLASLt (handle-level state, algo caching).
+        // This mirrors the runtime's warmup-then-capture pattern.
+        child_exec.launch(&stream).unwrap();
+        launch_matmul().unwrap();
+        stream.synchronize().unwrap();
+
         // Capture child graph launch + cuBLASLt call into a parent graph.
+        // NOTE: During stream capture, cuCtxSetCurrent (called by bind_to_thread) may
+        // be illegal. Use raw cuGraphLaunch instead of the wrapper's launch() method.
         unsafe {
             sys::cuStreamBeginCapture_v2(
                 stream.cu_stream(),
@@ -668,8 +677,11 @@ mod tests {
             )
             .result()
             .unwrap();
+
+            sys::cuGraphLaunch(child_exec.cu_graph_exec, stream.cu_stream())
+                .result()
+                .unwrap();
         }
-        child_exec.launch(&stream).unwrap();
         launch_matmul().unwrap();
 
         let mut captured_graph = std::ptr::null_mut();
