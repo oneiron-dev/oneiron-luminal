@@ -729,12 +729,17 @@ impl Runtime for CudaRuntime {
             self.allocate_intermediate_buffers(dyn_map);
         }
 
+        let rt_profiling = std::env::var("LUMINAL_PROFILE").map_or(false, |v| v == "1");
+
         // Always clear intermediate buffers to ensure correctness for operations using atomicAdd
         // TODO: this is very expensive. Need to eliminate ops that require zeroed outputs
+        let zero_t = std::time::Instant::now();
+        let n_bufs = self.buffers.len();
         for buffer in self.buffers.values_mut() {
             self.cuda_stream.memset_zeros(buffer).unwrap();
         }
         self.cuda_stream.synchronize().unwrap();
+        let zero_us = zero_t.elapsed().as_micros() as f64;
 
         // Cache HLIR input pointers
         if !self.changed_hlir.is_empty() {
@@ -753,11 +758,15 @@ impl Runtime for CudaRuntime {
         }
 
         // Ensure all CUDA graphs are built (handles first execute and any missing graphs)
+        let prebuild_t = std::time::Instant::now();
         self.prebuild_graphs(dyn_map);
+        let prebuild_us = prebuild_t.elapsed().as_micros() as f64;
 
         let total_start = std::time::Instant::now();
 
-        for exec_node in toposort(&self.exec_graph, None).unwrap() {
+        let exec_order = toposort(&self.exec_graph, None).unwrap();
+        let n_ops = exec_order.len();
+        for exec_node in exec_order {
             let exec_op = &self.exec_graph[exec_node];
             trace!("Executing: {:?}", exec_op);
 
@@ -821,7 +830,26 @@ impl Runtime for CudaRuntime {
                 });
             self.cuda_stream.synchronize().unwrap();
         }
-        self.last_total_time_us = total_start.elapsed().as_secs_f64() * 1_000_000.0;
+        let exec_ops_us = total_start.elapsed().as_micros() as f64;
+
+        // Final sync to ensure all operations completed successfully
+        let sync_t = std::time::Instant::now();
+        self.cuda_stream
+            .synchronize()
+            .expect("Final sync failed in execute");
+        let final_sync_us = sync_t.elapsed().as_micros() as f64;
+
+        self.last_total_time_us = exec_ops_us;
+
+        if rt_profiling {
+            let total_us = zero_us + prebuild_us + exec_ops_us + final_sync_us;
+            eprintln!(
+                "    [runtime] zero_buffers: {:.2}ms ({} bufs) | prebuild: {:.2}ms | exec_ops: {:.2}ms ({} ops) | final_sync: {:.2}ms | total: {:.2}ms",
+                zero_us / 1000.0, n_bufs, prebuild_us / 1000.0,
+                exec_ops_us / 1000.0, n_ops, final_sync_us / 1000.0,
+                total_us / 1000.0,
+            );
+        }
 
         // Populate last_kernel_stats from HostOps that report stats
         self.last_kernel_stats.clear();
@@ -839,11 +867,6 @@ impl Runtime for CudaRuntime {
                 });
             }
         }
-
-        // Final sync to ensure all operations completed successfully
-        self.cuda_stream
-            .synchronize()
-            .expect("Final sync failed in execute");
     }
 }
 

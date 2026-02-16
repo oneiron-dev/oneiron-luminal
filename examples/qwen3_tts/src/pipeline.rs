@@ -574,39 +574,57 @@ pub fn generate_frames(
     }
     attn_mask[max_seq] = 0.0;
 
+    let profiling = std::env::var("LUMINAL_PROFILE").map_or(false, |v| v == "1");
+    let mut prof_set_data: Vec<f64> = Vec::new();
+    let mut prof_kv_upload: Vec<f64> = Vec::new();
+    let mut prof_decode_exec: Vec<f64> = Vec::new();
+    let mut prof_get_f32: Vec<f64> = Vec::new();
+    let mut prof_pred_exec: Vec<f64> = Vec::new();
+    let mut prof_kv_scatter: Vec<f64> = Vec::new();
+    let mut prof_total: Vec<f64> = Vec::new();
+
     for frame in 1..num_frames {
+        let frame_start = std::time::Instant::now();
         let p = prompt_len + frame - 1;
 
+        // Phase 1: set_data (upload embed/pos/mask)
+        let phase_t = std::time::Instant::now();
         backend::set_data(&mut decode_rt, new_embed_input.id, next_embed.clone());
         backend::set_data(&mut decode_rt, pos_input.id, vec![p as f32]);
         backend::set_data(&mut decode_rt, mask_input.id, attn_mask.clone());
+        let set_data_us = phase_t.elapsed().as_micros() as f64;
 
-        // CUDA: full KV upload only on frame 1 to establish GPU buffers;
-        // subsequent frames use partial updates applied after previous frame.
-        // Non-CUDA: always full-upload (no GPU transfer cost).
+        // Phase 2: kv_upload (full KV cache, frame 1 only on CUDA)
+        let phase_t = std::time::Instant::now();
         if frame == 1 || cfg!(not(feature = "cuda")) {
             for (i, (k_in, v_in)) in kv_inputs.iter().enumerate() {
                 backend::set_data(&mut decode_rt, k_in.id, k_bufs[i].clone());
                 backend::set_data(&mut decode_rt, v_in.id, v_bufs[i].clone());
             }
         }
+        let kv_upload_us = phase_t.elapsed().as_micros() as f64;
 
+        // Phase 3: decode_exec
+        let phase_t = std::time::Instant::now();
         decode_rt.execute(&decode_cx.dyn_map);
+        let decode_exec_us = phase_t.elapsed().as_micros() as f64;
 
+        // Phase 4: get_f32 (download outputs)
+        let phase_t = std::time::Instant::now();
         let code_0_val = backend::get_f32(&decode_rt, decode_code_0_out.id)[0] as u32;
         if code_0_val == CODEC_EOS_ID as u32 {
             eprintln!("  [decode] EOS at frame {}", frame);
             break;
         }
-
         let code_0_embed_data = backend::get_f32(&decode_rt, decode_code_0_embed_out.id);
         let normed_data = backend::get_f32(&decode_rt, decode_normed_out.id);
+        let get_f32_us = phase_t.elapsed().as_micros() as f64;
 
-        // Reuse same pred_rt for code predictor (no rebuild needed)
+        // Phase 5: pred_exec (code predictor set_data + execute + get outputs)
+        let phase_t = std::time::Instant::now();
         backend::set_data(&mut pred_rt, pred_hidden_input.id, normed_data);
         backend::set_data(&mut pred_rt, pred_code0_embed_input.id, code_0_embed_data);
         pred_rt.execute(&pred_cx.dyn_map);
-
         let pred_codes: Vec<u32> = pred_code_outs
             .iter()
             .map(|code| backend::get_f32(&pred_rt, code.id)[0] as u32)
@@ -614,14 +632,10 @@ pub fn generate_frames(
         let mut frame_codes = vec![code_0_val];
         frame_codes.extend(pred_codes);
         all_frames.push(frame_codes);
+        let pred_exec_us = phase_t.elapsed().as_micros() as f64;
 
-        eprintln!(
-            "  [decode] frame {} done at {:.1}s",
-            frame,
-            t1.elapsed().as_secs_f32()
-        );
-
-        // Scatter new K/V into CPU buffers AND do partial GPU updates for next frame
+        // Phase 6: kv_scatter (CPU scatter + partial GPU updates + codec_sum)
+        let phase_t = std::time::Instant::now();
         for (i, (k_out, v_out)) in decode_new_kv_cache_outs.iter().enumerate() {
             let new_k = backend::get_f32(&decode_rt, k_out.id);
             let new_v = backend::get_f32(&decode_rt, v_out.id);
@@ -674,6 +688,51 @@ pub fn generate_frames(
             .zip(tts_pad_embed.iter())
             .map(|(codec, tts)| codec + tts)
             .collect();
+        let kv_scatter_us = phase_t.elapsed().as_micros() as f64;
+
+        let total_us = frame_start.elapsed().as_micros() as f64;
+
+        if profiling {
+            eprintln!(
+                "  [profile] frame {} | set_data: {:.1}ms | kv_upload: {:.1}ms | decode_exec: {:.1}ms | get_f32: {:.1}ms | pred_exec: {:.1}ms | kv_scatter: {:.1}ms | total: {:.1}ms",
+                frame, set_data_us / 1000.0, kv_upload_us / 1000.0, decode_exec_us / 1000.0,
+                get_f32_us / 1000.0, pred_exec_us / 1000.0, kv_scatter_us / 1000.0, total_us / 1000.0,
+            );
+            prof_set_data.push(set_data_us);
+            prof_kv_upload.push(kv_upload_us);
+            prof_decode_exec.push(decode_exec_us);
+            prof_get_f32.push(get_f32_us);
+            prof_pred_exec.push(pred_exec_us);
+            prof_kv_scatter.push(kv_scatter_us);
+            prof_total.push(total_us);
+        } else {
+            eprintln!(
+                "  [decode] frame {} done at {:.1}s",
+                frame,
+                t1.elapsed().as_secs_f32()
+            );
+        }
+    }
+
+    // Print profiling summary (averages excluding frame 1 which has KV upload overhead)
+    if profiling && prof_total.len() > 1 {
+        let skip = 1; // skip frame 1 (has full KV upload)
+        let n = (prof_total.len() - skip) as f64;
+        let avg = |v: &[f64]| v[skip..].iter().sum::<f64>() / n / 1000.0;
+        eprintln!("\n  [profile] === Decode Loop Averages (frames 2-{}) ===", prof_total.len());
+        eprintln!(
+            "  [profile] set_data: {:.2}ms | kv_upload: {:.2}ms | decode_exec: {:.2}ms | get_f32: {:.2}ms | pred_exec: {:.2}ms | kv_scatter: {:.2}ms | total: {:.2}ms",
+            avg(&prof_set_data), avg(&prof_kv_upload), avg(&prof_decode_exec),
+            avg(&prof_get_f32), avg(&prof_pred_exec), avg(&prof_kv_scatter), avg(&prof_total),
+        );
+
+        #[cfg(feature = "cuda")]
+        {
+            eprintln!("\n  === Decode Talker Execution Stats ===");
+            decode_rt.print_execution_stats();
+            eprintln!("\n  === Code Predictor Execution Stats ===");
+            pred_rt.print_execution_stats();
+        }
     }
 
     let exec_time = t1.elapsed();

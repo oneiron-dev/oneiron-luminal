@@ -172,6 +172,7 @@ def test_cuda_inference():
             "RUST_BACKTRACE": "1",
             "QWEN3_TTS_MAX_FRAMES": "100",
             "LUMINAL_CACHE_DIR": CACHE_DIR,
+            "LUMINAL_PROFILE": "1",
         },
     )
 
