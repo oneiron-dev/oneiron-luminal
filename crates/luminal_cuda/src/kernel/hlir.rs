@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{cuda_dtype, kernel::KernelOp};
 use cudarc::{
     driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream},
-    nvrtc::{CompileOptions, compile_ptx},
+    nvrtc::{CompileOptions, compile_ptx, compile_ptx_with_opts},
 };
 use itertools::Itertools;
 use luminal::{
@@ -2121,6 +2121,7 @@ impl KernelOp for KernelCast {
 
         let needs_bf16 = self.in_dtype == DType::Bf16 || self.out_dtype == DType::Bf16;
         let needs_fp16 = self.in_dtype == DType::F16 || self.out_dtype == DType::F16;
+        let needs_include = needs_bf16 || needs_fp16;
         let includes = format!(
             "{}{}",
             if needs_bf16 { "#include <cuda_bf16.h>\n" } else { "" },
@@ -2139,7 +2140,23 @@ extern \"C\" {{
         let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
             (module.clone(), func.clone())
         } else {
-            let ptx = compile_ptx(&kernel).unwrap();
+            let ptx = if needs_include {
+                let mut include_paths = Vec::new();
+                if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
+                    include_paths.push(format!("{cuda_path}/include"));
+                }
+                include_paths.push("/usr/local/cuda/include".to_string());
+                compile_ptx_with_opts(
+                    &kernel,
+                    CompileOptions {
+                        include_paths,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            } else {
+                compile_ptx(&kernel).unwrap()
+            };
             let module = stream.context().load_module(ptx).unwrap();
             let func = module.load_function("cast_k").unwrap();
             compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
