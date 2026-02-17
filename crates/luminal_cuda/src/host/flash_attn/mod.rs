@@ -56,6 +56,7 @@ pub struct FlashAttentionOp {
     pub dtype: DType,
     module: OnceLock<Arc<CudaModule>>,
     function: OnceLock<CudaFunction>,
+    shared_mem_bytes: OnceLock<u32>,
     loaded_config: OnceLock<(i32, usize, FlashAttentionMode)>,
 }
 
@@ -79,6 +80,7 @@ impl FlashAttentionOp {
             dtype,
             module: OnceLock::new(),
             function: OnceLock::new(),
+            shared_mem_bytes: OnceLock::new(),
             loaded_config: OnceLock::new(),
         }
     }
@@ -105,6 +107,14 @@ impl FlashAttentionOp {
             }
         }
         "flash_attn_fwd".to_string()
+    }
+
+    fn kernel_shared_mem(kernel_path: &Path) -> u32 {
+        let shared_path = PathBuf::from(format!("{}.shared", kernel_path.display()));
+        if let Ok(contents) = fs::read_to_string(&shared_path) {
+            return contents.trim().parse().unwrap_or(0);
+        }
+        0
     }
 
     fn ensure_kernel_loaded(
@@ -166,6 +176,29 @@ impl FlashAttentionOp {
                     kernel_path.display()
                 )
             })?;
+
+            // Triton kernels use dynamic shared memory — set the max allowed size.
+            let shared_bytes = Self::kernel_shared_mem(&kernel_path);
+            if shared_bytes > 0 {
+                unsafe {
+                    use crate::cudarc::driver::sys::{
+                        CUfunction_attribute, cuFuncSetAttribute, CUresult,
+                    };
+                    let result = cuFuncSetAttribute(
+                        function.raw_function(),
+                        CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        shared_bytes as i32,
+                    );
+                    if result != CUresult::CUDA_SUCCESS {
+                        anyhow::bail!(
+                            "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES={}) failed: {:?}",
+                            shared_bytes,
+                            result,
+                        );
+                    }
+                }
+            }
+            let _ = self.shared_mem_bytes.set(shared_bytes);
             let _ = self.function.set(function);
         }
 
@@ -231,7 +264,14 @@ impl FlashAttentionOp {
         let block_x = if head_dim == 64 { 128u32 } else { 256u32 };
         let block_y = 1u32;
         let block_z = 1u32;
-        let shared_mem = 0u32;
+        let shared_mem = self.shared_mem_bytes.get().copied().unwrap_or(0);
+
+        if std::env::var("LUMINAL_PROFILE").map_or(false, |v| v == "1") {
+            eprintln!(
+                "    [fa2] {:?} batch={} heads={} seq_q={} seq_k={} head_dim={} grid=({},{},{}) block=({},{},{}) shared={}",
+                self.mode, batch, heads, seq_q, seq_k, head_dim, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_mem
+            );
+        }
 
         let mut q_arg = q_ptr;
         let mut k_arg = k_ptr;

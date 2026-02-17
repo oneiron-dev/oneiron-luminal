@@ -98,6 +98,19 @@ def _extract_entry_name(compiled) -> str:
     return "flash_attn_fwd"
 
 
+def _extract_shared_mem(compiled) -> int:
+    """Extract dynamic shared memory bytes from Triton compilation metadata."""
+    metadata = getattr(compiled, "metadata", None)
+    if metadata is not None:
+        if isinstance(metadata, dict):
+            shared = metadata.get("shared")
+        else:
+            shared = getattr(metadata, "shared", None)
+        if shared is not None:
+            return int(shared)
+    return 0
+
+
 def _compile_with_new_api(
     triton,
     kernel_fn,
@@ -256,7 +269,9 @@ def main() -> None:
 
         q_head_offset = ((pid_b * heads + pid_h) * seq_q) * head_dim
         kv_head_offset = ((pid_b * heads + pid_h) * seq_k) * head_dim
-        mask_head_offset = ((pid_b * heads + pid_h) * seq_q) * seq_k
+        # Mask is [B, 1, Sq, Sk] — same mask for all heads (broadcast).
+        # Do NOT stride by pid_h; expand_dim creates stride-0 views.
+        mask_head_offset = (pid_b * seq_q) * seq_k
 
         q_ptrs = q_ptr + q_head_offset + offs_m[:, None] * head_dim + offs_d[None, :]
         q = tl.load(q_ptrs, mask=row_mask[:, None] & d_mask[None, :], other=0.0)
@@ -322,6 +337,10 @@ def main() -> None:
         is_causal = mode == "causal"
         has_mask = mode == "masked"
         num_warps = 4 if head_dim == 64 else 8
+        # A100 (sm80) supports max 163 KB shared mem per block.
+        # h128 with 3 stages needs ~180-213 KB — exceeds the limit.
+        # Use 2 stages for h128 to stay within ~120 KB.
+        num_stages = 2 if head_dim == 128 else args.num_stages
 
         compiled = _compile_kernel(
             triton,
@@ -331,7 +350,7 @@ def main() -> None:
             is_causal=is_causal,
             has_mask=has_mask,
             num_warps=num_warps,
-            num_stages=args.num_stages,
+            num_stages=num_stages,
         )
 
         cubin = compiled.asm.get("cubin")
@@ -345,7 +364,11 @@ def main() -> None:
         entry_file = out_dir / f"{out_file.name}.entry"
         entry_file.write_text(f"{entry_name}\n", encoding="utf-8")
 
-        print(f"Wrote {out_file} (entry={entry_name})")
+        shared_mem = _extract_shared_mem(compiled)
+        shared_file = out_dir / f"{out_file.name}.shared"
+        shared_file.write_text(f"{shared_mem}\n", encoding="utf-8")
+
+        print(f"Wrote {out_file} (entry={entry_name}, shared={shared_mem} bytes)")
 
 
 if __name__ == "__main__":

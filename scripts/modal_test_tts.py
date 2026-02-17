@@ -295,7 +295,7 @@ def compile_flash_attn_kernels():
     import os
     artifacts = {}
     for fname in os.listdir(out_dir):
-        if fname.endswith(".cubin") or fname.endswith(".entry"):
+        if fname.endswith(".cubin") or fname.endswith(".entry") or fname.endswith(".shared"):
             fpath = os.path.join(out_dir, fname)
             with open(fpath, "rb") as f:
                 artifacts[fname] = base64.b64encode(f.read()).decode("ascii")
