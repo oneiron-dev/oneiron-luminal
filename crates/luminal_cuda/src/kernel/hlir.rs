@@ -2119,8 +2119,16 @@ impl KernelOp for KernelCast {
         let in_dtype = cuda_dtype(self.in_dtype);
         let out_dtype = cuda_dtype(self.out_dtype);
 
+        let needs_bf16 = self.in_dtype == DType::Bf16 || self.out_dtype == DType::Bf16;
+        let needs_fp16 = self.in_dtype == DType::F16 || self.out_dtype == DType::F16;
+        let includes = format!(
+            "{}{}",
+            if needs_bf16 { "#include <cuda_bf16.h>\n" } else { "" },
+            if needs_fp16 { "#include <cuda_fp16.h>\n" } else { "" },
+        );
+
         let kernel = format!(
-            "
+            "{includes}\
 extern \"C\" {{
     __global__ void cast_k({out_dtype} *out, const {in_dtype} *in) {{
         long long const_z = (long long)blockIdx.x * blockDim.x + threadIdx.x;
