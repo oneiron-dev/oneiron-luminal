@@ -56,8 +56,10 @@ pub fn flash_attention_causal_enabled(head_dim: usize) -> bool {
     flash_attention_enabled(FlashAttentionMode::Causal, head_dim)
 }
 
-pub fn flash_attention_masked_enabled(head_dim: usize) -> bool {
-    flash_attention_enabled(FlashAttentionMode::Masked, head_dim)
+pub fn flash_attention_masked_enabled(_head_dim: usize) -> bool {
+    // Disabled: FA2 with seq_q=1 (decode) is 18% slower than cuBLASLt GEMV.
+    // BLOCK_M=64 wastes 98.4% of tile compute at seq_q=1.
+    false
 }
 
 #[derive(Debug, Clone)]
