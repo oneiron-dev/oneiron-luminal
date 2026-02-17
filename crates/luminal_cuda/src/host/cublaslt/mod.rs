@@ -205,10 +205,12 @@ impl EgglogOp for CuBlasLt {
 /// Returns (matrix_dtype, compute_type, scale_dtype)
 fn dtype_to_cuda_types(dtype: DType) -> (cudaDataType, cublasComputeType_t, cudaDataType) {
     match dtype {
-        // F32: matrix=f32, compute=f32, scale=f32
+        // F32: matrix=f32, compute via BF16 tensor cores, scale=f32
+        // CUBLAS_COMPUTE_32F_FAST_16BF: cuBLASLt internally converts F32→BF16 for tensor core
+        // computation, accumulates in FP32. On A100: 312 TFLOPS (BF16) vs 156 TFLOPS (TF32).
         DType::F32 => (
             cudaDataType::CUDA_R_32F,
-            cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
             cudaDataType::CUDA_R_32F,
         ),
         // F16: matrix=f16, compute=f32 (FP32 accumulation for accuracy), scale=f32

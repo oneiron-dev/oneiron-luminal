@@ -11,19 +11,6 @@ use luminal::{
 };
 use luminal_nn::LayerNorm;
 
-/// BF16 matmul wrapper: on CUDA, casts inputs to BF16 for 8x tensor core
-/// throughput (156 vs 19.5 TFLOPS on A100), then casts output back to FP32
-/// for Megakernel compatibility.
-#[cfg(feature = "cuda")]
-fn linear(a: GraphTensor, b: GraphTensor) -> GraphTensor {
-    a.cast(DType::Bf16).matmul(b.cast(DType::Bf16)).cast(DType::F32)
-}
-
-#[cfg(not(feature = "cuda"))]
-fn linear(a: GraphTensor, b: GraphTensor) -> GraphTensor {
-    a.matmul(b)
-}
-
 pub const LAYERS: usize = 28;
 pub const HIDDEN: usize = 2048;
 pub const HEAD_DIM: usize = 128;
@@ -91,8 +78,8 @@ impl TextProjection {
     pub fn forward(&self, x: GraphTensor) -> GraphTensor {
         let dims = x.dims();
         let leading = &dims[..dims.len() - 1];
-        let h = (linear(x, self.fc1_weight.t()) + self.fc1_bias.expand_lhs(leading)).silu();
-        linear(h, self.fc2_weight.t()) + self.fc2_bias.expand_lhs(leading)
+        let h = (x.matmul(self.fc1_weight.t()) + self.fc1_bias.expand_lhs(leading)).silu();
+        h.matmul(self.fc2_weight.t()) + self.fc2_bias.expand_lhs(leading)
     }
 }
 
@@ -359,7 +346,7 @@ impl TalkerModel {
             x = maybe_graph_break(out);
         }
         let normed = self.final_norm.forward(x);
-        let logits = linear(normed, self.codec_head.t());
+        let logits = normed.matmul(self.codec_head.t());
         (logits, normed, kv_caches)
     }
 
@@ -385,7 +372,7 @@ impl TalkerModel {
             x = maybe_graph_break(out);
         }
         let normed = self.final_norm.forward(x);
-        let logits = linear(normed, self.codec_head.t());
+        let logits = normed.matmul(self.codec_head.t());
         (logits, normed, new_caches)
     }
 
@@ -413,20 +400,20 @@ impl TalkerModel {
             x = maybe_graph_break(out);
         }
         let normed = self.final_norm.forward(x);
-        let logits = linear(normed, self.codec_head.t());
+        let logits = normed.matmul(self.codec_head.t());
         (logits, normed, new_kvs)
     }
 
     pub fn decode_step(&self, embeds: GraphTensor) -> (GraphTensor, GraphTensor) {
         let hidden = self.forward_embeds(embeds);
         let normed = self.final_norm.forward(hidden);
-        let logits = linear(normed, self.codec_head.t());
+        let logits = normed.matmul(self.codec_head.t());
         (logits, normed)
     }
 
     pub fn forward(&self, token_ids: GraphTensor) -> GraphTensor {
         let hidden = self.final_norm.forward(self.forward_hidden(token_ids));
-        linear(hidden, self.codec_head.t())
+        hidden.matmul(self.codec_head.t())
     }
 }
 
@@ -503,9 +490,9 @@ impl TalkerLayer {
         let residual = x;
         let x_attn = self.input_norm.forward(x);
 
-        let mut q = linear(x_attn, self.q_proj.t());
-        let mut k = linear(x_attn, self.k_proj.t());
-        let mut v = linear(x_attn, self.v_proj.t());
+        let mut q = x_attn.matmul(self.q_proj.t());
+        let mut k = x_attn.matmul(self.k_proj.t());
+        let mut v = x_attn.matmul(self.v_proj.t());
 
         q = q.split_dims(2, config.head_dim).transpose(1, 2);
         k = k.split_dims(2, config.head_dim).transpose(1, 2);
@@ -530,7 +517,7 @@ impl TalkerLayer {
                 .transpose(1, 2)
                 .merge_dims(2, 3)
         } else {
-            let scores = linear(q, k.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+            let scores = q.matmul(k.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
             let (batch, heads, seq, _) = scores.dims4();
             let causal_mask = scores
                 .graph()
@@ -542,11 +529,11 @@ impl TalkerLayer {
                 scores.graph().constant_float(-1e9).expand_rhs(scores.shape),
             );
             let probs = masked_scores.softmax(3);
-            linear(probs, v).transpose(1, 2).merge_dims(2, 3)
+            probs.matmul(v).transpose(1, 2).merge_dims(2, 3)
         };
 
         #[cfg(not(feature = "cuda"))]
-        let scores = linear(q, k.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+        let scores = q.matmul(k.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
         #[cfg(not(feature = "cuda"))]
         let (batch, heads, seq, _) = scores.dims4();
         #[cfg(not(feature = "cuda"))]
@@ -564,14 +551,12 @@ impl TalkerLayer {
         let probs = masked_scores.softmax(3);
 
         #[cfg(not(feature = "cuda"))]
-        let context = linear(probs, v).transpose(1, 2).merge_dims(2, 3);
-        x = residual + linear(context, self.o_proj.t());
+        let context = probs.matmul(v).transpose(1, 2).merge_dims(2, 3);
+        x = residual + context.matmul(self.o_proj.t());
 
         let ff_in = self.post_attn_norm.forward(x);
-        let ff = linear(
-            linear(ff_in, self.gate_proj.t()).silu() * linear(ff_in, self.up_proj.t()),
-            self.down_proj.t(),
-        );
+        let ff = (ff_in.matmul(self.gate_proj.t()).silu() * ff_in.matmul(self.up_proj.t()))
+            .matmul(self.down_proj.t());
         x += ff;
 
         (x, k_cache, v_cache)
@@ -590,9 +575,9 @@ impl TalkerLayer {
         let residual = x;
         let x_attn = self.input_norm.forward(x);
 
-        let mut q = linear(x_attn, self.q_proj.t());
-        let mut k_new = linear(x_attn, self.k_proj.t());
-        let mut v_new = linear(x_attn, self.v_proj.t());
+        let mut q = x_attn.matmul(self.q_proj.t());
+        let mut k_new = x_attn.matmul(self.k_proj.t());
+        let mut v_new = x_attn.matmul(self.v_proj.t());
 
         q = q.split_dims(2, config.head_dim).transpose(1, 2);
         k_new = k_new.split_dims(2, config.head_dim).transpose(1, 2);
@@ -611,17 +596,15 @@ impl TalkerLayer {
         let v_exp = repeat_kv_heads(v_full, config.kv_groups);
 
         // Single-token query can attend to the full key history, so no causal mask is required.
-        let scores = linear(q, k_exp.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+        let scores = q.matmul(k_exp.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
         let probs = scores.softmax(3);
 
-        let context = linear(probs, v_exp).transpose(1, 2).merge_dims(2, 3);
-        x = residual + linear(context, self.o_proj.t());
+        let context = probs.matmul(v_exp).transpose(1, 2).merge_dims(2, 3);
+        x = residual + context.matmul(self.o_proj.t());
 
         let ff_in = self.post_attn_norm.forward(x);
-        let ff = linear(
-            linear(ff_in, self.gate_proj.t()).silu() * linear(ff_in, self.up_proj.t()),
-            self.down_proj.t(),
-        );
+        let ff = (ff_in.matmul(self.gate_proj.t()).silu() * ff_in.matmul(self.up_proj.t()))
+            .matmul(self.down_proj.t());
         x += ff;
 
         (x, k_full, v_full)
@@ -641,9 +624,9 @@ impl TalkerLayer {
         let residual = x;
         let x_attn = self.input_norm.forward(x);
 
-        let mut q = linear(x_attn, self.q_proj.t());
-        let mut k_new = linear(x_attn, self.k_proj.t());
-        let mut v_new = linear(x_attn, self.v_proj.t());
+        let mut q = x_attn.matmul(self.q_proj.t());
+        let mut k_new = x_attn.matmul(self.k_proj.t());
+        let mut v_new = x_attn.matmul(self.v_proj.t());
 
         q = q.split_dims(2, config.head_dim).transpose(1, 2);
         k_new = k_new.split_dims(2, config.head_dim).transpose(1, 2);
@@ -669,15 +652,15 @@ impl TalkerLayer {
                 .transpose(1, 2)
                 .merge_dims(2, 3)
         } else {
-            let scores = linear(q, k_exp.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+            let scores = q.matmul(k_exp.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
             let (_, heads, _, _) = scores.dims4();
             let expanded_mask = attn_mask.squeeze(1).expand_dim(1, heads);
             let probs = (scores + expanded_mask).softmax(3);
-            linear(probs, v_exp).transpose(1, 2).merge_dims(2, 3)
+            probs.matmul(v_exp).transpose(1, 2).merge_dims(2, 3)
         };
 
         #[cfg(not(feature = "cuda"))]
-        let scores = linear(q, k_exp.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+        let scores = q.matmul(k_exp.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
         #[cfg(not(feature = "cuda"))]
         let (_, heads, _, _) = scores.dims4();
         #[cfg(not(feature = "cuda"))]
@@ -686,14 +669,12 @@ impl TalkerLayer {
         let probs = (scores + expanded_mask).softmax(3);
 
         #[cfg(not(feature = "cuda"))]
-        let context = linear(probs, v_exp).transpose(1, 2).merge_dims(2, 3);
-        x = residual + linear(context, self.o_proj.t());
+        let context = probs.matmul(v_exp).transpose(1, 2).merge_dims(2, 3);
+        x = residual + context.matmul(self.o_proj.t());
 
         let ff_in = self.post_attn_norm.forward(x);
-        let ff = linear(
-            linear(ff_in, self.gate_proj.t()).silu() * linear(ff_in, self.up_proj.t()),
-            self.down_proj.t(),
-        );
+        let ff = (ff_in.matmul(self.gate_proj.t()).silu() * ff_in.matmul(self.up_proj.t()))
+            .matmul(self.down_proj.t());
         x += ff;
 
         (x, k_new, v_new)
@@ -703,9 +684,9 @@ impl TalkerLayer {
         let residual = x;
         let x_attn = self.input_norm.forward(x);
 
-        let mut q = linear(x_attn, self.q_proj.t());
-        let mut k = linear(x_attn, self.k_proj.t());
-        let mut v = linear(x_attn, self.v_proj.t());
+        let mut q = x_attn.matmul(self.q_proj.t());
+        let mut k = x_attn.matmul(self.k_proj.t());
+        let mut v = x_attn.matmul(self.v_proj.t());
 
         q = q.split_dims(2, config.head_dim).transpose(1, 2);
         k = k.split_dims(2, config.head_dim).transpose(1, 2);
@@ -726,7 +707,7 @@ impl TalkerLayer {
                 .transpose(1, 2)
                 .merge_dims(2, 3)
         } else {
-            let scores = linear(q, k.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+            let scores = q.matmul(k.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
             let (batch, heads, seq, _) = scores.dims4();
             let causal_mask = scores
                 .graph()
@@ -738,11 +719,11 @@ impl TalkerLayer {
                 scores.graph().constant_float(-1e9).expand_rhs(scores.shape),
             );
             let probs = masked_scores.softmax(3);
-            linear(probs, v).transpose(1, 2).merge_dims(2, 3)
+            probs.matmul(v).transpose(1, 2).merge_dims(2, 3)
         };
 
         #[cfg(not(feature = "cuda"))]
-        let scores = linear(q, k.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
+        let scores = q.matmul(k.transpose(2, 3)) * (1.0 / (config.head_dim as f32).sqrt());
         #[cfg(not(feature = "cuda"))]
         let (batch, heads, seq, _) = scores.dims4();
         #[cfg(not(feature = "cuda"))]
@@ -760,14 +741,12 @@ impl TalkerLayer {
         let probs = masked_scores.softmax(3);
 
         #[cfg(not(feature = "cuda"))]
-        let context = linear(probs, v).transpose(1, 2).merge_dims(2, 3);
-        x = residual + linear(context, self.o_proj.t());
+        let context = probs.matmul(v).transpose(1, 2).merge_dims(2, 3);
+        x = residual + context.matmul(self.o_proj.t());
 
         let ff_in = self.post_attn_norm.forward(x);
-        let ff = linear(
-            linear(ff_in, self.gate_proj.t()).silu() * linear(ff_in, self.up_proj.t()),
-            self.down_proj.t(),
-        );
+        let ff = (ff_in.matmul(self.gate_proj.t()).silu() * ff_in.matmul(self.up_proj.t()))
+            .matmul(self.down_proj.t());
         x + ff
     }
 }
