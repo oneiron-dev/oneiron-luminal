@@ -701,6 +701,75 @@ pub fn record_block_op_timings(
     packets
 }
 
+/// Collect per-subgraph block-op metadata shared by interpreter and compiled megakernels.
+fn analyze_block_subgraph(
+    llir_graph: &LLIRGraph,
+    subgraph: &FxHashSet<NodeIndex>,
+) -> (Vec<Arc<Box<dyn BlockOp>>>, FxHashMap<NodeIndex, i32>) {
+    let block_ops = llir_graph
+        .node_indices()
+        .filter(|n| subgraph.contains(n))
+        .filter_map(|n| llir_graph[n].to_dialect::<dyn BlockOp>())
+        .map(|bo| (bo.op_name(), bo.clone()))
+        .collect::<HashMap<_, _>>()
+        .into_iter()
+        .sorted_by_key(|(name, _)| *name)
+        .map(|(_, op)| op)
+        .collect_vec();
+
+    let mut node_to_buffer_index = FxHashMap::default();
+    let mut next_buffer_index = 0i32;
+    let mut get_buffer_index = |node: NodeIndex| -> i32 {
+        *node_to_buffer_index.entry(node).or_insert_with(|| {
+            let idx = next_buffer_index;
+            next_buffer_index += 1;
+            idx
+        })
+    };
+
+    for node in toposort(llir_graph, None).unwrap() {
+        if !subgraph.contains(&node) {
+            continue;
+        }
+        let sources = llir_graph
+            .edges_directed(node, Direction::Incoming)
+            .sorted_by_key(|e| e.id())
+            .map(|e| e.source())
+            .collect_vec();
+        for source in sources {
+            get_buffer_index(source);
+        }
+        get_buffer_index(node);
+    }
+
+    (block_ops, node_to_buffer_index)
+}
+
+/// Collect expressions used by payload fields and launch ranges for a subgraph.
+fn collect_subgraph_expressions(
+    llir_graph: &LLIRGraph,
+    subgraph: &FxHashSet<NodeIndex>,
+    cuda_stream: &Arc<CudaStream>,
+) -> FxHashSet<Expression> {
+    let mut expressions = FxHashSet::default();
+    for node in toposort(llir_graph, None).unwrap() {
+        if !subgraph.contains(&node) {
+            continue;
+        }
+        let Some(op) = llir_graph[node].to_dialect::<dyn BlockOp>() else {
+            continue;
+        };
+        expressions.extend(
+            op.build_payload(cuda_stream, CStruct::new(None))
+                .recorded_expressions,
+        );
+        expressions.insert(op.launch_range().iter().copied().product::<Expression>());
+    }
+    expressions.insert(0.into());
+    expressions.insert(1.into());
+    expressions
+}
+
 #[tracing::instrument(skip_all)]
 #[allow(clippy::type_complexity)]
 fn compile_interpreter(
@@ -936,6 +1005,357 @@ fn compile_interpreter(
         })
         .collect();
     (func, module, expression_map, constants)
+}
+
+#[tracing::instrument(skip_all)]
+#[allow(clippy::type_complexity)]
+fn compile_sequential_kernel(
+    cuda_stream: &Arc<CudaStream>,
+    llir_graph: &LLIRGraph,
+    subgraph: &FxHashSet<NodeIndex>,
+    ops: &[Arc<Box<dyn BlockOp>>],
+    expressions: &FxHashSet<Expression>,
+    node_to_buffer_index: &FxHashMap<NodeIndex, i32>,
+    kernel_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+) -> (
+    CudaFunction,
+    Arc<CudaModule>,
+    FxHashMap<char, CudaSlice<u8>>,
+) {
+    let expression_map = expressions
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (*e, i as i32))
+        .collect::<FxHashMap<_, _>>();
+
+    let constants = expressions
+        .iter()
+        .flat_map(|e| e.dyn_vars())
+        .collect::<FxHashSet<_>>();
+    let constant_string = constants
+        .iter()
+        .map(|v| format!("__constant__ int const_{v}[1];"))
+        .join("\n");
+    let lambdas = expression_map
+        .iter()
+        .sorted_by_key(|(_, i)| **i)
+        .map(|(e, i)| format!("case {i}: return {};", e.simplify().to_kernel()))
+        .join("\n");
+    let op_structs = ops
+        .iter()
+        .map(|op| {
+            format!(
+                "struct {}Payload {{{}}};",
+                op.op_name(),
+                op.build_payload(cuda_stream, CStruct::new(Some(&expression_map))),
+            )
+        })
+        .join("\n");
+    let op_functions = ops
+        .iter()
+        .map(|op| {
+            let op_name = op.op_name();
+            let op_body = op.cuda_function();
+            format!(
+                "__device__ __forceinline__ void {op_name}_function({op_name}Payload payload, const float* const source_ptrs[6], float* out_ptr, const int current, int t, float* scratchpad) {{
+{op_body}
+}}"
+            )
+        })
+        .join("\n");
+    let device_globals = ops
+        .iter()
+        .map(|op| op.device_globals())
+        .filter(|s| !s.is_empty())
+        .join("\n");
+
+    let mut op_blocks = String::new();
+    let mut op_counter = 0usize;
+    for node in toposort(llir_graph, None).unwrap() {
+        if !subgraph.contains(&node) {
+            continue;
+        }
+        let Some(op) = llir_graph[node].to_dialect::<dyn BlockOp>() else {
+            continue;
+        };
+        let op_name = op.op_name();
+        let sources = llir_graph
+            .edges_directed(node, Direction::Incoming)
+            .sorted_by_key(|e| e.id())
+            .map(|e| e.source())
+            .collect_vec();
+        let source_init = (0..6)
+            .map(|i| {
+                sources
+                    .get(i)
+                    .and_then(|source| node_to_buffer_index.get(source))
+                    .map(|idx| format!("(const float*)buffers[{idx}]"))
+                    .unwrap_or_else(|| "0".to_string())
+            })
+            .join(", ");
+        let out_idx = *node_to_buffer_index
+            .get(&node)
+            .expect("Missing output buffer index for compiled megakernel node");
+
+        let payload_builder = op.build_payload(cuda_stream, CStruct::new(Some(&expression_map)));
+        let (payload_size, payload_align) = payload_builder.size_and_align();
+        let payload_bytes = payload_builder.finish_struct();
+        debug_assert_eq!(payload_size, payload_bytes.len());
+        let payload_blob = payload_bytes
+            .iter()
+            .map(|byte| format!("0x{byte:02x}"))
+            .join(", ");
+        let payload_load = if payload_size == 0 {
+            format!("{op_name}Payload payload = {{}};")
+        } else {
+            format!(
+                "__align__({payload_align}) const unsigned char _p{op_counter}[{payload_size}] = {{{payload_blob}}};\n        {op_name}Payload payload = *reinterpret_cast<const {op_name}Payload*>(_p{op_counter});"
+            )
+        };
+        let range = op.launch_range().iter().copied().product::<Expression>();
+        let range_id = *expression_map
+            .get(&range)
+            .expect("Missing launch range expression for compiled megakernel op");
+
+        op_blocks.push_str(&format!(
+            "
+    // Op {op_counter}: {op_name}
+    {{
+        const float* source_ptrs[6] = {{{source_init}}};
+        float* out_ptr = (float*)buffers[{out_idx}];
+        {payload_load}
+        int _range{op_counter} = eval_expression({range_id}, 0);
+        for (int _i{op_counter} = 0; _i{op_counter} < _range{op_counter}; _i{op_counter}++) {{
+            {op_name}_function(payload, source_ptrs, out_ptr, _i{op_counter}, threadIdx.x, scratchpad);
+        }}
+    }}
+    __syncthreads();
+"
+        ));
+        op_counter += 1;
+    }
+
+    let mut kernel = String::new();
+    if !constant_string.is_empty() {
+        kernel.push_str(&constant_string);
+        kernel.push('\n');
+    }
+    if !device_globals.is_empty() {
+        kernel.push_str(&device_globals);
+        kernel.push('\n');
+    }
+    kernel.push_str(
+        "__device__ __noinline__ int eval_expression(int expression, int const_z) {\n  switch (expression) {\n",
+    );
+    kernel.push_str(&lambdas);
+    kernel.push_str("\n    default: return 0;\n  }\n}\n\n");
+    kernel.push_str(&op_structs);
+    kernel.push('\n');
+    kernel.push_str(&op_functions);
+    kernel.push_str(
+        "\n\nextern \"C\" __global__ void compiled_megakernel(float* const* buffers) {\n  __shared__ float scratchpad[8192];\n",
+    );
+    kernel.push_str(&op_blocks);
+    kernel.push_str("}\n");
+
+    if std::env::var("LUMINAL_DUMP_COMPILED_KERNEL").map_or(false, |v| v == "1") {
+        eprintln!("{kernel}");
+    }
+
+    let (module, function) = if let Some((module, function)) = kernel_cache.get(&kernel) {
+        (module.clone(), function.clone())
+    } else {
+        let _span = span!(Level::TRACE, "nvrtc_compiled_megakernel").entered();
+        let ptx = compile_ptx_with_opts(
+            &kernel,
+            CompileOptions {
+                arch: Some("sm_75"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let module = cuda_stream.context().load_module(ptx).unwrap();
+        let function = module.load_function("compiled_megakernel").unwrap();
+        kernel_cache.insert(kernel, (module.clone(), function.clone()));
+        (module, function)
+    };
+
+    let constants: FxHashMap<char, CudaSlice<u8>> = constants
+        .into_iter()
+        .map(|d| {
+            let global = module
+                .get_global(&format!("const_{d}"), cuda_stream)
+                .unwrap();
+            (d, global)
+        })
+        .collect();
+
+    (function, module, constants)
+}
+
+#[derive(Debug)]
+pub struct CompiledMegakernelOp {
+    /// The compiled straight-line CUDA kernel function.
+    pub function: CudaFunction,
+    /// CUDA module containing compiled kernel and constant symbols.
+    pub module: Arc<CudaModule>,
+    /// Device-side constants for dynamic dimensions.
+    pub constants: FxHashMap<char, CudaSlice<u8>>,
+    /// Mapping from LLIR node to packed buffer pointer index.
+    pub node_to_buffer_index: FxHashMap<NodeIndex, i32>,
+}
+
+impl crate::kernel::KernelOp for CompiledMegakernelOp {
+    fn compile(
+        &self,
+        _stream: &Arc<CudaStream>,
+        _compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> (
+        CudaFunction,
+        Arc<CudaModule>,
+        String,
+        (Expression, Expression, Expression),
+        (Expression, Expression, Expression),
+        Expression,
+        FxHashMap<char, CudaSlice<u8>>,
+    ) {
+        (
+            self.function.clone(),
+            self.module.clone(),
+            "compiled_megakernel".to_string(),
+            (1.into(), 1.into(), 1.into()),
+            (256.into(), 1.into(), 1.into()),
+            0.into(),
+            self.constants.clone(),
+        )
+    }
+
+    fn output_size(&self) -> Expression {
+        0.into()
+    }
+
+    fn kernel_name(&self) -> &'static str {
+        "CompiledMegakernel"
+    }
+
+    fn allocate_internal_buffers(
+        &self,
+        stream: &Arc<CudaStream>,
+        _dyn_map: &FxHashMap<char, usize>,
+    ) -> Vec<CudaSlice<u8>> {
+        vec![
+            stream
+                .alloc_zeros::<u8>(self.buffer_count() * std::mem::size_of::<u64>())
+                .unwrap(),
+        ]
+    }
+
+    fn build_params(
+        &self,
+        stream: &Arc<CudaStream>,
+        _output_ptr: u64,
+        _input_ptrs: &[u64],
+        internal_bufs: &[CudaSlice<u8>],
+        _dyn_dims_ptr: u64,
+    ) -> Vec<u64> {
+        vec![internal_bufs[0].device_ptr(stream).0]
+    }
+
+    fn pre_execute(
+        &self,
+        stream: &Arc<CudaStream>,
+        internal_bufs: &mut [CudaSlice<u8>],
+        _constants: &mut FxHashMap<char, CudaSlice<u8>>,
+        all_buffer_ptrs: &FxHashMap<NodeIndex, u64>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) {
+        for (dyn_dim, val) in dyn_map {
+            let global_name = format!("const_{}", dyn_dim);
+            if let Ok(mut global) = self.module.get_global(&global_name, stream) {
+                let mut view = global.as_view_mut();
+                let mut symbol = unsafe { view.transmute_mut::<i32>(1).unwrap() };
+                stream
+                    .memcpy_htod(&[*val as i32], &mut symbol)
+                    .expect("Failed to update compiled megakernel dyn dim constant");
+                std::mem::forget(global);
+            }
+        }
+
+        let buffer_count = self.buffer_count();
+        let mut buffer_array: Vec<u64> = vec![0; buffer_count];
+        for (node, &buffer_idx) in &self.node_to_buffer_index {
+            if let Some(&ptr) = all_buffer_ptrs.get(node) {
+                buffer_array[buffer_idx as usize] = ptr;
+            }
+        }
+
+        for (node, &buffer_idx) in &self.node_to_buffer_index {
+            if buffer_array[buffer_idx as usize] == 0 {
+                panic!(
+                    "CompiledMegakernelOp: null buffer at idx {} for node {:?}. all_buffer_ptrs has {} entries, buffer_count={}",
+                    buffer_idx,
+                    node,
+                    all_buffer_ptrs.len(),
+                    buffer_count
+                );
+            }
+        }
+
+        let mut buffers_view = internal_bufs[0].as_view_mut();
+        let mut buffers_typed = unsafe {
+            buffers_view
+                .transmute_mut::<u64>(buffer_count)
+                .expect("Failed to transmute compiled megakernel buffers")
+        };
+        stream
+            .memcpy_htod(&buffer_array, &mut buffers_typed)
+            .expect("Failed to update compiled megakernel buffer array");
+    }
+}
+
+impl CompiledMegakernelOp {
+    pub fn new(
+        llir_graph: &LLIRGraph,
+        subgraph: &FxHashSet<NodeIndex>,
+        cuda_stream: &Arc<CudaStream>,
+        kernel_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> Self {
+        let (block_ops, node_to_buffer_index) = analyze_block_subgraph(llir_graph, subgraph);
+        let expressions = collect_subgraph_expressions(llir_graph, subgraph, cuda_stream);
+        let (function, module, constants) = compile_sequential_kernel(
+            cuda_stream,
+            llir_graph,
+            subgraph,
+            &block_ops,
+            &expressions,
+            &node_to_buffer_index,
+            kernel_cache,
+        );
+
+        Self {
+            function,
+            module,
+            constants,
+            node_to_buffer_index,
+        }
+    }
+
+    pub fn buffer_count(&self) -> usize {
+        self.node_to_buffer_index
+            .values()
+            .map(|&i| i + 1)
+            .max()
+            .unwrap_or(0) as usize
+    }
+}
+
+impl Drop for CompiledMegakernelOp {
+    fn drop(&mut self) {
+        let constants = std::mem::take(&mut self.constants);
+        for (_key, slice) in constants {
+            std::mem::forget(slice);
+        }
+    }
 }
 
 /// A compiled megakernel that implements KernelOp.
@@ -1344,16 +1764,7 @@ pub(crate) fn make_megakernel_from_llir_graph(
     FxHashMap<NodeIndex, usize>,
     FxHashMap<NodeIndex, i32>, // node_to_buffer_index mapping
 ) {
-    let block_ops = llir_graph
-        .node_indices()
-        .filter(|n| subgraph.contains(n))
-        .filter_map(|n| llir_graph[n].to_dialect::<dyn BlockOp>())
-        .map(|bo| (bo.op_name(), bo.clone()))
-        .collect::<HashMap<_, _>>()
-        .into_iter()
-        .sorted_by_key(|(n, _)| *n)
-        .map(|(_, o)| o)
-        .collect_vec();
+    let (block_ops, node_to_buffer_index) = analyze_block_subgraph(llir_graph, subgraph);
     // Render expressions
     let (
         producer_barrier_strides,
@@ -1436,17 +1847,6 @@ pub(crate) fn make_megakernel_from_llir_graph(
     // Build task queue with dynamic payload size and alignment
     let mut tasks = TaskQueue::new(max_payload_size, max_payload_align);
     let mut node_to_task_index = FxHashMap::default();
-    let mut node_to_buffer_index: FxHashMap<NodeIndex, i32> = FxHashMap::default();
-    let mut next_buffer_index: i32 = 0;
-
-    // Helper to get or assign buffer index for a node
-    let mut get_buffer_index = |node: NodeIndex| -> i32 {
-        *node_to_buffer_index.entry(node).or_insert_with(|| {
-            let idx = next_buffer_index;
-            next_buffer_index += 1;
-            idx
-        })
-    };
 
     for node in toposort(&llir_graph, None).unwrap() {
         if !subgraph.contains(&node) {
@@ -1460,14 +1860,40 @@ pub(crate) fn make_megakernel_from_llir_graph(
 
         // Assign buffer indices for source nodes and output node
         let source_indices: [i32; 6] = [
-            get_buffer_index(sources[0]),
-            sources.get(1).map(|&n| get_buffer_index(n)).unwrap_or(0),
-            sources.get(2).map(|&n| get_buffer_index(n)).unwrap_or(0),
-            sources.get(3).map(|&n| get_buffer_index(n)).unwrap_or(0),
-            sources.get(4).map(|&n| get_buffer_index(n)).unwrap_or(0),
-            sources.get(5).map(|&n| get_buffer_index(n)).unwrap_or(0),
+            sources
+                .first()
+                .and_then(|n| node_to_buffer_index.get(n))
+                .copied()
+                .unwrap_or(0),
+            sources
+                .get(1)
+                .and_then(|n| node_to_buffer_index.get(n))
+                .copied()
+                .unwrap_or(0),
+            sources
+                .get(2)
+                .and_then(|n| node_to_buffer_index.get(n))
+                .copied()
+                .unwrap_or(0),
+            sources
+                .get(3)
+                .and_then(|n| node_to_buffer_index.get(n))
+                .copied()
+                .unwrap_or(0),
+            sources
+                .get(4)
+                .and_then(|n| node_to_buffer_index.get(n))
+                .copied()
+                .unwrap_or(0),
+            sources
+                .get(5)
+                .and_then(|n| node_to_buffer_index.get(n))
+                .copied()
+                .unwrap_or(0),
         ];
-        let out_index = get_buffer_index(node);
+        let out_index = *node_to_buffer_index
+            .get(&node)
+            .expect("Missing output buffer index for megakernel node");
 
         let op = llir_graph[node].to_dialect::<dyn BlockOp>().unwrap();
         let op_code = block_ops
@@ -1499,8 +1925,9 @@ pub(crate) fn make_megakernel_from_llir_graph(
         node_to_task_index.insert(node, tasks.len());
         let task_range = expressions[&range.iter().copied().product()];
         let in_dep_a_stride_val = expressions[&in_dep_a_stride];
-        let in_dep_a_base_val = producer_barrier_bases
-            .get(&sources[0])
+        let in_dep_a_base_val = sources
+            .first()
+            .and_then(|n| producer_barrier_bases.get(n))
             .map(|e| expressions[e])
             .unwrap_or(-1);
         let in_dep_b_stride_val = expressions[&in_dep_b_stride];

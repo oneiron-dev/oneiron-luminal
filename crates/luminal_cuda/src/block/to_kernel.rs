@@ -15,7 +15,19 @@ use tracing::{Level, span};
 
 use crate::{kernel::KernelOp, runtime::partition_marked_convex};
 
-use super::{BlockOp, MegakernelOp};
+use super::{BlockOp, CompiledMegakernelOp, MegakernelOp};
+
+fn is_compiled_subgraph_eligible(llir_graph: &LLIRGraph, subgraph: &FxHashSet<NodeIndex>) -> bool {
+    !subgraph.iter().any(|node| {
+        let Some(op) = llir_graph[*node].to_dialect::<dyn BlockOp>() else {
+            return false;
+        };
+        matches!(
+            op.op_name(),
+            "TileMatmulFullSplit" | "TileMatmulNvFp4" | "TileMatmulMxfp4"
+        )
+    })
+}
 
 /// Compile all BlockOp subgraphs in the LLIR graph into MegakernelOps.
 ///
@@ -35,6 +47,7 @@ pub fn block_to_kernel(
     kernel_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
 ) -> FxHashMap<NodeIndex, Vec<NodeIndex>> {
     let _span = span!(Level::TRACE, "block_to_kernel").entered();
+    let use_compiled = std::env::var("LUMINAL_COMPILED_MEGAKERNEL").map_or(false, |v| v == "1");
 
     let block_ops_in_graph = llir_graph
         .node_indices()
@@ -48,12 +61,26 @@ pub fn block_to_kernel(
     let mut megakernel_to_blocks: FxHashMap<NodeIndex, Vec<NodeIndex>> = FxHashMap::default();
 
     for subgraph in partition_marked_convex(llir_graph, &block_ops_in_graph).unwrap() {
-        // Create MegakernelOp which implements KernelOp
-        let megakernel_op = MegakernelOp::new(llir_graph, &subgraph, cuda_stream, kernel_cache);
+        let use_compiled_for_subgraph =
+            use_compiled && is_compiled_subgraph_eligible(llir_graph, &subgraph);
+        let megakernel_op: Box<dyn KernelOp> = if use_compiled_for_subgraph {
+            Box::new(CompiledMegakernelOp::new(
+                llir_graph,
+                &subgraph,
+                cuda_stream,
+                kernel_cache,
+            ))
+        } else {
+            Box::new(MegakernelOp::new(
+                llir_graph,
+                &subgraph,
+                cuda_stream,
+                kernel_cache,
+            ))
+        };
 
         // Add megakernel node to llir_graph as a KernelOp
-        let megakernel_node =
-            llir_graph.add_node(LLIROp::new(Box::new(megakernel_op) as Box<dyn KernelOp>));
+        let megakernel_node = llir_graph.add_node(LLIROp::new(megakernel_op));
 
         // Find external inputs: nodes outside subgraph that have edges into subgraph
         // These edges establish exec_graph dependencies (megakernel waits for inputs)
