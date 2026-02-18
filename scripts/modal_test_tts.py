@@ -305,6 +305,63 @@ def compile_flash_attn_kernels():
     return {"status": "success", "artifacts": artifacts}
 
 
+@app.function(
+    gpu="A100-80GB:1",
+    timeout=3600,
+    volumes={
+        "/models": model_volume,
+        "/cache": cache_volume,
+    },
+)
+def test_compiled_megakernel():
+    """Run inference with LUMINAL_COMPILED_MEGAKERNEL=1 to test compiled sequential kernel."""
+    import os
+
+    run_streaming("nvidia-smi")
+
+    if os.path.exists(CACHE_DIR):
+        cache_files = os.listdir(CACHE_DIR)
+        total_size = sum(os.path.getsize(os.path.join(CACHE_DIR, f)) for f in cache_files)
+        print(f"\nCache: {len(cache_files)} files ({total_size / 1024 / 1024:.1f} MB)", flush=True)
+
+    print("\nDownloading model weights...", flush=True)
+    if not download_model(MAIN_MODEL_REPO, MAIN_MODEL_DIR, ["*.safetensors", "*.json"]):
+        return {"status": "download_failed"}
+    if not download_model(TOKENIZER_REPO, TOKENIZER_DIR, ["*.safetensors", "*.json", "tokenizer*", "vocab*"]):
+        return {"status": "download_failed"}
+    model_volume.commit()
+
+    print("\nBuilding qwen3_tts with CUDA feature...", flush=True)
+    rc, _ = run_streaming("cargo build --release -p qwen3_tts --features cuda", cwd=MOUNT_PATH)
+    if rc != 0:
+        return {"status": "build_failed"}
+
+    binary = f"{MOUNT_PATH}/target/release/qwen3_tts_infer"
+    if not os.path.exists(binary):
+        return {"status": "binary_not_found"}
+
+    # Run with compiled megakernel + dump first kernel source
+    print("\nRunning CUDA inference with COMPILED MEGAKERNEL...", flush=True)
+    rc, output = run_streaming(
+        binary,
+        env={
+            **os.environ,
+            "QWEN3_TTS_MODEL_DIR": MAIN_MODEL_DIR,
+            "QWEN3_TTS_TOKENIZER_DIR": TOKENIZER_DIR,
+            "RUST_BACKTRACE": "1",
+            "QWEN3_TTS_MAX_FRAMES": "100",
+            "LUMINAL_CACHE_DIR": CACHE_DIR,
+            "LUMINAL_PROFILE": "1",
+            "LUMINAL_COMPILED_MEGAKERNEL": "1",
+        },
+    )
+
+    cache_volume.commit()
+    status = "success" if rc == 0 else "failed"
+    print(f"\nCompiled megakernel inference {status} (exit code: {rc})", flush=True)
+    return {"status": status, "returncode": rc}
+
+
 @app.local_entrypoint()
 def main(target: str = "inference"):
     if target == "wave_b0":
@@ -313,6 +370,9 @@ def main(target: str = "inference"):
     elif target == "replay":
         print("Launching replay inference test on Modal A100...")
         result = test_replay_inference.remote()
+    elif target == "compiled":
+        print("Launching compiled megakernel test on Modal A100...")
+        result = test_compiled_megakernel.remote()
     elif target == "compile_fa":
         print("Compiling FlashAttention kernels on Modal A100...")
         result = compile_flash_attn_kernels.remote()

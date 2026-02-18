@@ -14,6 +14,18 @@ use luminal_metal::MetalRuntime;
 #[cfg(feature = "cuda")]
 use luminal_cuda::runtime::CudaRuntime;
 
+/// TileMatmul BlockOps to exclude when compiled megakernel is active.
+/// Excluding these forces cuBLASLt HostOp for all matmuls, which:
+/// 1. Removes matmuls from BlockOp convex subgraphs
+/// 2. Lets remaining element-wise ops form compiled-eligible subgraphs
+/// 3. Uses cuBLASLt's optimized GEMV for decode (faster than TileMatmul)
+#[cfg(feature = "cuda")]
+type TileMatmulOps = (
+    luminal_cuda::block::TileMatmulFullSplit,
+    luminal_cuda::block::TileMatmulNvFp4,
+    luminal_cuda::block::TileMatmulMxfp4,
+);
+
 // Type alias: cuda > metal > native
 #[cfg(feature = "cuda")]
 pub type Rt = CudaRuntime;
@@ -26,7 +38,15 @@ pub type Rt = luminal::prelude::NativeRuntime;
 
 pub fn build_search_space(cx: &mut Graph) {
     #[cfg(feature = "cuda")]
-    cx.build_search_space::<CudaRuntime>();
+    {
+        let use_compiled =
+            std::env::var("LUMINAL_COMPILED_MEGAKERNEL").map_or(false, |v| v == "1");
+        if use_compiled {
+            cx.build_search_space_exclude_ops::<CudaRuntime, TileMatmulOps>();
+        } else {
+            cx.build_search_space::<CudaRuntime>();
+        }
+    }
 
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     cx.build_search_space::<MetalRuntime>();
@@ -36,10 +56,16 @@ pub fn build_search_space(cx: &mut Graph) {
 }
 
 pub fn compile(cx: &mut Graph, weights: &HashMap<String, Vec<f32>>) -> Rt {
-    // Enable e-graph caching to skip egglog on subsequent runs
-    cx.cache_dir = Some(std::path::PathBuf::from(
-        std::env::var("LUMINAL_CACHE_DIR").unwrap_or_else(|_| ".luminal_cache".to_string()),
-    ));
+    // Enable e-graph caching to skip egglog on subsequent runs.
+    // Use a separate cache dir when compiled megakernel is active because the
+    // e-graph is different (no TileMatmul ops) and the cache key doesn't include
+    // which ops were excluded.
+    let mut cache_dir =
+        std::env::var("LUMINAL_CACHE_DIR").unwrap_or_else(|_| ".luminal_cache".to_string());
+    if std::env::var("LUMINAL_COMPILED_MEGAKERNEL").map_or(false, |v| v == "1") {
+        cache_dir.push_str("_compiled");
+    }
+    cx.cache_dir = Some(std::path::PathBuf::from(cache_dir));
 
     build_search_space(cx);
 
